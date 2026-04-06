@@ -1,0 +1,98 @@
+You are helping build Job Bot, a standalone Windows desktop application written in Python 3.11+. 
+It is a fully automated job search and application system. The user is not a programmer — 
+the final deliverable must be a single .exe file that a non-technical person can run.
+What it does: Job Bot runs on a schedule between 7am and 5pm EST. It scrapes job postings from multiple sources, 
+scores each posting against the user's resume using the Anthropic Claude API, generates a tailored 1–2 page resume 
+and cover letter for each matching job, and then applies — either by emailing the hiring manager directly, 
+auto-filling a company job portal, applying via the job board itself, or emailing the user with the tailored documents
+and a link so they can apply manually.
+
+Core principles:
+
+Every module must work on Windows 11. Use pathlib.Path everywhere. Never hardcode forward slashes in file paths.
+All user data (config, tokens, resume JSON, application logs) lives in %APPDATA%\JobBot\. The exe itself is stateless.
+Graceful degradation is mandatory. If any step fails (scraper blocked, portal CAPTCHA, API error), the system logs the failure and routes to the next best option. It never crashes silently and never skips logging.
+The Anthropic API model is always claude-sonnet-4-20250514. Max tokens 1000 unless specified otherwise.
+SQLite is the only database. No ORM — use raw sqlite3.
+Playwright is used for all browser automation. Browser is Chromium only.
+Rate limiting is built into every scraper. Minimum 3–5 second randomized delay between requests.
+Proxies are optional. If proxy_list in config is non-empty, scrapers rotate through them round-robin.
+Tech stack:
+
+playwright — browser automation and scraping
+pdfplumber — PDF text extraction
+anthropic — Claude API calls
+google-auth, google-api-python-client — Gmail OAuth2
+APScheduler — scheduling
+reportlab — PDF generation (resumes)
+rich — CLI dashboard
+pyyaml — config file parsing
+pyinstaller — final exe build
+Project file structure:
+JobBot/
+├── main.py
+├── config.py
+├── database.py
+├── resume_parser.py
+├── title_classifier.py
+├── match_scorer.py
+├── doc_generator.py
+├── gmail_client.py
+├── applicator.py
+├── portal_filler.py
+├── board_applier.py
+├── scheduler.py
+├── dashboard.py
+├── scrapers/
+│   ├── __init__.py
+│   ├── indeed_api.py
+│   ├── ziprecruiter_api.py
+│   ├── glassdoor_scraper.py
+│   ├── linkedin_scraper.py
+│   └── scraper_router.py
+├── build.bat
+├── first_run_setup.bat
+├── jobbot.spec
+└── requirements.txtData directory at runtime (%APPDATA%\JobBot\):
+config.yaml
+resume_data.json
+target_titles.json
+token.json
+jobbot.db
+output/
+  [Employer]_[YYYY-MM-DD]/
+    resume.pdf
+    cover_letter.txt
+logs/
+  jobbot.logThe Job object (shared across all modules, defined in database.py):
+python@dataclass
+class Job:
+    id: str                    # SHA256 hash of employer+title+location
+    title: str
+    employer: str
+    location: str
+    salary_range: str          # raw string from posting, may be empty
+    description_full: str
+    apply_method: str          # "email" | "portal" | "board" | "unknown"
+    apply_url: str
+    hiring_manager_email: str  # empty string if not found
+    source: str                # "indeed" | "ziprecruiter" | "glassdoor" | "linkedin"
+    posted_at: str             # ISO 8601
+    scraped_at: str            # ISO 8601Build order (modules are built one at a time in this sequence):
+
+config.py + config.yaml template
+database.py
+resume_parser.py
+title_classifier.py
+scrapers/indeed_api.py + scrapers/ziprecruiter_api.py
+scrapers/glassdoor_scraper.py
+scrapers/linkedin_scraper.py
+scrapers/scraper_router.py
+match_scorer.py
+doc_generator.py
+gmail_client.py
+applicator.py + portal_filler.py + board_applier.py
+scheduler.py
+dashboard.py
+main.py
+first_run_setup.bat + build.bat + jobbot.spec
