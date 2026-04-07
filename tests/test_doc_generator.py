@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import unittest
 from pathlib import Path
@@ -10,46 +10,29 @@ from resume_parser import ResumeData, ResumeWorkEntry
 from test_support import workspace_temp_dir
 
 
-def _build_source_resume_pdf(path: Path) -> None:
-    from reportlab.lib.pagesizes import letter
-    from reportlab.pdfgen import canvas
+def _build_source_resume_docx(path: Path) -> None:
+    from docx import Document
 
-    pdf = canvas.Canvas(str(path), pagesize=letter)
-    width, height = letter
-
-    pdf.setFont("Helvetica-Bold", 16)
-    pdf.drawString(72, height - 48, "ROBERT THOM")
-    pdf.setFont("Helvetica", 10)
-    pdf.drawString(72, height - 64, "robert@example.com | linkedin.com/in/example | (530) 220-4847")
-    pdf.setFont("Helvetica-Bold", 13)
-    pdf.drawString(72, height - 120, "WORK EXPERIENCE")
-    pdf.setFont("Helvetica-Bold", 10)
-    pdf.drawString(72, height - 150, "Underdog Strategies, New York, NY — Digital Advertising and Field Manager")
-    pdf.setFont("Helvetica", 9)
-    pdf.drawString(72, height - 164, "JULY 2024 - Present")
-    pdf.drawString(82, height - 180, "- Led digital ad strategy and reporting")
-    pdf.drawString(82, height - 194, "- Managed creative vendors and launches")
-    pdf.showPage()
-
-    pdf.setFont("Helvetica-Bold", 16)
-    pdf.drawString(72, height - 48, "ROBERT THOM")
-    pdf.setFont("Helvetica", 10)
-    pdf.drawString(72, height - 64, "robert@example.com | linkedin.com/in/example | (530) 220-4847")
-    pdf.setFont("Helvetica-Bold", 10)
-    pdf.drawString(72, height - 110, "Behavioral Associates, New York, NY — Operations Manager")
-    pdf.setFont("Helvetica", 9)
-    pdf.drawString(72, height - 124, "JUNE 2023 - JULY 2024")
-    pdf.drawString(82, height - 140, "- Directed software implementation")
-    pdf.setFont("Helvetica-Bold", 13)
-    pdf.drawString(72, height - 240, "EDUCATION")
-    pdf.setFont("Helvetica", 10)
-    pdf.drawString(72, height - 256, "University of California, Davis")
-    pdf.drawString(72, height - 270, "Bachelor of Arts in Political Science Class of 2015")
-    pdf.setFont("Helvetica-Bold", 13)
-    pdf.drawString(72, height - 320, "KEY SKILLS")
-    pdf.setFont("Helvetica", 10)
-    pdf.drawString(72, height - 336, "Operations, Project Management, Data Analysis, Canva, Adobe Photoshop")
-    pdf.save()
+    doc = Document()
+    doc.add_paragraph("ROBERT THOM")
+    doc.add_paragraph("robert@example.com | linkedin.com/in/example | (530) 220-4847")
+    doc.add_paragraph("WORK EXPERIENCE")
+    doc.add_paragraph("Underdog Strategies, New York, NY — Digital Advertising and Field Manager")
+    doc.add_paragraph("JULY 2024 - Present")
+    bullet = doc.add_paragraph(style="List Bullet")
+    bullet.add_run("Led digital ad strategy and reporting")
+    bullet = doc.add_paragraph(style="List Bullet")
+    bullet.add_run("Managed creative vendors and launches")
+    doc.add_paragraph("Behavioral Associates, New York, NY — Operations Manager")
+    doc.add_paragraph("JUNE 2023 - JULY 2024")
+    bullet = doc.add_paragraph(style="List Bullet")
+    bullet.add_run("Directed software implementation and internal systems")
+    doc.add_paragraph("EDUCATION")
+    doc.add_paragraph("University of California, Davis")
+    doc.add_paragraph("Bachelor of Arts in Political Science Class of 2015")
+    doc.add_paragraph("KEY SKILLS")
+    doc.add_paragraph("Operations, Project Management, CRM, Data Analysis, Mailchimp, Google Analytics")
+    doc.save(str(path))
 
 
 class DocumentGeneratorTests(unittest.TestCase):
@@ -80,11 +63,14 @@ class DocumentGeneratorTests(unittest.TestCase):
             self.assertNotIn("nan", text.lower())
             self.assertNotIn("AI scoring skipped", text)
 
-    def test_generate_resume_preserves_source_sections_without_generic_placeholders(self) -> None:
+    def test_generate_docx_resume_preserves_sections_and_writes_docx_and_pdf(self) -> None:
         with workspace_temp_dir() as tmp:
+            source_docx = Path(tmp) / "source_resume.docx"
+            _build_source_resume_docx(source_docx)
             generator = DocumentGenerator()
+            generator._export_docx_to_pdf = lambda docx_path, pdf_path: pdf_path.write_bytes(b"pdf")
             resume = ResumeData(
-                "",
+                str(source_docx),
                 "",
                 "ROBERT THOM",
                 "robert@example.com",
@@ -94,7 +80,7 @@ class DocumentGeneratorTests(unittest.TestCase):
                 ["Led field operations", "Managed paid media"],
                 header_lines=["ROBERT THOM", "robert@example.com | linkedin.com/in/example | (530) 220-4847"],
                 education_lines=["University of California, Davis", "Bachelor of Arts in Political Science Class of 2015"],
-                key_skills_lines=["Operations, Project Management, Data Analysis"],
+                key_skills_lines=["Operations, Project Management, CRM, Data Analysis, Mailchimp, Google Analytics"],
                 work_experience_entries=[
                     ResumeWorkEntry(
                         role_line="Underdog Strategies, New York, NY — Digital Advertising and Field Manager",
@@ -105,14 +91,18 @@ class DocumentGeneratorTests(unittest.TestCase):
             )
             docs = generator.generate(
                 Path(tmp),
-                Job("1", "Director of Ecommerce", "MILK BAR", "New York, NY", "", "Lead ecommerce growth, analytics, and digital strategy.", "board", "https://example.com", "", "jobspy", "", ""),
+                Job("1", "Director of Ecommerce", "MILK BAR", "New York, NY", "", "Lead ecommerce growth, analytics, and dashboard reporting.", "board", "https://example.com", "", "jobspy", "", ""),
                 resume,
-                MatchScore(0, "AI scoring skipped in semi_auto for faster review queueing.", [], [], False, "review", "", "2026-01-01T00:00:00+00:00"),
+                MatchScore(0, "", [], [], False, "review", "", "2026-01-01T00:00:00+00:00"),
                 ai_notes="",
             )
-            import pdfplumber
-            with pdfplumber.open(docs.resume_pdf_path) as pdf:
-                text = "\n".join((page.extract_text() or "") for page in pdf.pages)
+            self.assertTrue(docs.resume_docx_path.exists())
+            self.assertTrue(docs.resume_pdf_path.exists())
+            self.assertEqual(docs.status, "generated")
+
+            from docx import Document
+            document = Document(str(docs.resume_docx_path))
+            text = "\n".join(paragraph.text for paragraph in document.paragraphs)
             self.assertIn("WORK EXPERIENCE", text)
             self.assertIn("EDUCATION", text)
             self.assertIn("KEY SKILLS", text)
@@ -120,11 +110,53 @@ class DocumentGeneratorTests(unittest.TestCase):
             self.assertNotIn("Target Role", text)
             self.assertNotIn("Match Notes", text)
 
-    def test_generate_resume_keeps_full_key_skills_list(self) -> None:
+    def test_inferred_skills_are_added_when_supported(self) -> None:
+        generator = DocumentGenerator()
+        resume = ResumeData(
+            "resume.docx",
+            "Mailchimp Salesforce Marketing Cloud streamlined campaign reporting dashboards",
+            "ROBERT THOM",
+            "robert@example.com",
+            "(530) 220-4847",
+            "Marketing leader",
+            ["Operations"],
+            ["Streamlined campaign reporting dashboards for executive leadership"],
+            key_skills_lines=["Operations, Project Management, CRM, Data Analysis, Mailchimp, Salesforce Marketing Cloud"],
+            work_experience_entries=[],
+        )
+        job = Job("1", "Lifecycle Marketing Manager", "Acme", "Remote", "", "Own email marketing, dashboard reporting, and process improvement.", "board", "", "", "jobspy", "", "")
+        skills = generator._tailor_key_skills(resume, job)
+        self.assertIn("Email Marketing", skills)
+        self.assertIn("Dashboard Reporting", skills)
+        self.assertIn("Process Improvement", skills)
+
+    def test_unsupported_credentials_are_not_inferred(self) -> None:
+        generator = DocumentGenerator()
+        resume = ResumeData(
+            "resume.docx",
+            "Planned and ran programming and managed campaigns and analytics dashboards",
+            "ROBERT THOM",
+            "robert@example.com",
+            "(530) 220-4847",
+            "Marketing leader",
+            ["Operations"],
+            ["Planned and ran programming and managed campaigns and analytics dashboards"],
+            key_skills_lines=["Operations, Project Management"],
+            work_experience_entries=[],
+        )
+        job = Job("1", "Program Manager", "Acme", "Remote", "", "PMP certification required and program management preferred.", "board", "", "", "jobspy", "", "")
+        skills = generator._tailor_key_skills(resume, job)
+        self.assertIn("Program Management", skills)
+        self.assertNotIn("PMP certification", " ".join(skills))
+
+    def test_docx_generation_can_succeed_without_pdf_export(self) -> None:
         with workspace_temp_dir() as tmp:
+            source_docx = Path(tmp) / "source_resume.docx"
+            _build_source_resume_docx(source_docx)
             generator = DocumentGenerator()
+            generator._export_docx_to_pdf = lambda docx_path, pdf_path: (_ for _ in ()).throw(RuntimeError("Word automation unavailable"))
             resume = ResumeData(
-                "",
+                str(source_docx),
                 "",
                 "ROBERT THOM",
                 "robert@example.com",
@@ -132,13 +164,9 @@ class DocumentGeneratorTests(unittest.TestCase):
                 "Marketing and operations leader",
                 ["Operations"],
                 ["Led field operations"],
-                header_lines=["ROBERT THOM", "robert@example.com | linkedin.com/in/example | (530) 220-4847"],
+                header_lines=["ROBERT THOM"],
                 education_lines=["University of California, Davis"],
-                key_skills_lines=[
-                    "Operations, Project Management, CRM, Data Analysis, MS Excel, MS Powerpoint, MS Project, Asana, "
-                    "Meta Ads Manager, Programmatic Display, Google Adwords, Youtube, TikTok, Native Advertising, "
-                    "WordPress, Mailchimp, Salesforce Marketing Cloud, SEO, Google Analytics, Canva, Adobe InDesign, Adobe Photoshop"
-                ],
+                key_skills_lines=["Operations, Project Management"],
                 work_experience_entries=[
                     ResumeWorkEntry(
                         role_line="Underdog Strategies, New York, NY — Digital Advertising and Field Manager",
@@ -149,59 +177,12 @@ class DocumentGeneratorTests(unittest.TestCase):
             )
             docs = generator.generate(
                 Path(tmp),
-                Job("1", "Director of Ecommerce", "MILK BAR", "New York, NY", "", "Lead ecommerce growth, analytics, and digital strategy.", "board", "https://example.com", "", "jobspy", "", ""),
+                Job("1", "Director", "Acme", "Remote", "", "Role", "board", "", "", "jobspy", "", ""),
                 resume,
-                MatchScore(0, "", [], [], False, "review", "", "2026-01-01T00:00:00+00:00"),
+                MatchScore(0, "", [], [], False, "review", "", ""),
                 ai_notes="",
             )
-            import pdfplumber
-            with pdfplumber.open(docs.resume_pdf_path) as pdf:
-                text = "\n".join((page.extract_text() or "") for page in pdf.pages)
-            self.assertIn("Adobe Photoshop", text)
-            self.assertIn("Mailchimp", text)
-
-    def test_generate_resume_uses_source_pdf_as_overlay_base(self) -> None:
-        with workspace_temp_dir() as tmp:
-            source_pdf = Path(tmp) / "source_resume.pdf"
-            _build_source_resume_pdf(source_pdf)
-            generator = DocumentGenerator()
-            resume = ResumeData(
-                str(source_pdf),
-                "",
-                "ROBERT THOM",
-                "robert@example.com",
-                "(530) 220-4847",
-                "Marketing and operations leader",
-                ["Operations"],
-                ["Led field operations"],
-                header_lines=["ROBERT THOM", "robert@example.com | linkedin.com/in/example | (530) 220-4847"],
-                education_lines=["University of California, Davis", "Bachelor of Arts in Political Science Class of 2015"],
-                key_skills_lines=["Operations, Project Management, Data Analysis, Canva, Adobe Photoshop"],
-                work_experience_entries=[
-                    ResumeWorkEntry(
-                        role_line="Underdog Strategies, New York, NY — Digital Advertising and Field Manager",
-                        date_line="JULY 2024 - Present",
-                        bullets=["Led digital ad strategy and reporting", "Managed creative vendors and launches"],
-                    ),
-                    ResumeWorkEntry(
-                        role_line="Behavioral Associates, New York, NY — Operations Manager",
-                        date_line="JUNE 2023 - JULY 2024",
-                        bullets=["Directed software implementation"],
-                    ),
-                ],
-            )
-            docs = generator.generate(
-                Path(tmp),
-                Job("1", "Director of Ecommerce", "MILK BAR", "New York, NY", "", "Lead ecommerce growth, analytics, and digital strategy.", "board", "https://example.com", "", "jobspy", "", ""),
-                resume,
-                MatchScore(0, "", [], [], False, "review", "", "2026-01-01T00:00:00+00:00"),
-                ai_notes="",
-            )
-
-            import pdfplumber
-            with pdfplumber.open(docs.resume_pdf_path) as pdf:
-                self.assertEqual(len(pdf.pages), 2)
-                text = "\n".join((page.extract_text() or "") for page in pdf.pages)
-            self.assertIn("Underdog Strategies, New York, NY", text)
-            self.assertIn("Operations, Project Management, Data Analysis", text)
-            self.assertNotIn("Target Role", text)
+            self.assertTrue(docs.resume_docx_path.exists())
+            self.assertEqual(docs.resume_pdf_path, Path())
+            self.assertEqual(docs.status, "generated_docx_only")
+            self.assertIn("Word automation unavailable", docs.error_message)

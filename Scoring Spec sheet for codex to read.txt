@@ -1,0 +1,475 @@
+Scoring Spec sheet for codex to read
+
+Yes. Below is the scoring prompt set I would actually use for your app.
+
+It is designed to fit the MVP you described: match_scorer.py returns a numeric score, short rationale, strengths, gaps, and a boolean is_match, with document generation only for jobs that pass.
+
+The core design choice is this: do not ask the model for a vague holistic opinion. Force it to do a bounded evaluation against a fixed rubric, then emit strict JSON. That is what keeps scoring stable.
+
+Use this in three layers.
+
+First, a deterministic prefilter before any LLM call:
+
+reject by banned title terms
+reject by location if non-negotiable
+reject by work authorization if explicit mismatch
+reject duplicates
+reject obvious seniority mismatch if rules can catch it
+
+Then use Prompt A for first-pass scoring. If score is near threshold, or if the model reports uncertainty, use Prompt B for adjudication. Only after pass do you run doc generation.
+
+Here is the exact structure.
+
+1) Canonical input objects
+
+Do not send the raw resume PDF text every time. Parse once into structured JSON, as your plan already says.
+
+Send the scorer only these fields.
+
+Resume payload:
+
+{
+  "candidate": {
+    "target_titles": ["..."],
+    "preferred_locations": ["..."],
+    "work_authorization": "...",
+    "years_experience_estimate": 0,
+    "summary": "..."
+  },
+  "skills": {
+    "languages": [],
+    "frameworks": [],
+    "cloud": [],
+    "databases": [],
+    "tools": [],
+    "domains": [],
+    "other": []
+  },
+  "experience": [
+    {
+      "title": "...",
+      "company": "...",
+      "dates": "...",
+      "duration_months": 0,
+      "bullets": ["...", "..."],
+      "tech": ["...", "..."]
+    }
+  ],
+  "education": [
+    {
+      "school": "...",
+      "degree": "...",
+      "field": "..."
+    }
+  ],
+  "constraints": {
+    "remote_only": false,
+    "salary_floor": null,
+    "must_have_keywords": [],
+    "exclude_keywords": []
+  }
+}
+
+Job payload:
+
+{
+  "job_id": "...",
+  "source": "...",
+  "title": "...",
+  "company": "...",
+  "location": "...",
+  "remote_status": "...",
+  "employment_type": "...",
+  "salary_text": "...",
+  "description": "...",
+  "requirements": ["...", "..."],
+  "preferred_qualifications": ["...", "..."],
+  "apply_url": "..."
+}
+2) Prompt A: first-pass scoring template
+
+This is the main scorer.
+
+System prompt
+You are a conservative job-match evaluator for a resume-tailoring application.
+
+Your task is to evaluate whether a candidate is a plausible fit for a single job posting using ONLY the provided structured resume data and the provided job posting.
+
+Hard rules:
+1. Never invent candidate experience, skills, education, certifications, achievements, or authorization.
+2. Do not reward generic similarity. Score based on concrete evidence in the resume.
+3. Distinguish required qualifications from preferred qualifications.
+4. Penalize hard mismatches strongly:
+   - title/seniority mismatch
+   - required skill gaps
+   - work authorization mismatch
+   - location/remote mismatch when explicit
+   - domain mismatch when central to the role
+5. If the resume shows adjacent but not exact experience, you may give partial credit, but explain it as adjacency rather than direct evidence.
+6. Be conservative. False positives are worse than false negatives because downstream document generation should only happen for credible matches.
+7. Output STRICT JSON only. No prose before or after the JSON.
+
+Scoring rubric:
+- 90-100: strong match, clearly qualified on most required dimensions
+- 75-89: good match, some non-fatal gaps
+- 60-74: borderline match, enough overlap to justify human review
+- 40-59: weak match, substantial gaps
+- 0-39: poor match, should not proceed
+
+Define is_match as:
+- true if score >= MATCH_THRESHOLD
+- false otherwise
+
+You must fill every field in the output schema.
+User prompt template
+MATCH_THRESHOLD: {{match_threshold}}
+
+Candidate resume data:
+```json
+{{resume_json}}
+
+Job posting:
+
+{{job_json}}
+
+Evaluate the match and return STRICT JSON with this exact schema:
+
+{
+"score": 0,
+"is_match": false,
+"confidence": "high|medium|low",
+"rationale_short": "",
+"strengths": ["", "", ""],
+"gaps": ["", "", ""],
+"required_match_breakdown": {
+"title_alignment": {
+"score": 0,
+"evidence": [""]
+},
+"skills_alignment": {
+"score": 0,
+"evidence": [""]
+},
+"experience_alignment": {
+"score": 0,
+"evidence": [""]
+},
+"domain_alignment": {
+"score": 0,
+"evidence": [""]
+},
+"logistics_alignment": {
+"score": 0,
+"evidence": [""]
+}
+},
+"missing_required_items": [""],
+"adjacent_transferable_strengths": [""],
+"red_flags": [""],
+"recommended_action": "advance|human_review|reject",
+"resume_tailoring_focus": ["", "", ""]
+}
+
+Additional instructions:
+
+rationale_short must be 1-3 sentences.
+strengths and gaps should be concise and evidence-based.
+missing_required_items should include only likely required gaps, not preferences.
+resume_tailoring_focus should identify truthful emphases for a tailored resume if the job advances.
+If the job description is vague or incomplete, lower confidence.
+If there is not enough evidence in the resume for a claim, treat it as absent.
+
+## 3) Why this works
+
+This prompt separates the decision into five subdimensions:
+- title alignment
+- skills alignment
+- experience alignment
+- domain alignment
+- logistics alignment
+
+That prevents the usual failure mode where the model sees a few familiar tools and over-scores the job.
+
+It also creates data you can actually use in the UI:
+- numeric score
+- short rationale
+- strengths/gaps
+- tailoring focus
+
+Those map cleanly onto the review queue and generated package your demo plan describes. :contentReference[oaicite:3]{index=3} :contentReference[oaicite:4]{index=4}
+
+## 4) Prompt B: adjudication template for borderline cases
+
+Use this only when:
+- score is within, say, 10 points of threshold
+- confidence is low
+- missing required items is non-empty but overlap is otherwise good
+
+### System prompt
+```text
+You are a second-pass adjudicator for a job-match system.
+
+Your role is not to rescore from scratch casually. Your role is to determine whether the first-pass result was too harsh, too lenient, or reasonable.
+
+You must be conservative, evidence-based, and use ONLY the provided resume data and job posting. Never invent qualifications.
+
+Output STRICT JSON only.
+User prompt template
+MATCH_THRESHOLD: {{match_threshold}}
+
+Candidate resume data:
+```json
+{{resume_json}}
+
+Job posting:
+
+{{job_json}}
+
+First-pass evaluation:
+
+{{first_pass_json}}
+
+Return STRICT JSON with this schema:
+
+{
+"final_score": 0,
+"is_match": false,
+"decision": "confirm_advance|confirm_reject|borderline_human_review",
+"decision_reason": "",
+"which_first_pass_points_were_correct": [""],
+"which_first_pass_points_were_overstated": [""],
+"which_first_pass_points_were_understated": [""],
+"must_not_claim_in_tailored_resume": [""],
+"best_truthful_angles_if_advanced": [""]
+}
+
+Rules:
+
+If there is a hard missing requirement central to the role, usually reject.
+If the candidate has strong adjacent experience that could plausibly transfer, human_review is acceptable.
+best_truthful_angles_if_advanced must be conservative and non-fabricated.
+
+## 5) Optional ultra-cheap first-pass classifier
+
+If you want the cheapest pipeline, use a tiny local or cheap hosted model before Prompt A. This model should not do nuanced scoring. It should only bucket jobs into:
+- obvious reject
+- maybe
+- likely
+
+### System prompt
+```text
+You are a coarse job triage classifier.
+
+Classify the candidate-job pair into one of:
+- obvious_reject
+- maybe
+- likely
+
+Be conservative. False positives are worse than false negatives.
+Use only explicit evidence.
+Return STRICT JSON only.
+User prompt
+Candidate summary:
+```json
+{{compressed_resume_json}}
+
+Job posting:
+
+{{compressed_job_json}}
+
+Return:
+{
+"bucket": "obvious_reject|maybe|likely",
+"reasons": ["", "", ""],
+"hard_mismatch_flags": [""]
+}
+
+
+Pipeline use:
+- `obvious_reject` → stop
+- `maybe` and `likely` → run Prompt A
+
+## 6) Exact weighting recommendation
+
+Do not let the model choose its own hidden weighting. Use one fixed weighting in code after it returns sub-scores.
+
+I would use:
+
+- title_alignment: 20%
+- skills_alignment: 30%
+- experience_alignment: 25%
+- domain_alignment: 10%
+- logistics_alignment: 15%
+
+Then compute:
+```python
+score = round(
+    0.20 * title_alignment +
+    0.30 * skills_alignment +
+    0.25 * experience_alignment +
+    0.10 * domain_alignment +
+    0.15 * logistics_alignment
+)
+
+That is better than asking the model for a monolithic number, because you can inspect drift. If you want, you can still ask the model for an overall score too, but I would treat code-computed score as authoritative.
+
+7) Recommended threshold settings
+
+For your use case:
+
+75 if you want only strong candidates to reach doc generation
+70 if you want a broader review queue
+60 if a human is definitely reviewing all “matches” before acting
+
+For the MVP, I would set:
+
+is_match threshold = 75
+human_review band = 65-74
+
+That fits the conservative workflow in your plan, where the app presents reviewed packages rather than blindly auto-applying.
+
+8) Guardrails for resume truthfulness
+
+You said the tailored resume must be conservative, emphasize relevant experience, never invent, and stay within 1–2 pages.
+
+To support that, add this invariant to every scoring and doc-generation prompt:
+
+Never state or imply that the candidate has done something unless it is directly supported by the provided resume data. You may reframe, reorder, emphasize, summarize, or connect evidence, but you may not fabricate or upgrade the evidence.
+
+Also add this field to the score result if you want stronger downstream safety:
+
+"verified_resume_claims_to_emphasize": [
+  {
+    "claim": "",
+    "supporting_resume_evidence": [""]
+  }
+]
+
+That gives doc_generator.py a clean list of safe talking points.
+
+9) Failure handling
+
+Your plan already says scoring failures should be recorded and should not generate docs.
+
+In practice:
+
+if JSON parse fails, mark as scoring_error_invalid_json
+if required keys missing, mark as scoring_error_schema_mismatch
+if model refuses or truncates, retry once with lower max context
+if still bad, persist error and skip
+
+Use strict schema validation in code. Do not “best effort” parse vague prose into scores.
+
+10) Practical implementation advice
+
+Three operational points matter more than clever wording.
+
+First, compress the resume before scoring. Do not send full prose bullets that are irrelevant to the job. Build a “resume subset for scoring” from:
+
+summary
+target titles
+top skills
+last 3–5 roles
+only the bullets with relevant tools/domains
+
+Second, normalize job descriptions before prompting. Extract:
+
+required skills
+preferred skills
+seniority
+location
+authorization hints
+domain
+title family
+
+Third, validate output with a hard schema and log raw responses for tuning.
+
+11) Minimal Python prompt assembly
+SYSTEM_PROMPT = """
+You are a conservative job-match evaluator for a resume-tailoring application.
+
+Your task is to evaluate whether a candidate is a plausible fit for a single job posting using ONLY the provided structured resume data and the provided job posting.
+
+Hard rules:
+1. Never invent candidate experience, skills, education, certifications, achievements, or authorization.
+2. Do not reward generic similarity. Score based on concrete evidence in the resume.
+3. Distinguish required qualifications from preferred qualifications.
+4. Penalize hard mismatches strongly:
+   - title/seniority mismatch
+   - required skill gaps
+   - work authorization mismatch
+   - location/remote mismatch when explicit
+   - domain mismatch when central to the role
+5. If the resume shows adjacent but not exact experience, you may give partial credit, but explain it as adjacency rather than direct evidence.
+6. Be conservative. False positives are worse than false negatives because downstream document generation should only happen for credible matches.
+7. Output STRICT JSON only. No prose before or after the JSON.
+
+Scoring rubric:
+- 90-100: strong match, clearly qualified on most required dimensions
+- 75-89: good match, some non-fatal gaps
+- 60-74: borderline match, enough overlap to justify human review
+- 40-59: weak match, substantial gaps
+- 0-39: poor match, should not proceed
+""".strip()
+
+def build_user_prompt(match_threshold: int, resume_json: str, job_json: str) -> str:
+    return f"""
+MATCH_THRESHOLD: {match_threshold}
+
+Candidate resume data:
+```json
+{resume_json}
+
+Job posting:
+
+{job_json}
+
+Evaluate the match and return STRICT JSON with this exact schema:
+
+{{
+"score": 0,
+"is_match": false,
+"confidence": "high|medium|low",
+"rationale_short": "",
+"strengths": ["", "", ""],
+"gaps": ["", "", ""],
+"required_match_breakdown": {{
+"title_alignment": {{"score": 0, "evidence": [""]}},
+"skills_alignment": {{"score": 0, "evidence": [""]}},
+"experience_alignment": {{"score": 0, "evidence": [""]}},
+"domain_alignment": {{"score": 0, "evidence": [""]}},
+"logistics_alignment": {{"score": 0, "evidence": [""]}}
+}},
+"missing_required_items": [""],
+"adjacent_transferable_strengths": [""],
+"red_flags": [""],
+"recommended_action": "advance|human_review|reject",
+"resume_tailoring_focus": ["", "", ""]
+}}
+
+Additional instructions:
+
+rationale_short must be 1-3 sentences.
+strengths and gaps should be concise and evidence-based.
+missing_required_items should include only likely required gaps, not preferences.
+resume_tailoring_focus should identify truthful emphases for a tailored resume if the job advances.
+If the job description is vague or incomplete, lower confidence.
+If there is not enough evidence in the resume for a claim, treat it as absent.
+""".strip()
+
+## 12) My direct recommendation
+
+For your MVP, I would implement exactly this:
+
+- deterministic filter first
+- cheap triage model optional
+- Prompt A for main scoring
+- Prompt B only for borderline cases
+- code-computed weighted score from sub-scores
+- threshold 75
+- strict JSON schema validation
+- log every raw prompt/response pair for the first 200 jobs so you can tune
+
+That is the simplest version that is still robust enough for a real demo.
+
+If you want the next step, I can write the matching Python `pydantic` schema and the `match_s
