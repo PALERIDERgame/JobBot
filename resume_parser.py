@@ -39,16 +39,40 @@ MONTH_PATTERN = re.compile(
 
 
 @dataclass(slots=True)
+class ResumeParagraphTemplate:
+    paragraph_index: int
+    style_name: str
+    has_numbering: bool
+    left_indent: int | None = None
+    first_line_indent: int | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "paragraph_index": self.paragraph_index,
+            "style_name": self.style_name,
+            "has_numbering": self.has_numbering,
+            "left_indent": self.left_indent,
+            "first_line_indent": self.first_line_indent,
+        }
+
+
+@dataclass(slots=True)
 class ResumeWorkEntry:
     role_line: str
     date_line: str
     bullets: list[str] = field(default_factory=list)
+    role_template: ResumeParagraphTemplate | None = None
+    date_template: ResumeParagraphTemplate | None = None
+    bullet_templates: list[ResumeParagraphTemplate] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
             "role_line": self.role_line,
             "date_line": self.date_line,
             "bullets": self.bullets,
+            "role_template": self.role_template.to_dict() if self.role_template else None,
+            "date_template": self.date_template.to_dict() if self.date_template else None,
+            "bullet_templates": [template.to_dict() for template in self.bullet_templates],
         }
 
 
@@ -66,6 +90,7 @@ class ResumeData:
     education_lines: list[str] = field(default_factory=list)
     key_skills_lines: list[str] = field(default_factory=list)
     work_experience_entries: list[ResumeWorkEntry] = field(default_factory=list)
+    key_skills_templates: list[ResumeParagraphTemplate] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -81,6 +106,7 @@ class ResumeData:
             "education_lines": self.education_lines,
             "key_skills_lines": self.key_skills_lines,
             "work_experience_entries": [entry.to_dict() for entry in self.work_experience_entries],
+            "key_skills_templates": [template.to_dict() for template in self.key_skills_templates],
         }
 
 
@@ -108,6 +134,23 @@ def _extract_text_from_path(path: Path) -> str:
             paragraphs.append(text)
         return "\n".join(paragraphs).strip()
     return path.read_text(encoding="utf-8").strip()
+
+
+def _paragraph_has_numbering(paragraph) -> bool:
+    p_pr = getattr(paragraph._p, "pPr", None)
+    return bool(p_pr is not None and getattr(p_pr, "numPr", None) is not None)
+
+
+def _paragraph_template(paragraph, paragraph_index: int) -> ResumeParagraphTemplate:
+    left_indent = paragraph.paragraph_format.left_indent
+    first_line_indent = paragraph.paragraph_format.first_line_indent
+    return ResumeParagraphTemplate(
+        paragraph_index=paragraph_index,
+        style_name=paragraph.style.name if paragraph.style else "",
+        has_numbering=_paragraph_has_numbering(paragraph),
+        left_indent=int(left_indent) if left_indent is not None else None,
+        first_line_indent=int(first_line_indent) if first_line_indent is not None else None,
+    )
 
 
 def _find_line(lines: list[str], token: str) -> str:
@@ -254,6 +297,86 @@ def _is_date_line(line: str) -> bool:
     return bool(MONTH_PATTERN.match(line.strip()))
 
 
+def _is_bullet_paragraph(paragraph) -> bool:
+    text = paragraph.text.strip()
+    if not text:
+        return False
+    style_name = (paragraph.style.name or "").lower() if paragraph.style else ""
+    if "bullet" in style_name:
+        return True
+    if _paragraph_has_numbering(paragraph):
+        return True
+    first_line_indent = paragraph.paragraph_format.first_line_indent
+    left_indent = paragraph.paragraph_format.left_indent
+    if first_line_indent is not None and left_indent is not None and int(first_line_indent) < 0 and int(left_indent) > 0:
+        return True
+    return text.startswith(("•", "-", "*", "●"))
+
+
+def _structured_sections_from_docx(source_path: Path) -> tuple[list[str], list[ResumeWorkEntry], list[str], list[str], list[ResumeParagraphTemplate]]:
+    if DocxDocument is None:  # pragma: no cover
+        raise RuntimeError("python-docx is required to parse DOCX resumes")
+    document = DocxDocument(str(source_path))
+    paragraphs = document.paragraphs
+    nonempty = [(idx, paragraph) for idx, paragraph in enumerate(paragraphs) if paragraph.text.strip()]
+
+    def _find_heading_index_docx(names: tuple[str, ...]) -> int:
+        for idx, paragraph in nonempty:
+            if _normalize_header(paragraph.text) in names:
+                return idx
+        return -1
+
+    work_idx = _find_heading_index_docx(("work experience", "experience", "professional experience"))
+    education_idx = _find_heading_index_docx(("education",))
+    skills_idx = _find_heading_index_docx(("key skills", "skills", "technical skills"))
+
+    header_lines = [paragraph.text.strip() for idx, paragraph in nonempty if idx < work_idx] if work_idx > 0 else [paragraph.text.strip() for _, paragraph in nonempty[:2]]
+
+    work_entries: list[ResumeWorkEntry] = []
+    current: ResumeWorkEntry | None = None
+    for idx, paragraph in nonempty:
+        if work_idx < 0 or idx <= work_idx or (education_idx >= 0 and idx >= education_idx):
+            continue
+        text = paragraph.text.strip()
+        if not text or text.lower() in {line.lower() for line in header_lines} or _is_contact_or_link_line(text):
+            continue
+        if current and not current.date_line and _is_date_line(text):
+            current.date_line = text
+            current.date_template = _paragraph_template(paragraph, idx)
+            continue
+        if _is_bullet_paragraph(paragraph):
+            bullet_text = text.lstrip("•●*- ").strip()
+            if current is None:
+                continue
+            current.bullets.append(bullet_text)
+            current.bullet_templates.append(_paragraph_template(paragraph, idx))
+            continue
+        if _is_role_line(text):
+            if current and current.role_line:
+                work_entries.append(current)
+            current = ResumeWorkEntry(
+                role_line=text,
+                date_line="",
+                bullets=[],
+                role_template=_paragraph_template(paragraph, idx),
+                date_template=None,
+                bullet_templates=[],
+            )
+            continue
+        if current and current.bullets:
+            current.bullets[-1] = f"{current.bullets[-1]} {text}".strip()
+        elif current is None:
+            continue
+    if current and current.role_line:
+        work_entries.append(current)
+
+    education_lines = [paragraph.text.strip() for idx, paragraph in nonempty if education_idx >= 0 and idx > education_idx and (skills_idx < 0 or idx < skills_idx)]
+    key_skill_pairs = [(idx, paragraph) for idx, paragraph in nonempty if skills_idx >= 0 and idx > skills_idx]
+    key_skills_lines = [paragraph.text.strip() for idx, paragraph in key_skill_pairs]
+    key_skills_templates = [_paragraph_template(paragraph, idx) for idx, paragraph in key_skill_pairs]
+    return header_lines, work_entries, education_lines, key_skills_lines, key_skills_templates
+
+
 def _parse_work_entries(lines: list[str], *, header_lines: list[str]) -> list[ResumeWorkEntry]:
     entries: list[ResumeWorkEntry] = []
     current: ResumeWorkEntry | None = None
@@ -315,7 +438,11 @@ def parse_resume(source_path: Path, cache_path: Path) -> ResumeData:
         raise ValueError("Resume file contained no extractable text")
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    header_lines, work_entries, education_lines, key_skills_lines = _structured_sections(lines)
+    if source_path.suffix.lower() == ".docx":
+        header_lines, work_entries, education_lines, key_skills_lines, key_skills_templates = _structured_sections_from_docx(source_path)
+    else:
+        header_lines, work_entries, education_lines, key_skills_lines = _structured_sections(lines)
+        key_skills_templates = []
     email = _extract_email(text)
     phone = _extract_phone(text)
     summary_line = _summary_from_sections(lines) or _fallback_summary(lines) or "Experienced professional with relevant background."
@@ -334,6 +461,7 @@ def parse_resume(source_path: Path, cache_path: Path) -> ResumeData:
         education_lines=education_lines,
         key_skills_lines=key_skills_lines,
         work_experience_entries=work_entries,
+        key_skills_templates=key_skills_templates,
     )
     cache_path.write_text(json.dumps(resume.to_dict(), indent=2), encoding="utf-8")
     LOGGER.info("Cached parsed resume at %s", cache_path)
@@ -347,8 +475,22 @@ def load_cached_resume(cache_path: Path) -> ResumeData | None:
     payload["header_lines"] = payload.get("header_lines", [])
     payload["education_lines"] = payload.get("education_lines", [])
     payload["key_skills_lines"] = payload.get("key_skills_lines", [])
+    payload["key_skills_templates"] = [
+        ResumeParagraphTemplate(**entry) if isinstance(entry, dict) else entry
+        for entry in payload.get("key_skills_templates", [])
+    ]
     payload["work_experience_entries"] = [
-        ResumeWorkEntry(**entry) if isinstance(entry, dict) else entry
+        ResumeWorkEntry(
+            role_line=entry["role_line"],
+            date_line=entry.get("date_line", ""),
+            bullets=entry.get("bullets", []),
+            role_template=ResumeParagraphTemplate(**entry["role_template"]) if isinstance(entry.get("role_template"), dict) else entry.get("role_template"),
+            date_template=ResumeParagraphTemplate(**entry["date_template"]) if isinstance(entry.get("date_template"), dict) else entry.get("date_template"),
+            bullet_templates=[
+                ResumeParagraphTemplate(**template) if isinstance(template, dict) else template
+                for template in entry.get("bullet_templates", [])
+            ],
+        ) if isinstance(entry, dict) else entry
         for entry in payload.get("work_experience_entries", [])
     ]
     return ResumeData(**payload)
