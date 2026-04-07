@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,28 @@ class Job:
     def build_id(employer: str, title: str, location: str) -> str:
         digest = hashlib.sha256(f"{employer}|{title}|{location}".lower().encode("utf-8"))
         return digest.hexdigest()
+
+
+@dataclass(slots=True)
+class StageEvaluationRecord:
+    job_id: str
+    stage_name: str
+    resume_hash: str
+    provider: str
+    model: str
+    prompt_version: str
+    status: str
+    decision: str
+    score: int | None
+    confidence: float | None
+    rationale: str
+    strengths: list[str]
+    gaps: list[str]
+    input_tokens: int
+    output_tokens: int
+    estimated_cost_usd: float
+    cached: bool
+    evaluated_at: str
 
 
 class Database:
@@ -92,6 +115,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS generated_documents (
                     job_id TEXT PRIMARY KEY,
                     output_dir TEXT NOT NULL,
+                    resume_docx_path TEXT NOT NULL DEFAULT '',
                     resume_pdf_path TEXT NOT NULL DEFAULT '',
                     cover_letter_path TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'pending',
@@ -109,9 +133,43 @@ class Database:
                     delivered_at TEXT NOT NULL DEFAULT '',
                     FOREIGN KEY(job_id) REFERENCES jobs(id)
                 );
+
+                CREATE TABLE IF NOT EXISTS ai_evaluations (
+                    job_id TEXT NOT NULL,
+                    stage_name TEXT NOT NULL,
+                    resume_hash TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    prompt_version TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    decision TEXT NOT NULL DEFAULT '',
+                    score INTEGER,
+                    confidence REAL,
+                    rationale TEXT NOT NULL DEFAULT '',
+                    strengths TEXT NOT NULL DEFAULT '[]',
+                    gaps TEXT NOT NULL DEFAULT '[]',
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    estimated_cost_usd REAL NOT NULL DEFAULT 0,
+                    cached INTEGER NOT NULL DEFAULT 0,
+                    evaluated_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(job_id, stage_name, resume_hash, provider, model, prompt_version),
+                    FOREIGN KEY(job_id) REFERENCES jobs(id)
+                );
             """
         )
+        self._ensure_column("generated_documents", "resume_docx_path", "TEXT NOT NULL DEFAULT ''")
         connection.commit()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        connection = self.connect()
+        columns = {
+            str(row["name"])
+            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column in columns:
+            return
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def create_run(self, started_at: str, stage: str, status: str = "running", message: str = "") -> int:
         connection = self.connect()
@@ -161,7 +219,7 @@ class Database:
         connection.commit()
 
     def upsert_job(self, job: Job, raw_payload: dict[str, Any] | None = None) -> None:
-        payload = json.dumps(raw_payload or {}, ensure_ascii=True)
+        payload = json.dumps(raw_payload or {}, ensure_ascii=True, default=str)
         connection = self.connect()
         connection.execute(
             """
@@ -250,6 +308,7 @@ class Database:
         job_id: str,
         *,
         output_dir: str,
+        resume_docx_path: str,
         resume_pdf_path: str,
         cover_letter_path: str,
         status: str,
@@ -260,17 +319,18 @@ class Database:
         connection.execute(
             """
                 INSERT INTO generated_documents (
-                    job_id, output_dir, resume_pdf_path, cover_letter_path, status, error_message, generated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    job_id, output_dir, resume_docx_path, resume_pdf_path, cover_letter_path, status, error_message, generated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_id) DO UPDATE SET
                     output_dir=excluded.output_dir,
+                    resume_docx_path=excluded.resume_docx_path,
                     resume_pdf_path=excluded.resume_pdf_path,
                     cover_letter_path=excluded.cover_letter_path,
                     status=excluded.status,
                     error_message=excluded.error_message,
                     generated_at=excluded.generated_at
             """,
-            (job_id, output_dir, resume_pdf_path, cover_letter_path, status, error_message, generated_at),
+            (job_id, output_dir, resume_docx_path, resume_pdf_path, cover_letter_path, status, error_message, generated_at),
         )
         connection.commit()
 
@@ -300,31 +360,193 @@ class Database:
         )
         connection.commit()
 
-    def list_review_rows(self) -> list[dict[str, Any]]:
+    def upsert_ai_evaluation(self, record: StageEvaluationRecord) -> None:
+        connection = self.connect()
+        connection.execute(
+            """
+                INSERT INTO ai_evaluations (
+                    job_id, stage_name, resume_hash, provider, model, prompt_version,
+                    status, decision, score, confidence, rationale, strengths, gaps,
+                    input_tokens, output_tokens, estimated_cost_usd, cached, evaluated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_id, stage_name, resume_hash, provider, model, prompt_version) DO UPDATE SET
+                    status=excluded.status,
+                    decision=excluded.decision,
+                    score=excluded.score,
+                    confidence=excluded.confidence,
+                    rationale=excluded.rationale,
+                    strengths=excluded.strengths,
+                    gaps=excluded.gaps,
+                    input_tokens=excluded.input_tokens,
+                    output_tokens=excluded.output_tokens,
+                    estimated_cost_usd=excluded.estimated_cost_usd,
+                    cached=excluded.cached,
+                    evaluated_at=excluded.evaluated_at
+            """,
+            (
+                record.job_id,
+                record.stage_name,
+                record.resume_hash,
+                record.provider,
+                record.model,
+                record.prompt_version,
+                record.status,
+                record.decision,
+                record.score,
+                record.confidence,
+                record.rationale,
+                json.dumps(record.strengths, ensure_ascii=True),
+                json.dumps(record.gaps, ensure_ascii=True),
+                record.input_tokens,
+                record.output_tokens,
+                record.estimated_cost_usd,
+                int(record.cached),
+                record.evaluated_at,
+            ),
+        )
+        connection.commit()
+
+    def get_ai_evaluation(
+        self,
+        job_id: str,
+        *,
+        stage_name: str,
+        resume_hash: str,
+        provider: str,
+        model: str,
+        prompt_version: str,
+    ) -> StageEvaluationRecord | None:
+        connection = self.connect()
+        row = connection.execute(
+            """
+            SELECT * FROM ai_evaluations
+            WHERE job_id = ? AND stage_name = ? AND resume_hash = ? AND provider = ? AND model = ? AND prompt_version = ?
+            """,
+            (job_id, stage_name, resume_hash, provider, model, prompt_version),
+        ).fetchone()
+        if not row:
+            return None
+        payload = dict(row)
+        return StageEvaluationRecord(
+            job_id=payload["job_id"],
+            stage_name=payload["stage_name"],
+            resume_hash=payload["resume_hash"],
+            provider=payload["provider"],
+            model=payload["model"],
+            prompt_version=payload["prompt_version"],
+            status=payload["status"],
+            decision=payload["decision"],
+            score=payload["score"],
+            confidence=payload["confidence"],
+            rationale=payload["rationale"],
+            strengths=json.loads(payload["strengths"]),
+            gaps=json.loads(payload["gaps"]),
+            input_tokens=payload["input_tokens"],
+            output_tokens=payload["output_tokens"],
+            estimated_cost_usd=float(payload["estimated_cost_usd"]),
+            cached=bool(payload["cached"]),
+            evaluated_at=payload["evaluated_at"],
+        )
+
+    def summarize_costs(self) -> list[dict[str, Any]]:
+        connection = self.connect()
+        rows = connection.execute(
+            """
+            SELECT stage_name, COUNT(*) AS evaluations, ROUND(SUM(estimated_cost_usd), 4) AS total_cost
+            FROM ai_evaluations
+            GROUP BY stage_name
+            ORDER BY stage_name
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_review_rows(self, *, min_scraped_at: str | None = None) -> list[dict[str, Any]]:
         query = """
         SELECT
             jobs.id,
             jobs.title,
             jobs.employer,
             jobs.location,
+            jobs.posted_at,
+            jobs.scraped_at,
+            jobs.description_full,
             jobs.source,
+            jobs.apply_method,
             jobs.apply_url,
+            jobs.hiring_manager_email,
             COALESCE(match_results.score, 0) AS score,
             COALESCE(match_results.rationale, '') AS rationale,
             COALESCE(match_results.status, 'pending') AS match_status,
+            COALESCE(generated_documents.resume_docx_path, '') AS resume_docx_path,
             COALESCE(generated_documents.resume_pdf_path, '') AS resume_pdf_path,
             COALESCE(generated_documents.cover_letter_path, '') AS cover_letter_path,
             COALESCE(generated_documents.status, 'pending') AS document_status,
+            COALESCE(generated_documents.error_message, '') AS document_error,
             COALESCE(deliveries.status, 'pending') AS delivery_status
         FROM jobs
         LEFT JOIN match_results ON match_results.job_id = jobs.id
         LEFT JOIN generated_documents ON generated_documents.job_id = jobs.id
         LEFT JOIN deliveries ON deliveries.job_id = jobs.id
-        ORDER BY COALESCE(match_results.score, 0) DESC, jobs.scraped_at DESC
         """
         connection = self.connect()
-        rows = connection.execute(query).fetchall()
+        params: tuple[Any, ...] = ()
+        if min_scraped_at:
+            query += " WHERE jobs.scraped_at >= ?"
+            params = (min_scraped_at,)
+        query += " ORDER BY COALESCE(match_results.score, 0) DESC, jobs.scraped_at DESC"
+        rows = connection.execute(query, params).fetchall()
         return [dict(row) for row in rows]
+
+    def get_review_row(self, job_id: str) -> dict[str, Any] | None:
+        connection = self.connect()
+        row = connection.execute(
+            """
+            SELECT
+                jobs.id,
+                jobs.title,
+                jobs.employer,
+                jobs.location,
+                jobs.posted_at,
+                jobs.scraped_at,
+                jobs.description_full,
+                jobs.source,
+                jobs.apply_method,
+                jobs.apply_url,
+                jobs.hiring_manager_email,
+                COALESCE(match_results.score, 0) AS score,
+                COALESCE(match_results.rationale, '') AS rationale,
+                COALESCE(match_results.status, 'pending') AS match_status,
+                COALESCE(generated_documents.output_dir, '') AS output_dir,
+                COALESCE(generated_documents.resume_docx_path, '') AS resume_docx_path,
+                COALESCE(generated_documents.resume_pdf_path, '') AS resume_pdf_path,
+                COALESCE(generated_documents.cover_letter_path, '') AS cover_letter_path,
+                COALESCE(generated_documents.status, 'pending') AS document_status,
+                COALESCE(generated_documents.error_message, '') AS document_error,
+                COALESCE(deliveries.method, 'local') AS delivery_method,
+                COALESCE(deliveries.status, 'pending') AS delivery_status,
+                COALESCE(deliveries.message_id, '') AS message_id,
+                COALESCE(deliveries.error_message, '') AS delivery_error
+            FROM jobs
+            LEFT JOIN match_results ON match_results.job_id = jobs.id
+            LEFT JOIN generated_documents ON generated_documents.job_id = jobs.id
+            LEFT JOIN deliveries ON deliveries.job_id = jobs.id
+            WHERE jobs.id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def recent_job_ids(self, *, hours: int = 24, before_scraped_at: str | None = None) -> set[str]:
+        cutoff = (datetime.now(timezone.utc)).timestamp() - (hours * 3600)
+        cutoff_iso = datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat()
+        query = "SELECT id FROM jobs WHERE scraped_at >= ?"
+        params: list[Any] = [cutoff_iso]
+        if before_scraped_at:
+            query += " AND scraped_at <= ?"
+            params.append(before_scraped_at)
+        connection = self.connect()
+        rows = connection.execute(query, tuple(params)).fetchall()
+        return {str(row["id"]) for row in rows}
 
     def latest_run(self) -> dict[str, Any] | None:
         connection = self.connect()

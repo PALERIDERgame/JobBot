@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urlencode
 from urllib.request import ProxyHandler, Request, build_opener
 
+from application_routing import infer_application_routing
 from config import JobBotConfig
 from database import Job
 
@@ -32,7 +33,7 @@ class USAJobsScraper:
             "Keyword": self.config.source.keyword,
             "LocationName": self.config.source.location,
             "ResultsPerPage": self.config.source.results_per_page,
-            "DatePosted": self.config.source.days_back,
+            "DatePosted": min(self.config.source.days_back, 3),
             "WhoMayApply": "public",
             "RemoteIndicator": str(self.config.source.remote_only).lower(),
             "Fields": "Full",
@@ -79,6 +80,8 @@ class USAJobsScraper:
                 first = remuneration[0]
                 salary = f"{first.get('MinimumRange', '')}-{first.get('MaximumRange', '')}"
             apply_uris = descriptor.get("ApplyURI", [])
+            apply_url = apply_uris[0] if apply_uris else descriptor.get("PositionURI", "")
+            routing = infer_application_routing(description, apply_url)
             job = Job(
                 id=Job.build_id(employer, title, location),
                 title=title,
@@ -86,9 +89,9 @@ class USAJobsScraper:
                 location=location,
                 salary_range=salary,
                 description_full=description,
-                apply_method="board",
-                apply_url=apply_uris[0] if apply_uris else descriptor.get("PositionURI", ""),
-                hiring_manager_email="",
+                apply_method=routing.apply_method,
+                apply_url=routing.apply_url,
+                hiring_manager_email=routing.hiring_manager_email,
                 source=self.source_name,
                 posted_at=descriptor.get("PublicationStartDate", ""),
                 scraped_at=datetime.now(timezone.utc).isoformat(),

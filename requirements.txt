@@ -1,4 +1,5 @@
 anthropic
+openai
 apscheduler
 google-auth
 google-auth-oauthlib
@@ -7,3 +8,6 @@ pdfplumber
 pyyaml
 reportlab
 pyinstaller
+python-jobspy
+python-docx
+pywin32
