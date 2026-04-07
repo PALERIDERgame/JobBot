@@ -109,3 +109,11 @@ class ResumeParserTests(unittest.TestCase):
                 or "bullet" in parsed.work_experience_entries[0].bullet_templates[0].style_name.lower()
             )
             self.assertEqual(len(parsed.key_skills_templates), 1)
+
+    def test_parse_resume_can_infer_name_from_source_filename(self) -> None:
+        with workspace_temp_dir() as tmp:
+            resume_path = Path(tmp) / "Robert Thom Resume 2026.docx"
+            cache_path = Path(tmp) / "resume_data.json"
+            _build_resume_docx(resume_path)
+            parsed = parse_resume(resume_path, cache_path)
+            self.assertEqual(parsed.name, "ROBERT THOM")

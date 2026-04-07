@@ -36,6 +36,17 @@ MONTH_PATTERN = re.compile(
     r"(?:\s+\d{4})?(?:\s*-\s*(?:PRESENT|(?:JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER)\s+\d{4}))?$",
     re.IGNORECASE,
 )
+MOJIBAKE_REPLACEMENTS = {
+    "â€”": "—",
+    "â€“": "–",
+    "â€¢": "•",
+    "â—": "●",
+    "â€™": "'",
+    "â€œ": '"',
+    "â€": '"',
+    "Â ": " ",
+    "\uf0b7": "•",
+}
 
 
 @dataclass(slots=True)
@@ -110,6 +121,13 @@ class ResumeData:
         }
 
 
+def _normalize_text(text: str) -> str:
+    normalized = text
+    for bad, good in MOJIBAKE_REPLACEMENTS.items():
+        normalized = normalized.replace(bad, good)
+    return normalized
+
+
 def _extract_text_from_path(path: Path) -> str:
     if path.suffix.lower() == ".pdf":
         if pdfplumber is None:
@@ -118,7 +136,7 @@ def _extract_text_from_path(path: Path) -> str:
         with pdfplumber.open(path) as pdf:
             for page in pdf.pages:
                 pages.append(page.extract_text() or "")
-        return "\n".join(pages).strip()
+        return _normalize_text("\n".join(pages).strip())
     if path.suffix.lower() == ".docx":
         if DocxDocument is None:
             raise RuntimeError("python-docx is required to parse DOCX resumes")
@@ -132,8 +150,8 @@ def _extract_text_from_path(path: Path) -> str:
             if "bullet" in style_name and not text.startswith(("•", "-", "*")):
                 text = f"• {text}"
             paragraphs.append(text)
-        return "\n".join(paragraphs).strip()
-    return path.read_text(encoding="utf-8").strip()
+        return _normalize_text("\n".join(paragraphs).strip())
+    return _normalize_text(path.read_text(encoding="utf-8").strip())
 
 
 def _paragraph_has_numbering(paragraph) -> bool:
@@ -172,7 +190,7 @@ def _extract_phone(text: str) -> str:
 
 
 def _normalize_header(line: str) -> str:
-    return re.sub(r"[:\s]+$", "", line.strip().lower())
+    return re.sub(r"[:\s]+$", "", _normalize_text(line).strip().lower())
 
 
 def _is_section_header(line: str) -> bool:
@@ -206,7 +224,9 @@ def _summary_from_sections(lines: list[str]) -> str:
                     break
                 if _is_noise_line(candidate):
                     continue
-                collected.append(candidate)
+                if _is_role_line(candidate) or _is_date_line(candidate):
+                    continue
+                collected.append(_normalize_text(candidate))
                 if len(" ".join(collected)) >= 240:
                     break
             if collected:
@@ -216,8 +236,8 @@ def _summary_from_sections(lines: list[str]) -> str:
 
 def _fallback_summary(lines: list[str]) -> str:
     candidates = [
-        line for line in lines[:12]
-        if not _is_noise_line(line) and not _is_section_header(line) and len(line.split()) >= 4
+        _normalize_text(line) for line in lines[:12]
+        if not _is_noise_line(line) and not _is_section_header(line) and len(line.split()) >= 4 and not _is_role_line(line) and not _is_date_line(line)
     ]
     return " ".join(candidates[:2])[:280] if candidates else ""
 
@@ -421,14 +441,26 @@ def _structured_sections(lines: list[str]) -> tuple[list[str], list[ResumeWorkEn
     return header_lines, work_entries, education_lines, key_skills_lines
 
 
-def _guess_name(lines: list[str]) -> str:
+def _guess_name(lines: list[str], source_path: Path | None = None) -> str:
     for line in lines[:5]:
-        line = line.strip()
+        line = _normalize_text(line).strip()
         if not line:
+            continue
+        if _is_section_header(line) or _is_role_line(line) or _is_date_line(line):
             continue
         if "@" in line or any(ch.isdigit() for ch in line):
             continue
+        if len(line.split()) < 2:
+            continue
         return line
+    if source_path is not None:
+        stem = source_path.stem
+        stem = re.sub(r"\bresume\b", "", stem, flags=re.IGNORECASE)
+        stem = re.sub(r"\b\d{4}\b", "", stem)
+        stem = re.sub(r"[_-]+", " ", stem)
+        stem = " ".join(part for part in stem.split() if part)
+        if len(stem.split()) >= 2:
+            return stem.title()
     return "Unknown Candidate"
 
 
@@ -451,7 +483,7 @@ def parse_resume(source_path: Path, cache_path: Path) -> ResumeData:
     resume = ResumeData(
         source_path=str(source_path),
         raw_text=text,
-        name=_guess_name(lines),
+        name=_guess_name(lines, source_path),
         email=email,
         phone=phone,
         summary=summary_line,
