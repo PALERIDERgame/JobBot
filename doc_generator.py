@@ -4,6 +4,7 @@ import logging
 import re
 import shutil
 import subprocess
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -11,7 +12,7 @@ from pathlib import Path
 from config import sanitize_filename
 from database import Job
 from match_scorer import MatchScore
-from resume_parser import ResumeData
+from resume_parser import ResumeData, ResumeParagraphTemplate
 
 
 LOGGER = logging.getLogger(__name__)
@@ -141,13 +142,13 @@ class DocumentGenerator:
     def _build_docx_resume(self, path: Path, job: Job, resume: ResumeData, source_docx_path: Path) -> None:
         try:
             from docx import Document as DocxDocument
-            from docx.oxml import OxmlElement
             from docx.text.paragraph import Paragraph
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("python-docx is required to generate DOCX resumes") from exc
 
         document = DocxDocument(str(source_docx_path))
         paragraphs = list(document.paragraphs)
+        source_paragraphs = list(document.paragraphs)
         work_heading_idx = self._find_heading_index(paragraphs, "WORK EXPERIENCE")
         education_heading_idx = self._find_heading_index(paragraphs, "EDUCATION")
         key_skills_heading_idx = self._find_heading_index(paragraphs, "KEY SKILLS")
@@ -159,30 +160,50 @@ class DocumentGenerator:
         work_body = paragraphs[work_heading_idx + 1:education_heading_idx]
         key_skills_body = paragraphs[key_skills_heading_idx + 1:]
 
-        role_template = self._find_work_template(work_body, kind="role")
-        date_template = self._find_work_template(work_body, kind="date")
-        bullet_template = self._find_work_template(work_body, kind="bullet")
-        key_skill_template = self._first_nonempty_paragraph(key_skills_body) or key_skills_heading
-
         for paragraph in work_body:
             self._remove_paragraph(paragraph)
         for paragraph in key_skills_body:
             self._remove_paragraph(paragraph)
 
         for entry in self._tailor_work_entries(resume, job):
-            self._insert_paragraph_before(education_heading, text=str(entry["role_line"]), template=role_template or education_heading)
+            role_template = self._paragraph_from_template(source_paragraphs, entry.get("role_template"))
+            date_template = self._paragraph_from_template(source_paragraphs, entry.get("date_template"))
+            bullet_templates = [
+                template_paragraph
+                for template_paragraph in (
+                    self._paragraph_from_template(source_paragraphs, template)
+                    for template in entry.get("bullet_templates", [])
+                )
+                if template_paragraph is not None
+            ]
+            if role_template is None:
+                raise ValueError("DOCX resume is missing a reusable role paragraph template")
+            self._clone_paragraph_before(education_heading, role_template, str(entry["role_line"]))
             if entry["date_line"]:
-                self._insert_paragraph_before(education_heading, text=str(entry["date_line"]), template=date_template or role_template or education_heading)
-            for bullet in entry["bullets"]:
-                self._insert_paragraph_before(education_heading, text=str(bullet), template=bullet_template or date_template or role_template or education_heading)
+                self._clone_paragraph_before(education_heading, date_template or role_template, str(entry["date_line"]))
+            if not bullet_templates:
+                raise ValueError("DOCX resume is missing reusable bullet paragraph templates")
+            for idx, bullet in enumerate(entry["bullets"]):
+                template = bullet_templates[min(idx, len(bullet_templates) - 1)]
+                self._clone_paragraph_before(education_heading, template, str(bullet))
 
-        key_skill_anchor = key_skills_heading
-        for skill_line in self._chunk_key_skills(self._tailor_key_skills(resume, job), target_chars=105):
-            new_p = OxmlElement("w:p")
-            key_skill_anchor._p.addnext(new_p)
-            inserted = Paragraph(new_p, key_skill_anchor._parent)
-            self._apply_paragraph_template(inserted, key_skill_template, skill_line)
-            key_skill_anchor = inserted
+        key_skill_templates = [
+            template_paragraph
+            for template_paragraph in (
+                self._paragraph_from_template(source_paragraphs, template)
+                for template in resume.key_skills_templates
+            )
+            if template_paragraph is not None
+        ]
+        if not key_skill_templates:
+            key_skill_templates = [self._first_nonempty_paragraph(key_skills_body) or key_skills_heading]
+
+        tailored_skills = self._tailor_key_skills(resume, job)
+        skill_lines = self._render_key_skills_lines(tailored_skills, line_count=max(1, len(key_skill_templates)))
+        anchor = key_skills_heading
+        for idx, skill_line in enumerate(skill_lines):
+            template = key_skill_templates[min(idx, len(key_skill_templates) - 1)]
+            anchor = self._clone_paragraph_after(anchor, template, skill_line)
 
         document.save(str(path))
 
@@ -345,17 +366,38 @@ class DocumentGenerator:
                 return paragraph
         return None
 
-    def _insert_paragraph_before(self, anchor, *, text: str, template):
-        paragraph = anchor.insert_paragraph_before("")
+    @staticmethod
+    def _paragraph_from_template(paragraphs, template: ResumeParagraphTemplate | None):
+        if template is None:
+            return None
+        try:
+            return paragraphs[template.paragraph_index]
+        except IndexError:
+            return None
+
+    def _clone_paragraph_before(self, anchor, template, text: str):
+        from docx.text.paragraph import Paragraph
+
+        cloned = deepcopy(template._p)
+        anchor._p.addprevious(cloned)
+        paragraph = Paragraph(cloned, anchor._parent)
+        self._apply_paragraph_template(paragraph, template, text)
+        return paragraph
+
+    def _clone_paragraph_after(self, anchor, template, text: str):
+        from docx.text.paragraph import Paragraph
+
+        cloned = deepcopy(template._p)
+        anchor._p.addnext(cloned)
+        paragraph = Paragraph(cloned, anchor._parent)
         self._apply_paragraph_template(paragraph, template, text)
         return paragraph
 
     def _apply_paragraph_template(self, paragraph, template, text: str) -> None:
-        if template is not None and getattr(template, "style", None) is not None:
-            paragraph.style = template.style
-            self._copy_paragraph_format(paragraph, template)
-        for run in list(paragraph.runs):
-            run._element.getparent().remove(run._element)
+        for child in list(paragraph._p):
+            if child.tag.endswith("}pPr"):
+                continue
+            paragraph._p.remove(child)
         run = paragraph.add_run(text)
         template_run = template.runs[0] if template is not None and getattr(template, "runs", None) else None
         if template_run is not None:
@@ -368,26 +410,6 @@ class DocumentGenerator:
             font.underline = source_font.underline
 
     @staticmethod
-    def _copy_paragraph_format(target, template) -> None:
-        src = template.paragraph_format
-        dest = target.paragraph_format
-        for attr in (
-            "left_indent",
-            "right_indent",
-            "first_line_indent",
-            "keep_together",
-            "keep_with_next",
-            "page_break_before",
-            "widow_control",
-            "space_before",
-            "space_after",
-            "line_spacing",
-            "line_spacing_rule",
-        ):
-            setattr(dest, attr, getattr(src, attr))
-        dest.alignment = src.alignment
-
-    @staticmethod
     def _remove_paragraph(paragraph) -> None:
         element = paragraph._element
         parent = element.getparent()
@@ -395,44 +417,52 @@ class DocumentGenerator:
             parent.remove(element)
 
     @staticmethod
-    def _chunk_key_skills(skills: list[str], *, target_chars: int) -> list[str]:
-        lines: list[str] = []
-        current = ""
-        for skill in skills:
-            candidate = f"{current}, {skill}" if current else skill
-            if current and len(candidate) > target_chars:
-                lines.append(current)
-                current = skill
-            else:
-                current = candidate
-        if current:
-            lines.append(current)
-        return lines or ["Skills could not be extracted from the source resume."]
+    def _render_key_skills_lines(skills: list[str], *, line_count: int) -> list[str]:
+        if not skills:
+            return ["Skills could not be extracted from the source resume."]
+        if line_count <= 1:
+            return [", ".join(skills)]
+        chunk_size = max(1, (len(skills) + line_count - 1) // line_count)
+        return [", ".join(skills[idx:idx + chunk_size]) for idx in range(0, len(skills), chunk_size)]
 
     def _tailor_work_entries(self, resume: ResumeData, job: Job) -> list[dict[str, object]]:
         job_terms = self._job_terms(job)
+        changed_count = 0
         entries: list[dict[str, object]] = []
         for entry in resume.work_experience_entries:
-            scored_bullets = [
-                (
-                    self._bullet_relevance_score(bullet, job_terms),
-                    idx,
-                    self._refine_bullet(bullet.strip(), job_terms),
+            scored_bullets = []
+            for idx, bullet in enumerate(entry.bullets):
+                rewritten = self._tailor_bullet_text(bullet.strip(), job_terms, job)
+                if rewritten != bullet.strip():
+                    changed_count += 1
+                scored_bullets.append(
+                    (
+                        self._bullet_relevance_score(rewritten, job_terms),
+                        idx,
+                        rewritten,
+                    )
                 )
-                for idx, bullet in enumerate(entry.bullets)
-            ]
             if any(score > 0 for score, _idx, _bullet in scored_bullets):
                 scored_bullets.sort(key=lambda item: (item[0], -item[1]), reverse=True)
                 reordered = [bullet for _score, _idx, bullet in scored_bullets]
             else:
-                reordered = [self._refine_bullet(bullet.strip(), job_terms) for bullet in entry.bullets]
+                reordered = [bullet for _score, _idx, bullet in scored_bullets]
             entries.append(
                 {
                     "role_line": entry.role_line,
                     "date_line": entry.date_line,
                     "bullets": reordered,
+                    "role_template": entry.role_template,
+                    "date_template": entry.date_template,
+                    "bullet_templates": entry.bullet_templates,
                 }
             )
+        if changed_count == 0 and entries:
+            for entry in entries:
+                if not entry["bullets"]:
+                    continue
+                entry["bullets"][0] = self._force_tailored_emphasis(str(entry["bullets"][0]), job_terms, job)
+                break
         return entries
 
     def _tailor_key_skills(self, resume: ResumeData, job: Job) -> list[str]:
@@ -485,6 +515,44 @@ class DocumentGenerator:
         if len(set(re.findall(r"[a-z][a-z0-9+#&-]{2,}", cleaned.lower())) & job_terms) >= 2:
             return f"{cleaned}."
         return cleaned
+
+    def _tailor_bullet_text(self, bullet: str, job_terms: set[str], job: Job) -> str:
+        cleaned = self._refine_bullet(bullet, job_terms)
+        lowered = cleaned.lower()
+        emphasis: list[str] = []
+        if any(term in job_terms for term in {"analytics", "reporting", "dashboard", "insights"}):
+            if any(token in lowered for token in {"dashboard", "data", "metrics", "analysis", "report"}):
+                emphasis.append("analytics and reporting")
+        if any(term in job_terms for term in {"growth", "ecommerce", "marketing", "customer", "brand"}):
+            if any(token in lowered for token in {"campaign", "social media", "brand", "lead", "donor", "ad", "marketing"}):
+                emphasis.append("growth marketing")
+        if any(term in job_terms for term in {"stakeholder", "partnership", "cross-functional", "collaboration"}):
+            if any(token in lowered for token in {"collaborated", "coordinated", "community leaders", "clients", "partners", "worked with"}):
+                emphasis.append("cross-functional collaboration")
+        if any(term in job_terms for term in {"operations", "process", "program", "execution"}):
+            if any(token in lowered for token in {"managed", "oversaw", "streamlined", "implemented", "training", "operations"}):
+                emphasis.append("operational execution")
+
+        emphasis = [item for idx, item in enumerate(emphasis) if item not in emphasis[:idx]]
+        if not emphasis:
+            return cleaned
+        joined = " and ".join(emphasis[:2])
+        if re.match(r"^(led|managed|oversaw|streamlined|coordinated|collaborated|created|developed|recruited|planned|analyzed|captured|produced|presented|leveraged|expanded|spearheaded)\b", lowered):
+            return re.sub(
+                r"^([A-Z][^ ]+\b)",
+                rf"\1 with a focus on {joined}",
+                cleaned,
+                count=1,
+            )
+        return f"{cleaned.rstrip('.')} with a focus on {joined}."
+
+    def _force_tailored_emphasis(self, bullet: str, job_terms: set[str], job: Job) -> str:
+        cleaned = self._refine_bullet(bullet, job_terms).rstrip(".")
+        if "analytics" in job_terms or "reporting" in job_terms or "dashboard" in job_terms:
+            return f"{cleaned}, highlighting performance analysis and reporting."
+        if "marketing" in job_terms or "growth" in job_terms or "ecommerce" in job_terms:
+            return f"{cleaned}, highlighting growth-focused execution."
+        return f"{cleaned}, aligned to the role's core priorities."
 
     @staticmethod
     def _skills_from_lines(lines: list[str]) -> list[str]:

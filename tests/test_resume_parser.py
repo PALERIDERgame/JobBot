@@ -102,3 +102,10 @@ class ResumeParserTests(unittest.TestCase):
             self.assertEqual(parsed.work_experience_entries[0].date_line, "JULY 2024 - Present")
             self.assertIn("Led digital ad strategy and reporting.", parsed.work_experience_entries[0].bullets)
             self.assertIn("Operations", " ".join(parsed.key_skills_lines))
+            self.assertIsNotNone(parsed.work_experience_entries[0].role_template)
+            self.assertTrue(parsed.work_experience_entries[0].bullet_templates)
+            self.assertTrue(
+                parsed.work_experience_entries[0].bullet_templates[0].has_numbering
+                or "bullet" in parsed.work_experience_entries[0].bullet_templates[0].style_name.lower()
+            )
+            self.assertEqual(len(parsed.key_skills_templates), 1)
