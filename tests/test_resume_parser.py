@@ -1,10 +1,31 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import unittest
 from pathlib import Path
 
 from resume_parser import load_cached_resume, parse_resume
 from test_support import workspace_temp_dir
+
+
+def _build_resume_docx(path: Path) -> None:
+    from docx import Document
+
+    doc = Document()
+    doc.add_paragraph("ROBERT THOM")
+    doc.add_paragraph("robert@example.com | linkedin.com/in/example | (530) 220-4847")
+    doc.add_paragraph("WORK EXPERIENCE")
+    doc.add_paragraph("Underdog Strategies, New York, NY — Digital Advertising and Field Manager")
+    doc.add_paragraph("JULY 2024 - Present")
+    bullet = doc.add_paragraph(style="List Bullet")
+    bullet.add_run("Led digital ad strategy and reporting.")
+    bullet = doc.add_paragraph(style="List Bullet")
+    bullet.add_run("Managed creative vendors and campaign launches.")
+    doc.add_paragraph("EDUCATION")
+    doc.add_paragraph("University of California, Davis")
+    doc.add_paragraph("Bachelor of Arts in Political Science Class of 2015")
+    doc.add_paragraph("KEY SKILLS")
+    doc.add_paragraph("Operations, Project Management, CRM, Data Analysis")
+    doc.save(str(path))
 
 
 class ResumeParserTests(unittest.TestCase):
@@ -69,4 +90,15 @@ class ResumeParserTests(unittest.TestCase):
             self.assertEqual(parsed.work_experience_entries[0].role_line, "Underdog Strategies, New York, NY — Digital Advertising and Field Manager")
             self.assertEqual(parsed.work_experience_entries[0].date_line, "JULY 2024 - Present")
             self.assertIn("University of California, Davis", parsed.education_lines)
+            self.assertIn("Operations", " ".join(parsed.key_skills_lines))
+
+    def test_parse_docx_resume_extracts_structured_sections(self) -> None:
+        with workspace_temp_dir() as tmp:
+            resume_path = Path(tmp) / "resume.docx"
+            cache_path = Path(tmp) / "resume_data.json"
+            _build_resume_docx(resume_path)
+            parsed = parse_resume(resume_path, cache_path)
+            self.assertEqual(parsed.header_lines[0], "ROBERT THOM")
+            self.assertEqual(parsed.work_experience_entries[0].date_line, "JULY 2024 - Present")
+            self.assertIn("Led digital ad strategy and reporting.", parsed.work_experience_entries[0].bullets)
             self.assertIn("Operations", " ".join(parsed.key_skills_lines))

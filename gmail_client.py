@@ -50,7 +50,10 @@ class GmailClient:
             message["Subject"] = self._build_subject(job)
             message.set_content(self._build_body(job, score))
 
-            attachments = [path for path in (docs.resume_pdf_path, docs.resume_docx_path, docs.cover_letter_path) if path and path.exists()]
+            attachments = [
+                path for path in (docs.resume_pdf_path, docs.resume_docx_path, docs.cover_letter_path)
+                if path != Path() and path.exists()
+            ]
             for attachment_path in attachments:
                 data = attachment_path.read_bytes()
                 mime_type, _ = mimetypes.guess_type(str(attachment_path))

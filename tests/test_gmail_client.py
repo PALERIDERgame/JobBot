@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import base64
 import unittest
@@ -71,3 +71,29 @@ class GmailClientTests(unittest.TestCase):
             )
             self.assertEqual(result.status, "failed")
             self.assertEqual(result.error_message, "No delivery recipient available")
+
+    def test_docx_attachment_is_included_when_pdf_is_missing(self) -> None:
+        with workspace_temp_dir() as tmp:
+            resume_docx_path = Path(tmp) / "resume.docx"
+            cover_letter_path = Path(tmp) / "cover_letter.txt"
+            resume_docx_path.write_bytes(b"docx-bytes")
+            cover_letter_path.write_text("cover", encoding="utf-8")
+
+            service = MagicMock()
+            service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "msg-456"}
+            client = GmailClient(
+                GmailConfig(enabled=True, sender_email="me@example.com", recipient_email="review@example.com", client_secrets_file="client.json"),
+                Path(tmp) / "token.json",
+            )
+            client._build_service = lambda: service
+
+            result = client.deliver_match(
+                Job("1", "Engineer", "Acme", "Remote", "", "Role", "board", "https://example.com", "", "usajobs", "", ""),
+                MatchScore(90, "Fit", [], [], True, "scored", "", ""),
+                GeneratedDocs(Path(tmp), Path(), cover_letter_path, resume_docx_path=resume_docx_path),
+            )
+
+            self.assertEqual(result.status, "sent")
+            raw_message = service.users.return_value.messages.return_value.send.call_args.kwargs["body"]["raw"]
+            decoded = base64.urlsafe_b64decode(raw_message.encode("utf-8")).decode("utf-8", errors="ignore")
+            self.assertIn("resume.docx", decoded)
