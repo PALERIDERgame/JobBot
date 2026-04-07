@@ -1,0 +1,37 @@
+{
+  "source_path": "C:\\Projects\\JobBot\\tests\\_tmp\\da5c5001f5cf42ecbcb24d081d20675b\\resume.txt",
+  "raw_text": "ROBERT THOM\nrobert@example.com | linkedin.com/in/example | (530) 220-4847\nWORK EXPERIENCE\nUnderdog Strategies, New York, NY \u2014 Digital Advertising and Field Manager\nJULY 2024 - Present\n\u25cf Led digital ad strategy and reporting.\nEDUCATION\nUniversity of California, Davis\nBachelor of Arts in Political Science Class of 2015\nKEY SKILLS\nOperations, Project Management, CRM, Data Analysis",
+  "name": "ROBERT THOM",
+  "email": "robert@example.com",
+  "phone": "(530) 220-4847",
+  "summary": "Underdog Strategies, New York, NY \u2014 Digital Advertising and Field Manager JULY 2024 - Present",
+  "skills": [
+    "Operations",
+    "Project Management",
+    "CRM",
+    "Data Analysis"
+  ],
+  "experience_lines": [
+    "Underdog Strategies, New York, NY \u2014 Digital Advertising and Field Manager"
+  ],
+  "header_lines": [
+    "ROBERT THOM",
+    "robert@example.com | linkedin.com/in/example | (530) 220-4847"
+  ],
+  "education_lines": [
+    "University of California, Davis",
+    "Bachelor of Arts in Political Science Class of 2015"
+  ],
+  "key_skills_lines": [
+    "Operations, Project Management, CRM, Data Analysis"
+  ],
+  "work_experience_entries": [
+    {
+      "role_line": "Underdog Strategies, New York, NY \u2014 Digital Advertising and Field Manager",
+      "date_line": "JULY 2024 - Present",
+      "bullets": [
+        "Led digital ad strategy and reporting."
+      ]
+    }
+  ]
+}

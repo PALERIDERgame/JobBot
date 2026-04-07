@@ -1,0 +1,64 @@
+source:
+  enabled: true
+  provider: usajobs
+  keyword: data engineer
+  location: ''
+  results_per_page: 25
+  days_back: 7
+  remote_only: false
+  api_url: https://data.usajobs.gov/api/search
+  user_agent: jobbot-demo@example.com
+  authorization_key: ''
+gmail:
+  enabled: false
+  sender_email: ''
+  recipient_email: ''
+  client_secrets_file: ''
+schedule:
+  enabled: false
+  weekdays:
+  - mon
+  - tue
+  - wed
+  - thu
+  - fri
+  start_hour_est: 7
+  end_hour_est: 17
+  interval_minutes: 120
+automation_mode: semi_auto
+llm_provider: anthropic
+cheap_stage_provider: ollama_local
+cheap_stage_model: qwen2.5:7b
+strong_stage_provider: anthropic
+strong_stage_model: claude-sonnet-4-20250514
+doc_stage_provider: openai
+doc_stage_model: gpt-5-mini
+ollama_base_url: http://localhost:11434
+proxy_list: []
+scoring_threshold: 70
+rate_limit_min_seconds: 3
+rate_limit_max_seconds: 5
+resume_source_path: ''
+output_dir: output
+target_titles:
+- software engineer
+- python developer
+include_titles:
+- software engineer
+- python developer
+exclude_titles:
+- principal
+- sales
+- designer
+force_escalate_keywords:
+- python
+- automation
+- llm
+- agent
+salary_floor: 0
+cheap_reject_threshold: 55
+cheap_escalate_threshold: 75
+final_apply_threshold: 80
+enable_cost_tracking: true
+anthropic_api_key: ''
+openai_api_key: ''

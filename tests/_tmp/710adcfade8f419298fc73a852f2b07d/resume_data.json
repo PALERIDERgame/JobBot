@@ -1,0 +1,16 @@
+{
+  "source_path": "C:\\Projects\\JobBot\\tests\\_tmp\\710adcfade8f419298fc73a852f2b07d\\resume.txt",
+  "raw_text": "ROBERT THOM\nrobert@example.com | linkedin.com/in/example | (530) 220-4847\nPROFESSIONAL SUMMARY\nMarketing and operations leader with campaign, field, and analytics experience.\nKEY SKILLS\nDigital Advertising, Campaign Management, Operations\nWORK EXPERIENCE\nUnderdog Strategies - Digital Advertising and Field Manager",
+  "name": "ROBERT THOM",
+  "email": "robert@example.com",
+  "phone": "(530) 220-4847",
+  "summary": "Marketing and operations leader with campaign, field, and analytics experience.",
+  "skills": [
+    "Digital Advertising",
+    "Campaign Management",
+    "Operations"
+  ],
+  "experience_lines": [
+    "Underdog Strategies - Digital Advertising and Field Manager"
+  ]
+}

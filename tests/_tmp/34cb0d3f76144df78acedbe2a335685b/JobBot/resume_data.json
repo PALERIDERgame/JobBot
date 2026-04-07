@@ -1,0 +1,23 @@
+{
+  "source_path": "C:\\Projects\\JobBot\\tests\\_tmp\\34cb0d3f76144df78acedbe2a335685b\\resume.txt",
+  "raw_text": "Jane Candidate\njane@example.com\n555-123-4567\nSummary: Python engineer\nSkills: Python, SQL\nBuilt APIs",
+  "name": "Jane Candidate",
+  "email": "jane@example.com",
+  "phone": "555-123-4567",
+  "summary": "Experienced professional with relevant background.",
+  "skills": [
+    "Python",
+    "SQL Built APIs"
+  ],
+  "experience_lines": [
+    "Summary: Python engineer",
+    "Built APIs"
+  ],
+  "header_lines": [
+    "Jane Candidate",
+    "jane@example.com"
+  ],
+  "education_lines": [],
+  "key_skills_lines": [],
+  "work_experience_entries": []
+}
