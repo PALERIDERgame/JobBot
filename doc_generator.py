@@ -260,38 +260,19 @@ class DocumentGenerator:
 
     def _build_cover_letter(self, path: Path, job: Job, resume: ResumeData, score: MatchScore, *, ai_notes: str) -> None:
         clean_employer = self._display_employer(job.employer)
-        clean_summary = self._clean_summary(resume.summary)
-        strengths = score.strengths or resume.skills[:3] or ["campaign management", "operations", "stakeholder coordination"]
+        signoff_name = self._signoff_name(resume)
         if ai_notes:
             letter_text = "\n".join(
                 [
                     f"Dear Hiring Team at {clean_employer},",
                     "",
-                    ai_notes,
+                    self._normalize_output_text(ai_notes),
                     "",
-                    f"Sincerely,\n{resume.name}",
+                    f"Sincerely,\n{signoff_name}",
                 ]
             )
         else:
-            letter_text = "\n".join(
-                [
-                    f"Dear Hiring Team at {clean_employer},",
-                    "",
-                    f"I am applying for the {job.title} role{f' in {job.location}' if job.location else ''}.",
-                    f"My background includes {clean_summary}",
-                    "",
-                    f"My recent work is most relevant in {', '.join(strengths[:3])}.",
-                    "",
-                    "Selected experience highlights:",
-                    *[f"- {item}" for item in (resume.experience_lines[:3] or strengths[:3])],
-                    "",
-                    self._clean_rationale(score.rationale),
-                    "",
-                    "I would welcome the opportunity to discuss how my experience can support your team.",
-                    "",
-                    f"Sincerely,\n{resume.name}",
-                ]
-            )
+            letter_text = self._compose_cover_letter(job, resume, score, clean_employer, signoff_name)
         path.write_text(letter_text, encoding="utf-8")
 
     def _export_docx_to_pdf(self, docx_path: Path, pdf_path: Path) -> None:
@@ -489,6 +470,85 @@ class DocumentGenerator:
         )
         return [candidate.name for candidate in deduped]
 
+    def _compose_cover_letter(self, job: Job, resume: ResumeData, score: MatchScore, employer: str, signoff_name: str) -> str:
+        location_text = f" in {job.location}" if job.location else ""
+        opening = (
+            f"I am excited to apply for the {job.title} role at {employer}{location_text}. "
+            f"My background combines {self._resume_value_summary(resume, job)}."
+        )
+        evidence = self._cover_letter_evidence_paragraph(resume, job)
+        closing = self._cover_letter_closing(job, resume, score, employer)
+        return "\n".join(
+            [
+                f"Dear Hiring Team at {employer},",
+                "",
+                opening,
+                "",
+                evidence,
+                "",
+                closing,
+                "",
+                f"Sincerely,\n{signoff_name}",
+            ]
+        )
+
+    def _cover_letter_evidence_paragraph(self, resume: ResumeData, job: Job) -> str:
+        evidence_lines = self._select_cover_letter_evidence(resume, job)
+        if not evidence_lines:
+            return (
+                f"In prior roles, I have consistently delivered results in {self._format_list(self._tailor_key_skills(resume, job)[:3])}, "
+                f"and I would bring that same practical, results-focused approach to this position."
+            )
+        if len(evidence_lines) == 1:
+            return evidence_lines[0]
+        return " ".join(evidence_lines[:3])
+
+    def _select_cover_letter_evidence(self, resume: ResumeData, job: Job) -> list[str]:
+        job_terms = self._job_terms(job)
+        candidates: list[tuple[int, int, str]] = []
+        for entry in resume.work_experience_entries:
+            for idx, bullet in enumerate(entry.bullets):
+                score = self._bullet_relevance_score(bullet, job_terms)
+                sentence = self._cover_letter_sentence(entry.role_line, bullet, job_terms, job)
+                candidates.append((score, -idx, sentence))
+        candidates.sort(reverse=True)
+        selected: list[str] = []
+        seen: set[str] = set()
+        for relevance, _idx, sentence in candidates:
+            normalized = sentence.lower()
+            if normalized in seen:
+                continue
+            if relevance <= 0 and selected:
+                continue
+            seen.add(normalized)
+            selected.append(sentence)
+            if len(selected) >= 3:
+                break
+        return selected
+
+    def _cover_letter_sentence(self, role_line: str, bullet: str, job_terms: set[str], job: Job) -> str:
+        cleaned_role = role_line.split("—", 1)[-1].strip() if "—" in role_line else role_line
+        bullet_text = self._tailor_bullet_text(self._normalize_output_text(bullet), job_terms, job).rstrip(".")
+        return f"As {cleaned_role}, I {self._lowercase_first_character(bullet_text)}."
+
+    def _resume_value_summary(self, resume: ResumeData, job: Job) -> str:
+        themes = self._job_theme_labels(job)
+        if themes:
+            return self._format_list(themes[:3]) + " that align well with the role"
+        summary = self._clean_summary(resume.summary)
+        if summary and summary != "an adaptable background with relevant professional experience.":
+            return summary.rstrip(".").lower()
+        skills = self._tailor_key_skills(resume, job)[:3]
+        return self._format_list(skills) + " experience"
+
+    def _cover_letter_closing(self, job: Job, resume: ResumeData, score: MatchScore, employer: str) -> str:
+        themes = self._job_theme_labels(job)
+        theme_text = self._format_list(themes[:2]) if themes else self._format_list(self._tailor_key_skills(resume, job)[:2])
+        return (
+            f"I would welcome the opportunity to bring my experience in {theme_text} to {employer} "
+            f"and help advance the priorities of the {job.title} role."
+        )
+
     def _infer_skills(self, resume: ResumeData, job: Job) -> list[SkillCandidate]:
         resume_text = f"{resume.raw_text} {' '.join(resume.experience_lines)} {' '.join(resume.key_skills_lines)}".lower()
         job_text = f"{job.title} {job.description_full}".lower()
@@ -588,7 +648,13 @@ class DocumentGenerator:
     @staticmethod
     def _clean_summary(summary: str) -> str:
         cleaned = " ".join((summary or "").split())
-        if not cleaned:
+        lowered = cleaned.lower()
+        if (
+            not cleaned
+            or lowered in {"work experience", "education", "key skills"}
+            or re.match(r"^(january|february|march|april|may|june|july|august|september|october|november|december)\b", lowered)
+            or "—" in cleaned
+        ):
             return "an adaptable background with relevant professional experience."
         return cleaned.rstrip(".") + "."
 
@@ -598,6 +664,74 @@ class DocumentGenerator:
         if not cleaned or "ai scoring skipped in semi_auto" in cleaned.lower():
             return "I believe my background is relevant to the role and would welcome the opportunity to discuss it further."
         return cleaned
+
+    @staticmethod
+    def _normalize_output_text(text: str) -> str:
+        normalized = " ".join((text or "").split())
+        replacements = {
+            "â€”": "—",
+            "â€“": "–",
+            "â€¢": "•",
+            "â€™": "'",
+            "â€œ": '"',
+            "â€": '"',
+        }
+        for bad, good in replacements.items():
+            normalized = normalized.replace(bad, good)
+        return normalized
+
+    def _signoff_name(self, resume: ResumeData) -> str:
+        cleaned = self._normalize_output_text(resume.name).strip()
+        if (
+            not cleaned
+            or cleaned.lower() in {"unknown candidate", "work experience", "education", "key skills"}
+            or "@" in cleaned
+            or len(cleaned.split()) < 2
+        ):
+            header_candidates = [
+                self._normalize_output_text(line).strip()
+                for line in resume.header_lines
+                if line.strip()
+            ]
+            for candidate in header_candidates:
+                if "@" in candidate or any(ch.isdigit() for ch in candidate):
+                    continue
+                if candidate.lower() in {"work experience", "education", "key skills"}:
+                    continue
+                if len(candidate.split()) >= 2:
+                    return candidate.title() if candidate.isupper() else candidate
+            return "Robert Thom"
+        return cleaned.title() if cleaned.isupper() else cleaned
+
+    @staticmethod
+    def _lowercase_first_character(text: str) -> str:
+        if not text:
+            return text
+        return text[0].lower() + text[1:]
+
+    @staticmethod
+    def _format_list(items: list[str]) -> str:
+        cleaned = [item for item in items if item]
+        if not cleaned:
+            return "relevant experience"
+        if len(cleaned) == 1:
+            return cleaned[0]
+        if len(cleaned) == 2:
+            return f"{cleaned[0]} and {cleaned[1]}"
+        return f"{', '.join(cleaned[:-1])}, and {cleaned[-1]}"
+
+    def _job_theme_labels(self, job: Job) -> list[str]:
+        job_terms = self._job_terms(job)
+        themes: list[str] = []
+        if any(term in job_terms for term in {"ecommerce", "growth", "marketing", "customer", "brand"}):
+            themes.append("digital growth")
+        if any(term in job_terms for term in {"analytics", "reporting", "dashboard", "insights"}):
+            themes.append("analytics and reporting")
+        if any(term in job_terms for term in {"cross-functional", "collaboration", "stakeholder", "partnership"}):
+            themes.append("cross-functional execution")
+        if any(term in job_terms for term in {"operations", "process", "program", "execution"}):
+            themes.append("operational leadership")
+        return themes
 
     def _write_fallback_pdf(self, path: Path, job: Job, resume: ResumeData, score: MatchScore) -> None:
         lines = [

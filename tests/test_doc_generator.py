@@ -61,6 +61,8 @@ class DocumentGeneratorTests(unittest.TestCase):
             text = docs.cover_letter_path.read_text(encoding="utf-8")
             self.assertNotIn("nan", text.lower())
             self.assertNotIn("AI scoring skipped", text)
+            self.assertNotIn("Selected experience highlights:", text)
+            self.assertNotIn("I believe my background is relevant", text)
 
     def test_generate_docx_resume_preserves_sections_and_writes_docx_and_pdf(self) -> None:
         with workspace_temp_dir() as tmp:
@@ -121,6 +123,63 @@ class DocumentGeneratorTests(unittest.TestCase):
             text = "\n".join(paragraph.text for paragraph in document.paragraphs if paragraph.text.strip())
             self.assertIn("focus on analytics and reporting", text.lower())
             self.assertNotIn("Target Role", text)
+
+    def test_cover_letter_is_structured_and_tailored_for_relevant_job(self) -> None:
+        with workspace_temp_dir() as tmp:
+            source_docx = Path(tmp) / "source_resume.docx"
+            _build_source_resume_docx(source_docx)
+            generator = DocumentGenerator()
+            generator._export_docx_to_pdf = lambda docx_path, pdf_path: pdf_path.write_bytes(b"pdf")
+            resume = parse_resume(source_docx, Path(tmp) / "resume_cache.json")
+            docs = generator.generate(
+                Path(tmp),
+                Job("1", "Director of Ecommerce", "MILK BAR", "New York, NY", "", "Lead ecommerce growth, marketing analytics, dashboard reporting, and cross-functional execution.", "board", "https://example.com", "", "jobspy", "", ""),
+                resume,
+                MatchScore(0, "", [], [], False, "review", "", "2026-01-01T00:00:00+00:00"),
+                ai_notes="",
+            )
+            text = docs.cover_letter_path.read_text(encoding="utf-8")
+            self.assertIn("Director of Ecommerce", text)
+            self.assertIn("MILK BAR", text)
+            self.assertIn("analytics and reporting", text.lower())
+            self.assertIn("digital growth", text.lower())
+            self.assertIn("Sincerely,\nRobert Thom", text)
+            self.assertNotIn("Selected experience highlights:", text)
+            self.assertNotIn("I believe my background is relevant", text)
+            self.assertNotIn("â€”", text)
+            self.assertNotIn("- Underdog Strategies", text)
+
+    def test_cover_letter_uses_safe_signoff_when_resume_name_is_bad(self) -> None:
+        generator = DocumentGenerator()
+        resume = ResumeData(
+            "resume.docx",
+            "",
+            "WORK EXPERIENCE",
+            "robert@example.com",
+            "(530) 220-4847",
+            "",
+            ["Operations"],
+            ["Led digital ad strategy and reporting"],
+            header_lines=["ROBERT THOM", "robert@example.com | linkedin.com/in/example | (530) 220-4847"],
+            work_experience_entries=[
+                ResumeWorkEntry(
+                    role_line="Underdog Strategies, New York, NY — Digital Advertising and Field Manager",
+                    date_line="JULY 2024 - Present",
+                    bullets=["Led digital ad strategy and reporting"],
+                )
+            ],
+        )
+        with workspace_temp_dir() as tmp:
+            docs = generator.generate(
+                Path(tmp),
+                Job("1", "Director", "Acme", "Remote", "", "Lead analytics and reporting.", "board", "https://example.com", "", "jobspy", "", ""),
+                resume,
+                MatchScore(0, "", [], [], False, "review", "", "2026-01-01T00:00:00+00:00"),
+                ai_notes="",
+            )
+            text = docs.cover_letter_path.read_text(encoding="utf-8")
+            self.assertIn("Sincerely,\nRobert Thom", text)
+            self.assertNotIn("Sincerely,\nWORK EXPERIENCE", text)
 
     def test_inferred_skills_are_added_when_supported(self) -> None:
         generator = DocumentGenerator()
