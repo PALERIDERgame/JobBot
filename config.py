@@ -32,11 +32,12 @@ def sanitize_filename(value: str) -> str:
 @dataclass(slots=True)
 class SourceConfig:
     enabled: bool = True
-    provider: str = "usajobs"
+    provider: str = "jobspy"
     keyword: str = "software engineer"
     location: str = ""
-    results_per_page: int = 25
-    days_back: int = 7
+    jobspy_sites: list[str] = field(default_factory=lambda: ["indeed", "google"])
+    results_per_page: int = 100
+    days_back: int = 3
     remote_only: bool = False
     api_url: str = "https://data.usajobs.gov/api/search"
     user_agent: str = "jobbot-demo@example.com"
@@ -65,6 +66,15 @@ class JobBotConfig:
     source: SourceConfig = field(default_factory=SourceConfig)
     gmail: GmailConfig = field(default_factory=GmailConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
+    automation_mode: str = "semi_auto"
+    llm_provider: str = "anthropic"
+    cheap_stage_provider: str = "ollama_local"
+    cheap_stage_model: str = "qwen2.5:7b"
+    strong_stage_provider: str = "anthropic"
+    strong_stage_model: str = "claude-sonnet-4-20250514"
+    doc_stage_provider: str = "openai"
+    doc_stage_model: str = "gpt-5-mini"
+    ollama_base_url: str = "http://localhost:11434"
     proxy_list: list[str] = field(default_factory=list)
     scoring_threshold: int = 70
     rate_limit_min_seconds: int = 3
@@ -72,7 +82,17 @@ class JobBotConfig:
     resume_source_path: str = ""
     output_dir: str = "output"
     target_titles: list[str] = field(default_factory=lambda: ["software engineer", "python developer"])
+    include_titles: list[str] = field(default_factory=lambda: ["software engineer", "python developer"])
+    exclude_titles: list[str] = field(default_factory=lambda: ["principal", "sales", "designer"])
+    force_escalate_keywords: list[str] = field(default_factory=lambda: ["python", "automation", "llm", "agent"])
+    salary_floor: int = 0
+    cheap_reject_threshold: int = 55
+    cheap_escalate_threshold: int = 75
+    final_apply_threshold: int = 80
+    skip_ai_scoring_in_semi_auto: bool = True
+    enable_cost_tracking: bool = True
     anthropic_api_key: str = ""
+    openai_api_key: str = ""
 
 
 @dataclass(slots=True)
@@ -134,6 +154,15 @@ def load_or_create_config(paths: AppPaths) -> JobBotConfig:
         source=_merge_dataclass(SourceConfig, raw.get("source")),
         gmail=_merge_dataclass(GmailConfig, raw.get("gmail")),
         schedule=_merge_dataclass(ScheduleConfig, raw.get("schedule")),
+        automation_mode=str(raw.get("automation_mode", "semi_auto")),
+        llm_provider=str(raw.get("llm_provider", "anthropic")),
+        cheap_stage_provider=str(raw.get("cheap_stage_provider", "ollama_local")),
+        cheap_stage_model=str(raw.get("cheap_stage_model", "qwen2.5:7b")),
+        strong_stage_provider=str(raw.get("strong_stage_provider", "anthropic")),
+        strong_stage_model=str(raw.get("strong_stage_model", "claude-sonnet-4-20250514")),
+        doc_stage_provider=str(raw.get("doc_stage_provider", "openai")),
+        doc_stage_model=str(raw.get("doc_stage_model", "gpt-5-mini")),
+        ollama_base_url=str(raw.get("ollama_base_url", "http://localhost:11434")),
         proxy_list=list(raw.get("proxy_list", [])),
         scoring_threshold=int(raw.get("scoring_threshold", 70)),
         rate_limit_min_seconds=int(raw.get("rate_limit_min_seconds", 3)),
@@ -141,7 +170,17 @@ def load_or_create_config(paths: AppPaths) -> JobBotConfig:
         resume_source_path=str(raw.get("resume_source_path", "")),
         output_dir=str(raw.get("output_dir", "output")),
         target_titles=list(raw.get("target_titles", ["software engineer", "python developer"])),
+        include_titles=list(raw.get("include_titles", ["software engineer", "python developer"])),
+        exclude_titles=list(raw.get("exclude_titles", ["principal", "sales", "designer"])),
+        force_escalate_keywords=list(raw.get("force_escalate_keywords", ["python", "automation", "llm", "agent"])),
+        salary_floor=int(raw.get("salary_floor", 0)),
+        cheap_reject_threshold=int(raw.get("cheap_reject_threshold", 55)),
+        cheap_escalate_threshold=int(raw.get("cheap_escalate_threshold", 75)),
+        final_apply_threshold=int(raw.get("final_apply_threshold", 80)),
+        skip_ai_scoring_in_semi_auto=bool(raw.get("skip_ai_scoring_in_semi_auto", True)),
+        enable_cost_tracking=bool(raw.get("enable_cost_tracking", True)),
         anthropic_api_key=str(raw.get("anthropic_api_key", "")),
+        openai_api_key=str(raw.get("openai_api_key", "")),
     )
     validate_config(config)
     return config
@@ -152,6 +191,32 @@ def validate_config(config: JobBotConfig) -> None:
         raise ValueError("Invalid rate limit range")
     if not 0 <= config.scoring_threshold <= 100:
         raise ValueError("scoring_threshold must be between 0 and 100")
+    if config.automation_mode not in {"semi_auto", "auto"}:
+        raise ValueError("automation_mode must be 'semi_auto' or 'auto'")
+    if config.llm_provider not in {"anthropic", "openai"}:
+        raise ValueError("llm_provider must be 'anthropic' or 'openai'")
+    if config.source.provider not in {"usajobs", "jobspy"}:
+        raise ValueError("source.provider must be 'usajobs' or 'jobspy'")
+    if not config.source.jobspy_sites:
+        raise ValueError("source.jobspy_sites must contain at least one site")
+    if config.source.days_back <= 0:
+        raise ValueError("source.days_back must be greater than 0")
+    if config.cheap_stage_provider not in {"ollama_local", "openai", "anthropic"}:
+        raise ValueError("cheap_stage_provider must be 'ollama_local', 'openai', or 'anthropic'")
+    if config.strong_stage_provider not in {"openai", "anthropic"}:
+        raise ValueError("strong_stage_provider must be 'openai' or 'anthropic'")
+    if config.doc_stage_provider not in {"openai", "anthropic", "cheap_stage"}:
+        raise ValueError("doc_stage_provider must be 'openai', 'anthropic', or 'cheap_stage'")
+    if not 0 <= config.cheap_reject_threshold <= 100:
+        raise ValueError("cheap_reject_threshold must be between 0 and 100")
+    if not 0 <= config.cheap_escalate_threshold <= 100:
+        raise ValueError("cheap_escalate_threshold must be between 0 and 100")
+    if not 0 <= config.final_apply_threshold <= 100:
+        raise ValueError("final_apply_threshold must be between 0 and 100")
+    if config.source.results_per_page <= 0:
+        raise ValueError("source.results_per_page must be greater than 0")
+    if config.cheap_reject_threshold > config.cheap_escalate_threshold:
+        raise ValueError("cheap_reject_threshold must be <= cheap_escalate_threshold")
     if config.schedule.start_hour_est < 0 or config.schedule.end_hour_est > 23:
         raise ValueError("Schedule hours must be between 0 and 23")
     if config.schedule.end_hour_est < config.schedule.start_hour_est:

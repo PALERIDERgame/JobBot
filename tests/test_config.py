@@ -16,6 +16,9 @@ class ConfigTests(unittest.TestCase):
                 config = load_or_create_config(paths)
                 self.assertTrue(paths.config_file.exists())
                 self.assertEqual(config.scoring_threshold, 70)
+                self.assertEqual(config.source.results_per_page, 100)
+                self.assertEqual(config.cheap_stage_provider, "ollama_local")
+                self.assertEqual(config.strong_stage_provider, "anthropic")
 
     def test_resolve_output_dir_uses_appdata_when_relative(self) -> None:
         with workspace_temp_dir() as tmp:

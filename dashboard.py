@@ -1,14 +1,96 @@
 from __future__ import annotations
 
+import copy
 import os
 import threading
 import tkinter as tk
 import webbrowser
+from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from config import AppPaths, JobBotConfig, load_or_create_config, save_config
 from database import Database
+from match_scorer import MatchScorer
 from pipeline import JobBotPipeline
+from resume_parser import parse_resume
+
+
+MODEL_OPTIONS = {
+    "ollama_local": ("qwen2.5:7b",),
+    "openai": ("gpt-5-mini", "gpt-5-nano"),
+    "anthropic": ("claude-sonnet-4-20250514", "claude-3-5-haiku-latest"),
+}
+
+FIELD_TOOLTIPS = {
+    "Resume source": "Path to your source resume file. DOCX is recommended for the highest-quality tailoring; PDF and plain text still work.",
+    "Source provider": "Choose where jobs are discovered. JobSpy searches boards by keyword; USAJobs uses the federal API.",
+    "JobSpy sites": "Comma-separated JobSpy sites to query. Recommended: indeed, google.",
+    "Results per page": "How many jobs to request per run. Semi-auto defaults to 100; auto defaults to 25.",
+    "Cheap stage provider": "Model provider for the low-cost screening pass.",
+    "Cheap stage model": "Specific low-cost model used for the cheap screening stage.",
+    "Strong stage provider": "Provider used for the higher-confidence scoring stage.",
+    "Strong stage model": "Specific model used for the stronger scoring stage.",
+    "Doc stage provider": "Provider used for document tailoring notes.",
+    "Doc stage model": "Specific model used for document note generation.",
+    "Ollama base URL": "Local Ollama server URL used when the cheap stage runs on your machine.",
+    "Anthropic API key": "API key for Anthropic-hosted models.",
+    "OpenAI API key": "API key for OpenAI-hosted models.",
+    "Job keyword": "Primary search phrase sent to the job source.",
+    "Location": "Optional job search location. Leave blank for broader searches.",
+    "USAJobs account email": "Email address registered with the USAJobs API. Sent as the User-Agent header.",
+    "USAJobs authorization key": "API key for USAJobs. Required to avoid 401 Unauthorized responses.",
+    "Include titles": "Comma-separated titles that should be treated as good fits.",
+    "Exclude titles": "Comma-separated titles the app should skip.",
+    "Force escalate keywords": "Comma-separated keywords that always push a job to the stronger review stage.",
+    "Salary floor": "Minimum annual salary filter. Use 0 to disable.",
+    "Review threshold": "Score at or above this value is worth manual review.",
+    "Final apply threshold": "Score at or above this value becomes an apply candidate.",
+    "Cheap reject threshold": "Cheap-stage score at or below this value gets rejected early.",
+    "Cheap escalate threshold": "Cheap-stage score at or above this value moves to the strong stage.",
+    "Automation mode": "Semi-auto queues jobs for approval. Auto sends only when the apply method supports it.",
+    "Skip AI scoring in semi_auto": "When enabled, semi-auto skips AI scoring and queues deterministic matches right away for faster review.",
+    "Gmail recipient (optional fallback/test inbox)": "Optional fallback inbox for non-employer delivery or dry-run testing.",
+    "Gmail sender": "Authenticated Gmail account used to send applications.",
+    "Client secrets path": "Path to your Google OAuth client secrets JSON file.",
+    "Enable Gmail delivery": "Turn on Gmail delivery for approved jobs.",
+    "Fit to Resume": "Analyze the configured resume with the cheap AI stage and replace Job keyword with suggested search terms you can edit.",
+}
+
+
+class Tooltip:
+    def __init__(self, widget: tk.Widget, text: str) -> None:
+        self.widget = widget
+        self.text = text
+        self.tip_window: tk.Toplevel | None = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _show(self, _event: object | None = None) -> None:
+        if self.tip_window or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 18
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        self.tip_window = tk.Toplevel(self.widget)
+        self.tip_window.wm_overrideredirect(True)
+        self.tip_window.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(
+            self.tip_window,
+            text=self.text,
+            justify="left",
+            background="#fff8d5",
+            relief="solid",
+            borderwidth=1,
+            padx=8,
+            pady=4,
+            wraplength=340,
+        )
+        label.pack()
+
+    def _hide(self, _event: object | None = None) -> None:
+        if self.tip_window:
+            self.tip_window.destroy()
+            self.tip_window = None
 
 
 class JobBotDashboard:
@@ -22,17 +104,51 @@ class JobBotDashboard:
 
         self.resume_var = tk.StringVar(value=config.resume_source_path)
         self.threshold_var = tk.StringVar(value=str(config.scoring_threshold))
+        self.final_apply_threshold_var = tk.StringVar(value=str(config.final_apply_threshold))
+        self.cheap_reject_threshold_var = tk.StringVar(value=str(config.cheap_reject_threshold))
+        self.cheap_escalate_threshold_var = tk.StringVar(value=str(config.cheap_escalate_threshold))
         self.keyword_var = tk.StringVar(value=config.source.keyword)
         self.location_var = tk.StringVar(value=config.source.location)
+        self.source_provider_var = tk.StringVar(value=config.source.provider)
+        self.jobspy_sites_var = tk.StringVar(value=", ".join(config.source.jobspy_sites))
+        self.results_per_page_var = tk.StringVar(value=str(config.source.results_per_page))
+        self.usajobs_email_var = tk.StringVar(value=config.source.user_agent)
+        self.usajobs_auth_key_var = tk.StringVar(value=config.source.authorization_key)
+        self.include_titles_var = tk.StringVar(value=", ".join(config.include_titles))
+        self.exclude_titles_var = tk.StringVar(value=", ".join(config.exclude_titles))
+        self.force_keywords_var = tk.StringVar(value=", ".join(config.force_escalate_keywords))
+        self.salary_floor_var = tk.StringVar(value=str(config.salary_floor))
         self.gmail_enabled_var = tk.BooleanVar(value=config.gmail.enabled)
+        self.skip_ai_scoring_var = tk.BooleanVar(value=config.skip_ai_scoring_in_semi_auto)
+        self.automation_mode_var = tk.StringVar(value=config.automation_mode)
+        self.llm_provider_var = tk.StringVar(value=config.llm_provider)
+        self.cheap_stage_provider_var = tk.StringVar(value=config.cheap_stage_provider)
+        self.cheap_stage_model_var = tk.StringVar(value=config.cheap_stage_model)
+        self.strong_stage_provider_var = tk.StringVar(value=config.strong_stage_provider)
+        self.strong_stage_model_var = tk.StringVar(value=config.strong_stage_model)
+        self.doc_stage_provider_var = tk.StringVar(value=config.doc_stage_provider)
+        self.doc_stage_model_var = tk.StringVar(value=config.doc_stage_model)
+        self.ollama_base_url_var = tk.StringVar(value=config.ollama_base_url)
         self.recipient_var = tk.StringVar(value=config.gmail.recipient_email)
         self.sender_var = tk.StringVar(value=config.gmail.sender_email)
         self.client_secret_var = tk.StringVar(value=config.gmail.client_secrets_file)
-        self.api_key_var = tk.StringVar(value=config.anthropic_api_key)
+        self.anthropic_api_key_var = tk.StringVar(value=config.anthropic_api_key)
+        self.openai_api_key_var = tk.StringVar(value=config.openai_api_key)
 
         self.review_tree: ttk.Treeview | None = None
         self.log_text: tk.Text | None = None
+        self.cost_text: tk.Text | None = None
         self.last_run_label: ttk.Label | None = None
+        self.details_text: tk.Text | None = None
+        self.strong_stage_model_combo: ttk.Combobox | None = None
+        self.setup_canvas: tk.Canvas | None = None
+        self._tooltips: list[Tooltip] = []
+        self._run_poll_after_id: str | None = None
+        self._run_in_progress = False
+        self.fit_resume_button: ttk.Button | None = None
+        self._review_rows: list[dict[str, object]] = []
+        self._review_sort_column = "score"
+        self._review_sort_desc = True
         self._build_ui()
         self.refresh_view()
 
@@ -54,100 +170,459 @@ class JobBotDashboard:
         self._build_review_tab(review_frame)
 
     def _build_setup_tab(self, frame: ttk.Frame) -> None:
-        frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(frame, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas, padding=(0, 0, 12, 0))
+        inner.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window_id, width=event.width))
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        canvas.bind("<Enter>", self._bind_setup_mousewheel, add="+")
+        canvas.bind("<Leave>", self._unbind_setup_mousewheel, add="+")
+        inner.bind("<Enter>", self._bind_setup_mousewheel, add="+")
+        inner.bind("<Leave>", self._unbind_setup_mousewheel, add="+")
+        self.setup_canvas = canvas
+
+        frame = inner
+        frame.columnconfigure(2, weight=1)
         labels = [
             ("Resume source", self.resume_var),
-            ("Anthropic API key", self.api_key_var),
             ("Job keyword", self.keyword_var),
             ("Location", self.location_var),
-            ("Score threshold", self.threshold_var),
-            ("Gmail recipient", self.recipient_var),
+            ("Include titles", self.include_titles_var),
+            ("Exclude titles", self.exclude_titles_var),
+            ("Salary floor", self.salary_floor_var),
+            ("Force escalate keywords", self.force_keywords_var),
+            ("Source provider", self.source_provider_var),
+            ("JobSpy sites", self.jobspy_sites_var),
+            ("Results per page", self.results_per_page_var),
+            ("USAJobs account email", self.usajobs_email_var),
+            ("USAJobs authorization key", self.usajobs_auth_key_var),
+            ("Automation mode", self.automation_mode_var),
+            ("Cheap stage provider", self.cheap_stage_provider_var),
+            ("Cheap stage model", self.cheap_stage_model_var),
+            ("Review threshold", self.threshold_var),
+            ("Final apply threshold", self.final_apply_threshold_var),
+            ("Cheap reject threshold", self.cheap_reject_threshold_var),
+            ("Cheap escalate threshold", self.cheap_escalate_threshold_var),
+            ("Strong stage provider", self.strong_stage_provider_var),
+            ("Strong stage model", self.strong_stage_model_var),
+            ("Doc stage provider", self.doc_stage_provider_var),
+            ("Doc stage model", self.doc_stage_model_var),
+            ("Ollama base URL", self.ollama_base_url_var),
+            ("Anthropic API key", self.anthropic_api_key_var),
+            ("OpenAI API key", self.openai_api_key_var),
             ("Gmail sender", self.sender_var),
+            ("Gmail recipient (optional fallback/test inbox)", self.recipient_var),
             ("Client secrets path", self.client_secret_var),
         ]
+        values_map = {
+            "Source provider": ("jobspy", "usajobs"),
+            "Automation mode": ("semi_auto", "auto"),
+            "Cheap stage provider": ("ollama_local", "openai", "anthropic"),
+            "Strong stage provider": ("anthropic", "openai"),
+            "Doc stage provider": ("openai", "anthropic", "cheap_stage"),
+        }
         for idx, (label, var) in enumerate(labels):
-            ttk.Label(frame, text=label).grid(row=idx, column=0, sticky="w", pady=6, padx=(0, 10))
-            show = "*" if "key" in label.lower() else ""
-            ttk.Entry(frame, textvariable=var, width=70, show=show).grid(row=idx, column=1, sticky="ew", pady=6)
+            label_widget = ttk.Label(frame, text=label)
+            label_widget.grid(row=idx, column=0, sticky="w", pady=6, padx=(0, 10))
+            self._add_tooltip(label_widget, FIELD_TOOLTIPS.get(label, label))
+            if label == "Resume source":
+                action_frame = ttk.Frame(frame)
+                action_frame.grid(row=idx, column=1, sticky="w", pady=6, padx=(0, 10))
+                open_button = ttk.Button(action_frame, text="Open Resume", command=self._open_resume_source)
+                open_button.pack(side="left", padx=(0, 8))
+                browse_button = ttk.Button(action_frame, text="Browse Resume", command=self._browse_resume)
+                browse_button.pack(side="left")
+                self._add_tooltip(open_button, "Open the configured source resume file from disk.")
+                self._add_tooltip(browse_button, "Choose a resume file to use as the source document.")
+                entry = ttk.Entry(frame, textvariable=var, width=70)
+                entry.grid(row=idx, column=2, sticky="ew", pady=6)
+                self._bind_entry_autosave(entry)
+                self._add_tooltip(entry, FIELD_TOOLTIPS[label])
+            elif label == "Client secrets path":
+                action_frame = ttk.Frame(frame)
+                action_frame.grid(row=idx, column=1, sticky="w", pady=6, padx=(0, 10))
+                browse_button = ttk.Button(action_frame, text="Browse", command=self._browse_client_secrets)
+                browse_button.pack(side="left")
+                self._add_tooltip(browse_button, "Choose your Google OAuth client secrets JSON file.")
+                entry = ttk.Entry(frame, textvariable=var, width=70)
+                entry.grid(row=idx, column=2, sticky="ew", pady=6)
+                self._bind_entry_autosave(entry)
+                self._add_tooltip(entry, FIELD_TOOLTIPS[label])
+            elif label == "Job keyword":
+                action_frame = ttk.Frame(frame)
+                action_frame.grid(row=idx, column=1, sticky="w", pady=6, padx=(0, 10))
+                fit_button = ttk.Button(action_frame, text="Fit to Resume", command=self._fit_to_resume)
+                fit_button.pack(side="left")
+                self.fit_resume_button = fit_button
+                self._add_tooltip(fit_button, FIELD_TOOLTIPS["Fit to Resume"])
+                entry = ttk.Entry(frame, textvariable=var, width=70)
+                entry.grid(row=idx, column=2, sticky="ew", pady=6)
+                self._bind_entry_autosave(entry)
+                self._add_tooltip(entry, FIELD_TOOLTIPS[label])
+            elif label in {"Source provider", "Automation mode", "Cheap stage provider", "Strong stage provider", "Doc stage provider"}:
+                combo = ttk.Combobox(frame, textvariable=var, values=values_map[label], state="readonly", width=67)
+                combo.grid(row=idx, column=1, columnspan=2, sticky="ew", pady=6)
+                if label == "Strong stage provider":
+                    combo.bind("<<ComboboxSelected>>", self._on_strong_provider_changed, add="+")
+                if label == "Automation mode":
+                    combo.bind("<<ComboboxSelected>>", self._on_automation_mode_changed, add="+")
+                combo.bind("<<ComboboxSelected>>", self._autosave_setup, add="+")
+                self._add_tooltip(combo, FIELD_TOOLTIPS[label])
+            elif label == "Strong stage model":
+                combo = ttk.Combobox(frame, textvariable=var, state="readonly", width=67)
+                combo.grid(row=idx, column=1, columnspan=2, sticky="ew", pady=6)
+                combo.bind("<<ComboboxSelected>>", self._autosave_setup, add="+")
+                self.strong_stage_model_combo = combo
+                self._add_tooltip(combo, FIELD_TOOLTIPS[label])
+            else:
+                show = "*" if label in {"Anthropic API key", "OpenAI API key", "USAJobs authorization key"} else ""
+                entry = ttk.Entry(frame, textvariable=var, width=70, show=show)
+                entry.grid(row=idx, column=1, columnspan=2, sticky="ew", pady=6)
+                self._bind_entry_autosave(entry)
+                self._add_tooltip(entry, FIELD_TOOLTIPS[label])
 
-        ttk.Checkbutton(frame, text="Enable Gmail delivery", variable=self.gmail_enabled_var).grid(
-            row=len(labels), column=1, sticky="w", pady=6
-        )
+        self._sync_strong_model_dropdown()
 
-        button_row = ttk.Frame(frame)
-        button_row.grid(row=len(labels) + 1, column=1, sticky="w", pady=12)
-        ttk.Button(button_row, text="Browse Resume", command=self._browse_resume).pack(side="left", padx=(0, 8))
-        ttk.Button(button_row, text="Save Config", command=self._save_config).pack(side="left")
+        check = ttk.Checkbutton(frame, text="Enable Gmail delivery", variable=self.gmail_enabled_var, command=self._autosave_setup)
+        check.grid(row=len(labels), column=1, columnspan=2, sticky="w", pady=6)
+        self._add_tooltip(check, FIELD_TOOLTIPS["Enable Gmail delivery"])
+        skip_ai_check = ttk.Checkbutton(frame, text="Skip AI scoring in semi_auto", variable=self.skip_ai_scoring_var, command=self._autosave_setup)
+        skip_ai_check.grid(row=len(labels) + 1, column=1, columnspan=2, sticky="w", pady=6)
+        self._add_tooltip(skip_ai_check, FIELD_TOOLTIPS["Skip AI scoring in semi_auto"])
 
     def _build_run_tab(self, frame: ttk.Frame) -> None:
         top = ttk.Frame(frame)
         top.pack(fill="x")
-        ttk.Button(top, text="Run Now", command=self._run_now).pack(side="left")
-        ttk.Label(top, textvariable=self.status_var).pack(side="left", padx=12)
+        run_button = ttk.Button(top, text="Run Now", command=self._run_now)
+        run_button.pack(side="left")
+        self._add_tooltip(run_button, "Run the scrape, scoring, document generation, and delivery pipeline now.")
+        status_label = ttk.Label(top, textvariable=self.status_var)
+        status_label.pack(side="left", padx=12)
+        self._add_tooltip(status_label, "Current app status, including autosave and run results.")
         self.last_run_label = ttk.Label(top, text="No runs yet")
         self.last_run_label.pack(side="left", padx=12)
+        self._add_tooltip(self.last_run_label, "Summary of the most recent pipeline run.")
 
-        self.log_text = tk.Text(frame, height=30, wrap="word")
-        self.log_text.pack(fill="both", expand=True, pady=(12, 0))
+        log_frame = ttk.Frame(frame)
+        log_frame.pack(fill="both", expand=True, pady=(12, 0))
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        self.log_text = tk.Text(log_frame, height=30, wrap="word")
+        log_scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scrollbar.set)
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        log_scrollbar.grid(row=0, column=1, sticky="ns")
+        self._add_tooltip(self.log_text, "Recent application logs from the current workspace.")
+        self.cost_text = tk.Text(frame, height=8, wrap="word")
+        self.cost_text.pack(fill="x", expand=False, pady=(12, 0))
+        self._add_tooltip(self.cost_text, "Tracked estimated API costs by stage.")
 
     def _build_review_tab(self, frame: ttk.Frame) -> None:
-        columns = ("title", "employer", "score", "source", "document_status", "delivery_status")
-        tree = ttk.Treeview(frame, columns=columns, show="headings", height=18)
+        columns = ("title", "employer", "posted_at", "score", "source", "document_status", "delivery_status")
+        tree_container = ttk.Frame(frame)
+        tree_container.pack(fill="both", expand=True)
+        tree_container.columnconfigure(0, weight=1)
+        tree_container.rowconfigure(0, weight=1)
+
+        tree = ttk.Treeview(tree_container, columns=columns, show="headings", height=18)
         for column in columns:
-            tree.heading(column, text=column.replace("_", " ").title())
+            tree.heading(column, text=column.replace("_", " ").title(), command=lambda col=column: self._sort_review_rows(col))
             tree.column(column, width=150, anchor="w")
         tree.column("title", width=250)
         tree.column("employer", width=180)
-        tree.pack(fill="both", expand=True)
+        tree.column("posted_at", width=150)
+        review_scrollbar = ttk.Scrollbar(tree_container, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=review_scrollbar.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        review_scrollbar.grid(row=0, column=1, sticky="ns")
+        tree.bind("<<TreeviewSelect>>", lambda _event: self._refresh_selected_details())
         self.review_tree = tree
+        self._add_tooltip(tree, "Jobs awaiting review, approval, or delivery follow-up.")
 
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x", pady=(10, 0))
-        ttk.Button(buttons, text="Refresh", command=self.refresh_view).pack(side="left")
-        ttk.Button(buttons, text="Open Apply Link", command=self._open_apply_link).pack(side="left", padx=8)
-        ttk.Button(buttons, text="Open Resume", command=self._open_resume).pack(side="left")
+        refresh_button = ttk.Button(buttons, text="Refresh", command=self.refresh_view)
+        refresh_button.pack(side="left")
+        self._add_tooltip(refresh_button, "Reload the queue, logs, run summary, and selected job details.")
+        apply_button = ttk.Button(buttons, text="Open Apply Link", command=self._open_apply_link)
+        apply_button.pack(side="left", padx=8)
+        self._add_tooltip(apply_button, "Open the job posting or application page in your browser.")
+        generate_button = ttk.Button(buttons, text="Generate", command=self._generate_documents_for_selected)
+        generate_button.pack(side="left")
+        self._add_tooltip(generate_button, "Generate the tailored resume and cover letter for the selected review item.")
+        open_resume_button = ttk.Button(buttons, text="Open Resume", command=self._open_resume)
+        open_resume_button.pack(side="left", padx=8)
+        self._add_tooltip(open_resume_button, "Open the generated tailored resume for the selected review item, preferring DOCX when available.")
+        open_cover_button = ttk.Button(buttons, text="Open Cover Letter", command=self._open_cover_letter)
+        open_cover_button.pack(side="left")
+        self._add_tooltip(open_cover_button, "Open the generated cover letter for the selected review item.")
+        approve_button = ttk.Button(buttons, text="Approve and Send", command=self._approve_and_send)
+        approve_button.pack(side="left", padx=8)
+        self._add_tooltip(approve_button, "Send the selected job through the configured delivery path.")
+
+        self.details_text = tk.Text(frame, height=16, wrap="word")
+        self.details_text.pack(fill="both", expand=False, pady=(10, 0))
+        self._add_tooltip(self.details_text, "Detailed view of the selected job, generated files, and delivery status.")
 
     def _browse_resume(self) -> None:
         path = filedialog.askopenfilename(
             title="Select resume source",
-            filetypes=[("Resume files", "*.pdf *.txt"), ("All files", "*.*")],
+            filetypes=[("Resume files", "*.docx *.pdf *.txt"), ("All files", "*.*")],
         )
         if path:
             self.resume_var.set(path)
+            self._autosave_setup()
 
-    def _save_config(self) -> None:
-        self.config.resume_source_path = self.resume_var.get().strip()
-        self.config.anthropic_api_key = self.api_key_var.get().strip()
-        self.config.source.keyword = self.keyword_var.get().strip()
-        self.config.source.location = self.location_var.get().strip()
-        self.config.scoring_threshold = int(self.threshold_var.get().strip() or "70")
-        self.config.gmail.enabled = self.gmail_enabled_var.get()
-        self.config.gmail.recipient_email = self.recipient_var.get().strip()
-        self.config.gmail.sender_email = self.sender_var.get().strip()
-        self.config.gmail.client_secrets_file = self.client_secret_var.get().strip()
-        save_config(self.config, self.paths.config_file)
-        self.pipeline = JobBotPipeline(self.config, self.paths, self.database)
-        messagebox.showinfo("Job Bot", f"Config saved to {self.paths.config_file}")
+    def _browse_client_secrets(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select Google client secrets file",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if path:
+            self.client_secret_var.set(path)
+            self._autosave_setup()
+
+    def _open_resume_source(self) -> None:
+        configured_path = self.resume_var.get().strip()
+        if not configured_path:
+            messagebox.showwarning("Job Bot", "No source resume is configured yet.")
+            return
+        path = self._resolve_configured_path(configured_path)
+        if not path.exists():
+            messagebox.showwarning("Job Bot", f"Configured resume source was not found:\n{path}")
+            return
+        os.startfile(str(path))
+
+    def _fit_to_resume(self) -> None:
+        configured_path = self.resume_var.get().strip()
+        if not configured_path:
+            messagebox.showwarning("Job Bot", "Configure Resume source before using Fit to Resume.")
+            return
+        try:
+            self._build_config_from_vars()
+        except Exception as exc:
+            messagebox.showwarning("Job Bot", f"Current setup values need attention before fitting to resume:\n{exc}")
+            return
+        self.status_var.set("Generating job keywords from resume...")
+        self._set_fit_resume_button_enabled(False)
+        thread = threading.Thread(target=self._fit_to_resume_background, daemon=True)
+        thread.start()
+
+    def _fit_to_resume_background(self) -> None:
+        try:
+            config = self._build_config_from_vars()
+            resume_path = self._resolve_configured_path(config.resume_source_path)
+            if not resume_path.exists():
+                raise FileNotFoundError(f"Configured resume source was not found: {resume_path}")
+            resume_data = parse_resume(resume_path, self.paths.resume_json)
+            keywords = MatchScorer(config, self.database).suggest_job_keywords(resume_data)
+        except Exception as exc:
+            self.root.after(0, lambda: self._handle_fit_to_resume_error(str(exc)))
+            return
+        self.root.after(0, lambda: self._apply_fit_to_resume_keywords(keywords))
+
+    def _apply_fit_to_resume_keywords(self, keywords: str) -> None:
+        self.keyword_var.set(keywords)
+        if self._autosave_setup():
+            self.status_var.set("Resume-fit keywords generated. Review and edit them before running.")
+        self._set_fit_resume_button_enabled(True)
+
+    def _handle_fit_to_resume_error(self, message: str) -> None:
+        self.status_var.set(f"Fit to Resume failed: {message}")
+        self._set_fit_resume_button_enabled(True)
+
+    def _set_fit_resume_button_enabled(self, enabled: bool) -> None:
+        if self.fit_resume_button:
+            self.fit_resume_button.configure(state="normal" if enabled else "disabled")
+
+    def _resolve_configured_path(self, configured_path: str) -> Path:
+        path = Path(configured_path).expanduser()
+        if path.is_absolute():
+            return path
+        return (self.paths.root / path).resolve()
+
+    def _bind_entry_autosave(self, widget: ttk.Entry) -> None:
+        widget.bind("<FocusOut>", self._autosave_setup, add="+")
+
+    def _bind_setup_mousewheel(self, _event: object | None = None) -> None:
+        self.root.bind_all("<MouseWheel>", self._on_setup_mousewheel, add="+")
+
+    def _unbind_setup_mousewheel(self, _event: object | None = None) -> None:
+        self.root.unbind_all("<MouseWheel>")
+
+    def _on_setup_mousewheel(self, event: tk.Event) -> None:
+        if self.setup_canvas:
+            self.setup_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _on_strong_provider_changed(self, _event: object | None = None) -> None:
+        self._sync_strong_model_dropdown()
+
+    def _on_automation_mode_changed(self, _event: object | None = None) -> None:
+        mode = self.automation_mode_var.get().strip() or "semi_auto"
+        self.results_per_page_var.set("100" if mode == "semi_auto" else "25")
+
+    def _sync_strong_model_dropdown(self) -> None:
+        if not self.strong_stage_model_combo:
+            return
+        provider = self.strong_stage_provider_var.get().strip() or "anthropic"
+        models = MODEL_OPTIONS.get(provider, ())
+        self.strong_stage_model_combo.configure(values=models)
+        current = self.strong_stage_model_var.get().strip()
+        if current not in models and models:
+            self.strong_stage_model_var.set(models[0])
+
+    def _autosave_setup(self, _event: object | None = None) -> bool:
+        return self._save_config(show_status_only=True)
+
+    def _save_config(self, show_status_only: bool = True) -> bool:
+        try:
+            updated_config = self._build_config_from_vars()
+            save_config(updated_config, self.paths.config_file)
+            self.config = updated_config
+            self.pipeline = JobBotPipeline(self.config, self.paths, self.database)
+            if show_status_only:
+                self.status_var.set("Settings saved.")
+            return True
+        except Exception as exc:
+            self.status_var.set(f"Settings not saved: {exc}")
+            return False
+
+    def _build_config_from_vars(self) -> JobBotConfig:
+        config = copy.deepcopy(self.config)
+        config.resume_source_path = self.resume_var.get().strip()
+        config.llm_provider = "anthropic"
+        config.cheap_stage_provider = self.cheap_stage_provider_var.get().strip() or "ollama_local"
+        config.cheap_stage_model = self.cheap_stage_model_var.get().strip() or "qwen2.5:7b"
+        config.strong_stage_provider = self.strong_stage_provider_var.get().strip() or "anthropic"
+        config.strong_stage_model = self.strong_stage_model_var.get().strip() or "claude-sonnet-4-20250514"
+        config.doc_stage_provider = self.doc_stage_provider_var.get().strip() or "openai"
+        config.doc_stage_model = self.doc_stage_model_var.get().strip() or "gpt-5-mini"
+        config.ollama_base_url = self.ollama_base_url_var.get().strip() or "http://localhost:11434"
+        config.anthropic_api_key = self.anthropic_api_key_var.get().strip()
+        config.openai_api_key = self.openai_api_key_var.get().strip()
+        config.source.keyword = self.keyword_var.get().strip()
+        config.source.location = self.location_var.get().strip()
+        config.source.provider = self.source_provider_var.get().strip() or "jobspy"
+        config.source.jobspy_sites = self._parse_csv(self.jobspy_sites_var.get()) or ["indeed", "google"]
+        config.automation_mode = self.automation_mode_var.get().strip() or "semi_auto"
+        config.source.results_per_page = int(self.results_per_page_var.get().strip() or ("100" if config.automation_mode == "semi_auto" else "25"))
+        config.source.user_agent = self.usajobs_email_var.get().strip() or "jobbot-demo@example.com"
+        config.source.authorization_key = self.usajobs_auth_key_var.get().strip()
+        config.include_titles = self._parse_csv(self.include_titles_var.get())
+        config.exclude_titles = self._parse_csv(self.exclude_titles_var.get())
+        config.force_escalate_keywords = self._parse_csv(self.force_keywords_var.get())
+        config.salary_floor = int(self.salary_floor_var.get().strip() or "0")
+        config.scoring_threshold = int(self.threshold_var.get().strip() or "70")
+        config.final_apply_threshold = int(self.final_apply_threshold_var.get().strip() or "80")
+        config.cheap_reject_threshold = int(self.cheap_reject_threshold_var.get().strip() or "55")
+        config.cheap_escalate_threshold = int(self.cheap_escalate_threshold_var.get().strip() or "75")
+        config.skip_ai_scoring_in_semi_auto = self.skip_ai_scoring_var.get()
+        config.gmail.enabled = self.gmail_enabled_var.get()
+        config.gmail.recipient_email = self.recipient_var.get().strip()
+        config.gmail.sender_email = self.sender_var.get().strip()
+        config.gmail.client_secrets_file = self.client_secret_var.get().strip()
+        return config
 
     def _run_now(self) -> None:
-        self.status_var.set("Running...")
+        if self.config.automation_mode == "auto" and not self._confirm_auto_run():
+            self.status_var.set("Auto run canceled.")
+            return
+        self._run_in_progress = True
+        self.status_var.set("Starting run...")
+        self._start_run_polling()
         thread = threading.Thread(target=self._run_pipeline_background, daemon=True)
         thread.start()
+
+    def _confirm_auto_run(self) -> bool:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Confirm Automatic Run")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        confirmed = {"value": False}
+
+        container = ttk.Frame(dialog, padding=16)
+        container.pack(fill="both", expand=True)
+
+        ttk.Label(
+            container,
+            text="Auto mode is enabled. Running now may send applications automatically.",
+            wraplength=380,
+            justify="left",
+        ).pack(anchor="w")
+
+        ttk.Label(
+            container,
+            text="Click 'Run automatically' to continue, or Cancel to go back.",
+            wraplength=380,
+            justify="left",
+        ).pack(anchor="w", pady=(8, 0))
+
+        buttons = ttk.Frame(container)
+        buttons.pack(anchor="e", pady=(16, 0))
+
+        def close_with(value: bool) -> None:
+            confirmed["value"] = value
+            dialog.destroy()
+
+        ttk.Button(buttons, text="Cancel", command=lambda: close_with(False)).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="Run automatically", command=lambda: close_with(True)).pack(side="left")
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: close_with(False))
+        self.root.wait_window(dialog)
+        return confirmed["value"]
 
     def _run_pipeline_background(self) -> None:
         result = self.pipeline.run()
         self.root.after(
             0,
             lambda: (
-                self.status_var.set(f"{result.status} - {result.message}"),
+                setattr(self, "_run_in_progress", False),
+                self._stop_run_polling(),
+                self.status_var.set(f"{result.status} - {result.message} - est. cost ${result.estimated_cost_usd:.4f}"),
                 self.refresh_view(),
             ),
         )
 
+    def _start_run_polling(self) -> None:
+        self._stop_run_polling()
+        self._poll_run_progress()
+
+    def _stop_run_polling(self) -> None:
+        if self._run_poll_after_id:
+            self.root.after_cancel(self._run_poll_after_id)
+            self._run_poll_after_id = None
+
+    def _poll_run_progress(self) -> None:
+        run = self.database.latest_run()
+        if run and run.get("status") == "running":
+            message = run.get("message") or "Working..."
+            stage = run.get("stage") or "running"
+            seen = run.get("jobs_seen") or 0
+            matched = run.get("jobs_matched") or 0
+            self.status_var.set(f"Running - {stage}: {message} | seen={seen} matched={matched}")
+            self.refresh_view()
+            self._run_poll_after_id = self.root.after(1000, self._poll_run_progress)
+        elif self._run_in_progress:
+            self.status_var.set("Running - starting: Initializing run... | seen=0 matched=0")
+            self.refresh_view()
+            self._run_poll_after_id = self.root.after(500, self._poll_run_progress)
+        else:
+            self._run_poll_after_id = None
+
     def refresh_view(self) -> None:
         self._refresh_logs()
+        self._refresh_costs()
         self._refresh_runs()
         self._refresh_review_queue()
+        self._refresh_selected_details()
 
     def _refresh_logs(self) -> None:
         if not self.log_text:
@@ -157,6 +632,7 @@ class JobBotDashboard:
             content = self.paths.log_file.read_text(encoding="utf-8", errors="ignore")[-8000:]
         self.log_text.delete("1.0", tk.END)
         self.log_text.insert("1.0", content or "No logs yet.")
+        self.log_text.see(tk.END)
 
     def _refresh_runs(self) -> None:
         run = self.database.latest_run()
@@ -168,12 +644,35 @@ class JobBotDashboard:
                     text=f"Last run: {run['status']} | stage={run['stage']} | seen={run['jobs_seen']} matched={run['jobs_matched']}"
                 )
 
+    def _refresh_costs(self) -> None:
+        if not self.cost_text:
+            return
+        rows = self.database.summarize_costs()
+        total = sum(float(row.get("total_cost") or 0.0) for row in rows)
+        lines = [f"Estimated AI cost tracked so far: ${total:.4f}", ""]
+        for row in rows:
+            lines.append(f"{row['stage_name']}: {row['evaluations']} evals, ${float(row.get('total_cost') or 0.0):.4f}")
+        if len(lines) == 2:
+            lines.append("No API cost data recorded yet.")
+        self.cost_text.delete("1.0", tk.END)
+        self.cost_text.insert("1.0", "\n".join(lines))
+
     def _refresh_review_queue(self) -> None:
         if not self.review_tree:
             return
+        latest_run = self.database.latest_run()
+        min_scraped_at = str(latest_run.get("started_at")) if latest_run else None
+        self._review_rows = self.database.list_review_rows(min_scraped_at=min_scraped_at)
+        self._populate_review_tree()
+
+    def _populate_review_tree(self) -> None:
+        if not self.review_tree:
+            return
+        selected = self.review_tree.selection()
+        selected_id = selected[0] if selected else None
         for item in self.review_tree.get_children():
             self.review_tree.delete(item)
-        for row in self.database.list_review_rows():
+        for row in self._sorted_review_rows():
             self.review_tree.insert(
                 "",
                 "end",
@@ -181,25 +680,95 @@ class JobBotDashboard:
                 values=(
                     row["title"],
                     row["employer"],
+                    self._format_posted_at(str(row.get("posted_at") or "")),
                     row["score"],
                     row["source"],
                     row["document_status"],
                     row["delivery_status"],
                 ),
             )
+        if selected_id and self.review_tree.exists(selected_id):
+            self.review_tree.selection_set(selected_id)
 
-    def _selected_row(self):
+    def _sorted_review_rows(self) -> list[dict[str, object]]:
+        def sort_value(row: dict[str, object]) -> object:
+            value = row.get(self._review_sort_column)
+            if self._review_sort_column == "score":
+                return int(value or 0)
+            return str(value or "").lower()
+
+        return sorted(self._review_rows, key=sort_value, reverse=self._review_sort_desc)
+
+    def _sort_review_rows(self, column: str) -> None:
+        if self._review_sort_column == column:
+            self._review_sort_desc = not self._review_sort_desc
+        else:
+            self._review_sort_column = column
+            self._review_sort_desc = column in {"score", "posted_at"}
+        self._populate_review_tree()
+
+    @staticmethod
+    def _format_posted_at(value: str) -> str:
+        if not value:
+            return ""
+        return value.replace("T", " ")[:19]
+
+    def _refresh_selected_details(self) -> None:
+        if not self.details_text:
+            return
+        row = self._selected_row(show_warning=False)
+        if not row:
+            self.details_text.delete("1.0", tk.END)
+            self.details_text.insert("1.0", "Select a job to review its description, match notes, and generated files.")
+            return
+        details = "\n".join(
+            [
+                f"Title: {row['title']}",
+                f"Employer: {row['employer']}",
+                f"Location: {row['location']}",
+                f"Posted at: {self._format_posted_at(row['posted_at']) or 'Unknown'}",
+                f"Source: {row['source']}",
+                f"Resume source type: {Path(self.config.resume_source_path).suffix.lower() or 'unknown'}",
+                f"Score: {row['score']}",
+                f"Match status: {row['match_status']}",
+                f"Apply method: {row['apply_method']}",
+                f"Destination email: {row['hiring_manager_email'] or 'Not detected'}",
+                f"Delivery status: {row['delivery_status']}",
+                f"Delivery method: {row['delivery_method']}",
+                f"Apply URL: {row['apply_url']}",
+                f"Delivery error: {row['delivery_error'] or 'None'}",
+                "",
+                "Match rationale:",
+                row["rationale"] or "No rationale available.",
+                "",
+                "Generated resume (DOCX):",
+                self._document_status_text(row.get("resume_docx_path", "")),
+                "",
+                "Generated resume (PDF):",
+                self._document_status_text(row["resume_pdf_path"]),
+                "",
+                "Generated cover letter:",
+                self._document_status_text(row["cover_letter_path"]),
+                "",
+                f"Document status: {row['document_status']}",
+                f"Document error: {row.get('document_error') or 'None'}",
+                "",
+                "Job description:",
+                row["description_full"] or "No description captured.",
+            ]
+        )
+        self.details_text.delete("1.0", tk.END)
+        self.details_text.insert("1.0", details)
+
+    def _selected_row(self, show_warning: bool = True):
         if not self.review_tree:
             return None
         selected = self.review_tree.selection()
         if not selected:
-            messagebox.showwarning("Job Bot", "Select a review item first.")
+            if show_warning:
+                messagebox.showwarning("Job Bot", "Select a review item first.")
             return None
-        job_id = selected[0]
-        for row in self.database.list_review_rows():
-            if row["id"] == job_id:
-                return row
-        return None
+        return self.database.get_review_row(selected[0])
 
     def _open_apply_link(self) -> None:
         row = self._selected_row()
@@ -210,11 +779,89 @@ class JobBotDashboard:
         row = self._selected_row()
         if not row:
             return
-        resume_path = row["resume_pdf_path"]
-        if not resume_path:
-            messagebox.showwarning("Job Bot", "No generated resume available for this row.")
+        preferred_paths = [row.get("resume_docx_path", ""), row.get("resume_pdf_path", "")]
+        resume_path = next((candidate for candidate in preferred_paths if candidate and Path(candidate).exists()), "")
+        if not resume_path and not any(preferred_paths):
+            messagebox.showwarning("Job Bot", "No generated resume is available for this row yet. Click Generate first.")
+            return
+        if not resume_path or not Path(resume_path).exists():
+            messagebox.showwarning("Job Bot", "The generated resume file is missing on disk. Click Generate to recreate it.")
             return
         os.startfile(resume_path)
+
+    def _open_cover_letter(self) -> None:
+        row = self._selected_row()
+        if not row:
+            return
+        cover_letter_path = row["cover_letter_path"]
+        if not cover_letter_path:
+            messagebox.showwarning("Job Bot", "No generated cover letter is available for this row yet. Click Generate first.")
+            return
+        if not Path(cover_letter_path).exists():
+            messagebox.showwarning("Job Bot", "The generated cover letter file is missing on disk. Click Generate to recreate it.")
+            return
+        os.startfile(cover_letter_path)
+
+    def _generate_documents_for_selected(self) -> None:
+        row = self._selected_row()
+        if not row:
+            return
+        self.status_var.set("Generating documents...")
+        thread = threading.Thread(target=self._generate_documents_background, args=(row["id"],), daemon=True)
+        thread.start()
+
+    def _generate_documents_background(self, job_id: str) -> None:
+        try:
+            self.pipeline.generate_documents_for_job(job_id)
+            status = "Documents generated."
+        except Exception as exc:
+            status = f"Document generation failed: {exc}"
+        self.root.after(
+            0,
+            lambda: (
+                self.status_var.set(status),
+                self.refresh_view(),
+            ),
+        )
+
+    def _approve_and_send(self) -> None:
+        row = self._selected_row()
+        if not row:
+            return
+        self.status_var.set("Sending approved match...")
+        thread = threading.Thread(target=self._approve_and_send_background, args=(row["id"],), daemon=True)
+        thread.start()
+
+    def _approve_and_send_background(self, job_id: str) -> None:
+        try:
+            result = self.pipeline.approve_and_send(job_id)
+            status = f"{result.status} via {result.method}"
+            if result.error_message:
+                status = f"{status} - {result.error_message}"
+        except Exception as exc:
+            status = f"send_failed - {exc}"
+        self.root.after(
+            0,
+            lambda: (
+                self.status_var.set(status),
+                self.refresh_view(),
+            ),
+        )
+
+    def _add_tooltip(self, widget: tk.Widget, text: str) -> None:
+        self._tooltips.append(Tooltip(widget, text))
+
+    @staticmethod
+    def _parse_csv(value: str) -> list[str]:
+        return [item.strip() for item in value.split(",") if item.strip()]
+
+    @staticmethod
+    def _document_status_text(path_value: str) -> str:
+        if not path_value:
+            return "Not generated"
+        if not Path(path_value).exists():
+            return f"Generated but missing on disk: {path_value}"
+        return path_value
 
 
 def launch_dashboard(paths: AppPaths) -> None:
