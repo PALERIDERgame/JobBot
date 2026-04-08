@@ -359,7 +359,7 @@ class JobBotDashboard:
 
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x", pady=(10, 0))
-        refresh_button = ttk.Button(buttons, text="Refresh", command=self.refresh_view)
+        refresh_button = ttk.Button(buttons, text="Refresh", command=self._refresh_review_queue_action)
         refresh_button.pack(side="left")
         self._add_tooltip(refresh_button, "Reload the queue, logs, run summary, and selected job details.")
         apply_button = ttk.Button(buttons, text="Open Apply Link", command=self._open_apply_link)
@@ -647,6 +647,12 @@ class JobBotDashboard:
         self._refresh_review_queue()
         self._refresh_selected_details()
 
+    def _refresh_review_queue_action(self) -> None:
+        self.refresh_view()
+        row_count = len(self._review_rows)
+        noun = "job" if row_count == 1 else "jobs"
+        self.status_var.set(f"Review Queue refreshed: {row_count} {noun} loaded.")
+
     def _refresh_logs(self) -> None:
         if not self.log_text:
             return
@@ -683,9 +689,7 @@ class JobBotDashboard:
     def _refresh_review_queue(self) -> None:
         if not self.review_tree:
             return
-        latest_run = self.database.latest_run()
-        min_scraped_at = str(latest_run.get("started_at")) if latest_run else None
-        self._review_rows = self.database.list_review_rows(min_scraped_at=min_scraped_at)
+        self._review_rows = self.database.list_review_rows()
         self._populate_review_tree()
 
     def _populate_review_tree(self) -> None:
@@ -785,6 +789,15 @@ class JobBotDashboard:
                 f"Document status: {row['document_status']}",
                 f"Generated at: {self._format_generated_at(str(row.get('generated_at') or '')) or 'Not generated'}",
                 f"Document error: {row.get('document_error') or 'None'}",
+                "",
+                "--- Doc generation log ---",
+                f"Tailoring route:    {row.get('tailoring_route') or 'N/A'}",
+                f"Provider / model:   {(row.get('tailoring_provider') or '') + ('/' + row.get('tailoring_model') if row.get('tailoring_model') else '') or 'N/A (local)'}",
+                f"AI accepted:        {'Yes' if row.get('tailoring_route') == 'ai' else ('No (fell back)' if row.get('tailoring_route') == 'fallback' else 'N/A')}",
+                f"Fallback reason:    {row.get('tailoring_fallback_reason') or 'None'}",
+                f"AI retry count:     {row.get('tailoring_retry_count', 0)}",
+                f"Page-fit attempts:  {row.get('page_fit_attempts', 0)}",
+                f"PDF exporter:       {row.get('pdf_exporter_used') or 'N/A'}",
                 "",
                 "Job description:",
                 row["description_full"] or "No description captured.",
