@@ -10,7 +10,8 @@ from urllib import error, request
 
 from config import JobBotConfig
 from database import Database, Job, StageEvaluationRecord
-from resume_parser import ResumeData
+from document_tailoring import DocumentTailoringPayload
+from resume_parser import ResumeData, ResumeWorkEntry
 
 
 LOGGER = logging.getLogger(__name__)
@@ -171,6 +172,101 @@ class MatchScorer:
         except Exception:  # pragma: no cover
             LOGGER.exception("Failed to generate document notes for %s", job.id)
             return ""
+
+    def tailor_documents_with_ai(
+        self,
+        job: Job,
+        resume_data: ResumeData,
+        local_preview: DocumentTailoringPayload,
+        *,
+        alignment_notes: str = "",
+        retry_count: int = 0,
+    ) -> DocumentTailoringPayload | None:
+        provider, model = self._resolve_doc_provider_model()
+        if provider == "cheap_stage":
+            provider, model = self.config.cheap_stage_provider, self.config.cheap_stage_model
+        if provider != "openai" or self._build_client(provider) is None:
+            return None
+
+        prompt = {
+            "candidate": self._resume_summary(resume_data),
+            "job": self._job_summary(job),
+            "alignment_notes": alignment_notes,
+            "work_entries": [
+                {
+                    "role_line": entry.role_line,
+                    "date_line": entry.date_line,
+                    "bullets": entry.bullets,
+                }
+                for entry in resume_data.work_experience_entries
+            ],
+            "current_preview": {
+                "work_entries": [
+                    {
+                        "role_line": entry.role_line,
+                        "date_line": entry.date_line,
+                        "bullets": entry.bullets,
+                    }
+                    for entry in local_preview.work_entries
+                ],
+                "key_skills": local_preview.key_skills,
+                "cover_letter_text": local_preview.cover_letter_text,
+            },
+            "instructions": {
+                "return_json": True,
+                "fields": ["work_entries", "key_skills", "cover_letter_text"],
+                "constraints": [
+                    "Preserve employers, role titles, dates, and chronology exactly.",
+                    "Return one work entry for each source work entry in the same order.",
+                    "Preserve at least one bullet per role and do not invent jobs or dates.",
+                    "Keep rewritten bullets plausible and grounded in the source resume.",
+                    "Keep cover letter concise and professional.",
+                ],
+            },
+        }
+        if retry_count > 0:
+            prompt["instructions"]["constraints"].extend(
+                [
+                    "Avoid repeated openings or repeated closing clauses across bullets.",
+                    "Reject any broken grammar such as duplicated verbs or dropped conjunctions.",
+                    "Prefer preserving the original sentence when uncertain.",
+                ]
+            )
+
+        system_prompt = (
+            "You tailor resume and cover-letter content for job applications. "
+            "Return only valid JSON with keys work_entries, key_skills, and cover_letter_text. "
+            "Do not invent employers, titles, or dates. Preserve chronology. "
+            "Improve wording quality and relevance while keeping claims plausibly grounded in the source resume."
+        )
+        try:
+            text = self._create_completion(provider, model, prompt, system_prompt=system_prompt)
+            cleaned_text = self._extract_json_text(text)
+            try:
+                payload = json.loads(cleaned_text)
+            except json.JSONDecodeError:
+                payload = json.loads(cleaned_text.replace("\r\n", "\\n").replace("\n", "\\n"))
+        except Exception:
+            LOGGER.exception("Failed AI document tailoring for %s", job.id)
+            return None
+
+        try:
+            tailored_entries = self._parse_tailored_entries(payload.get("work_entries"), resume_data)
+            key_skills = self._parse_tailored_key_skills(payload.get("key_skills"), local_preview.key_skills)
+            cover_letter_text = self._parse_tailored_cover_letter(payload.get("cover_letter_text"))
+        except Exception:
+            LOGGER.exception("Failed to parse AI document tailoring payload for %s", job.id)
+            return None
+
+        return DocumentTailoringPayload(
+            work_entries=tailored_entries,
+            key_skills=key_skills,
+            cover_letter_text=cover_letter_text,
+            route="openai",
+            provider=provider,
+            model=model,
+            retry_count=retry_count,
+        )
 
     def _evaluate(
         self,
@@ -522,6 +618,64 @@ class MatchScorer:
             if keyword:
                 cleaned.append(keyword)
         return cleaned[:16]
+
+    @staticmethod
+    def _parse_tailored_key_skills(value: object, fallback: list[str]) -> list[str]:
+        if not isinstance(value, list):
+            return fallback
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            skill = re.sub(r"\s+", " ", str(item or "").strip()).strip(",.;:")
+            normalized = skill.lower()
+            if not skill or normalized in seen:
+                continue
+            seen.add(normalized)
+            cleaned.append(skill)
+        return cleaned or fallback
+
+    @staticmethod
+    def _parse_tailored_cover_letter(value: object) -> str:
+        text = re.sub(r"\s+\n", "\n", str(value or "").strip())
+        return text
+
+    @staticmethod
+    def _parse_tailored_entries(value: object, resume_data: ResumeData) -> list[ResumeWorkEntry]:
+        if not isinstance(value, list) or len(value) != len(resume_data.work_experience_entries):
+            return resume_data.work_experience_entries
+        parsed: list[ResumeWorkEntry] = []
+        for source_entry, item in zip(resume_data.work_experience_entries, value):
+            if not isinstance(item, dict):
+                return resume_data.work_experience_entries
+            bullets_raw = item.get("bullets")
+            if not isinstance(bullets_raw, list):
+                return resume_data.work_experience_entries
+            bullets = [
+                re.sub(r"\s+", " ", str(bullet or "").strip()).strip()
+                for bullet in bullets_raw
+                if str(bullet or "").strip()
+            ]
+            if not bullets:
+                bullets = source_entry.bullets[:1] or [source_entry.role_line]
+            parsed.append(
+                ResumeWorkEntry(
+                    role_line=source_entry.role_line,
+                    date_line=source_entry.date_line,
+                    bullets=bullets,
+                    role_template=source_entry.role_template,
+                    date_template=source_entry.date_template,
+                    bullet_templates=source_entry.bullet_templates,
+                )
+            )
+        return parsed
+
+    @staticmethod
+    def _extract_json_text(text: str) -> str:
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+        return cleaned.strip()
 
     def _estimate_cost(self, provider: str, model: str, input_tokens: int, output_tokens: int) -> float:
         if not self.config.enable_cost_tracking:

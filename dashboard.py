@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import copy
+import logging
 import os
+import queue
 import threading
 import tkinter as tk
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -146,6 +149,15 @@ class JobBotDashboard:
         self._run_poll_after_id: str | None = None
         self._run_in_progress = False
         self.fit_resume_button: ttk.Button | None = None
+        self.generate_button: ttk.Button | None = None
+        self.generate_progress_var = tk.DoubleVar(value=0.0)
+        self.generate_status_var = tk.StringVar(value="Idle")
+        self.generate_context_var = tk.StringVar(value="No generation in progress.")
+        self.generate_progressbar: ttk.Progressbar | None = None
+        self._generate_in_progress = False
+        self._generate_job_id: str | None = None
+        self._generate_event_queue: queue.Queue[tuple[str, str, int, str | None]] = queue.Queue()
+        self._generate_poll_after_id: str | None = None
         self._review_rows: list[dict[str, object]] = []
         self._review_sort_column = "score"
         self._review_sort_desc = True
@@ -356,6 +368,7 @@ class JobBotDashboard:
         generate_button = ttk.Button(buttons, text="Generate", command=self._generate_documents_for_selected)
         generate_button.pack(side="left")
         self._add_tooltip(generate_button, "Generate the tailored resume and cover letter for the selected review item.")
+        self.generate_button = generate_button
         open_resume_button = ttk.Button(buttons, text="Open Resume", command=self._open_resume)
         open_resume_button.pack(side="left", padx=8)
         self._add_tooltip(open_resume_button, "Open the generated tailored resume for the selected review item, preferring DOCX when available.")
@@ -365,6 +378,16 @@ class JobBotDashboard:
         approve_button = ttk.Button(buttons, text="Approve and Send", command=self._approve_and_send)
         approve_button.pack(side="left", padx=8)
         self._add_tooltip(approve_button, "Send the selected job through the configured delivery path.")
+
+        progress_frame = ttk.Frame(frame)
+        progress_frame.pack(fill="x", pady=(8, 0))
+        progress_frame.columnconfigure(0, weight=1)
+        progress_bar = ttk.Progressbar(progress_frame, maximum=8, variable=self.generate_progress_var)
+        progress_bar.grid(row=0, column=0, sticky="ew")
+        self.generate_progressbar = progress_bar
+        self._add_tooltip(progress_bar, "Shows progress for the selected Generate action.")
+        ttk.Label(progress_frame, textvariable=self.generate_status_var).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(progress_frame, textvariable=self.generate_context_var).grid(row=2, column=0, sticky="w")
 
         self.details_text = tk.Text(frame, height=16, wrap="word")
         self.details_text.pack(fill="both", expand=False, pady=(10, 0))
@@ -713,6 +736,15 @@ class JobBotDashboard:
             return ""
         return value.replace("T", " ")[:19]
 
+    @staticmethod
+    def _format_generated_at(value: str) -> str:
+        if not value:
+            return ""
+        try:
+            return datetime.fromisoformat(value).astimezone().strftime("%Y-%m-%d %I:%M:%S %p")
+        except ValueError:
+            return value.replace("T", " ")[:19]
+
     def _refresh_selected_details(self) -> None:
         if not self.details_text:
             return
@@ -751,6 +783,7 @@ class JobBotDashboard:
                 self._document_status_text(row["cover_letter_path"]),
                 "",
                 f"Document status: {row['document_status']}",
+                f"Generated at: {self._format_generated_at(str(row.get('generated_at') or '')) or 'Not generated'}",
                 f"Document error: {row.get('document_error') or 'None'}",
                 "",
                 "Job description:",
@@ -803,26 +836,82 @@ class JobBotDashboard:
         os.startfile(cover_letter_path)
 
     def _generate_documents_for_selected(self) -> None:
+        if self._generate_in_progress:
+            self.status_var.set("Document generation is already in progress.")
+            return
         row = self._selected_row()
         if not row:
             return
+        LOGGER.info("Review queue generation requested for %s", row["id"])
+        self._set_generate_state(
+            True,
+            job_id=str(row["id"]),
+            status="Starting document generation...",
+            context=f"{row['title']} at {row['employer']}",
+            progress=0,
+        )
         self.status_var.set("Generating documents...")
+        self._start_generate_polling()
         thread = threading.Thread(target=self._generate_documents_background, args=(row["id"],), daemon=True)
         thread.start()
 
     def _generate_documents_background(self, job_id: str) -> None:
         try:
-            self.pipeline.generate_documents_for_job(job_id)
-            status = "Documents generated."
+            self.pipeline.generate_documents_for_job(job_id, progress_callback=lambda stage, message, progress: self._report_generate_progress(job_id, stage, message, progress))
+            row = self.database.get_review_row(job_id)
+            generated_at = self._format_generated_at(str(row.get("generated_at") or "")) if row else ""
+            status = f"Documents generated{f' at {generated_at}' if generated_at else '.'}"
+            self._generate_event_queue.put(("completed", status, 8, job_id))
         except Exception as exc:
+            LOGGER.exception("Review queue generation failed for %s", job_id)
             status = f"Document generation failed: {exc}"
-        self.root.after(
-            0,
-            lambda: (
-                self.status_var.set(status),
-                self.refresh_view(),
-            ),
-        )
+            self._generate_event_queue.put(("failed", status, 0, job_id))
+
+    def _report_generate_progress(self, job_id: str, stage: str, message: str, progress: int) -> None:
+        self._generate_event_queue.put((stage, message, progress, job_id))
+
+    def _apply_generate_progress(self, job_id: str, stage: str, message: str, progress: int) -> None:
+        if self._generate_job_id != job_id:
+            return
+        self.generate_progress_var.set(progress)
+        self.generate_status_var.set(message)
+
+    def _start_generate_polling(self) -> None:
+        self._stop_generate_polling()
+        self._drain_generate_events()
+
+    def _stop_generate_polling(self) -> None:
+        if self._generate_poll_after_id:
+            self.root.after_cancel(self._generate_poll_after_id)
+            self._generate_poll_after_id = None
+
+    def _drain_generate_events(self) -> None:
+        keep_polling = self._generate_in_progress
+        while True:
+            try:
+                stage, message, progress, job_id = self._generate_event_queue.get_nowait()
+            except queue.Empty:
+                break
+            if stage in {"completed", "failed"}:
+                self._set_generate_state(False, job_id=job_id, status=message, context=self.generate_context_var.get(), progress=progress)
+                self.status_var.set(message)
+                self.refresh_view()
+                keep_polling = False
+            else:
+                self._apply_generate_progress(str(job_id), stage, message, progress)
+        if keep_polling:
+            self._generate_poll_after_id = self.root.after(100, self._drain_generate_events)
+        else:
+            self._generate_poll_after_id = None
+
+    def _set_generate_state(self, in_progress: bool, *, job_id: str | None, status: str, context: str, progress: float) -> None:
+        self._generate_in_progress = in_progress
+        self._generate_job_id = job_id if in_progress else None
+        self.generate_status_var.set(status)
+        self.generate_context_var.set(context if context else "No generation in progress.")
+        self.generate_progress_var.set(progress)
+        if self.generate_button:
+            self.generate_button.configure(state="disabled" if in_progress else "normal")
 
     def _approve_and_send(self) -> None:
         row = self._selected_row()
@@ -871,3 +960,4 @@ def launch_dashboard(paths: AppPaths) -> None:
     root = tk.Tk()
     JobBotDashboard(root, config, paths, database)
     root.mainloop()
+LOGGER = logging.getLogger(__name__)

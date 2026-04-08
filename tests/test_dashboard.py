@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tkinter as tk
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -9,6 +10,8 @@ from unittest.mock import patch
 from config import build_app_paths, load_or_create_config
 from database import Database
 from dashboard import JobBotDashboard
+from doc_generator import GeneratedDocs
+from database import Job
 from test_support import workspace_temp_dir
 
 
@@ -152,3 +155,91 @@ class DashboardSmokeTests(unittest.TestCase):
     def test_document_status_text_reports_missing_and_not_generated(self) -> None:
         self.assertEqual(JobBotDashboard._document_status_text(""), "Not generated")
         self.assertIn("Generated but missing on disk:", JobBotDashboard._document_status_text("C:\\missing\\resume.pdf"))
+
+    @unittest.skipIf(os.environ.get("CI") == "true", "Skipping Tk smoke test in CI")
+    def test_generate_documents_updates_progress_and_reenables_button(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                database = Database(paths.database_file)
+                database.initialize()
+                database.upsert_job(
+                    Job(
+                        id="dash-gen-1",
+                        title="Director of Ecommerce",
+                        employer="MILK BAR",
+                        location="New York, NY",
+                        salary_range="",
+                        description_full="Lead ecommerce growth and analytics.",
+                        apply_method="board",
+                        apply_url="https://example.com",
+                        hiring_manager_email="",
+                        source="jobspy",
+                        posted_at="2026-01-01T00:00:00+00:00",
+                        scraped_at="2026-01-01T00:00:00+00:00",
+                    ),
+                    {},
+                )
+                database.record_match_result(
+                    "dash-gen-1",
+                    score=82,
+                    rationale="Strong fit",
+                    strengths=[],
+                    gaps=[],
+                    is_match=True,
+                    status="review",
+                    error_message="",
+                    scored_at="2026-01-01T00:00:00+00:00",
+                )
+                root = tk.Tk()
+                root.withdraw()
+                try:
+                    dashboard = JobBotDashboard(root, config, paths, database)
+                    dashboard.review_tree.selection_set("dash-gen-1")
+
+                    class FakePipeline:
+                        def __init__(self, db: Database, base: Path) -> None:
+                            self.db = db
+                            self.base = base
+
+                        def generate_documents_for_job(self, job_id: str, *, progress_callback=None):
+                            if progress_callback:
+                                progress_callback("starting", "Starting document generation...", 0)
+                                progress_callback("parsing_resume", "Loading and parsing resume...", 2)
+                                progress_callback("validating_pages", "Validating final page count...", 5)
+                                progress_callback("writing_cover_letter", "Writing cover letter...", 6)
+                            target_dir = self.base / "output"
+                            target_dir.mkdir(parents=True, exist_ok=True)
+                            resume_pdf = target_dir / "resume.pdf"
+                            cover = target_dir / "cover_letter.txt"
+                            resume_pdf.write_text("pdf", encoding="utf-8")
+                            cover.write_text("cover", encoding="utf-8")
+                            self.db.record_generated_documents(
+                                job_id,
+                                output_dir=str(target_dir),
+                                resume_docx_path="",
+                                resume_pdf_path=str(resume_pdf),
+                                cover_letter_path=str(cover),
+                                status="generated",
+                                error_message="",
+                                generated_at="2026-04-07T16:52:00+00:00",
+                            )
+                            return GeneratedDocs(output_dir=target_dir, resume_pdf_path=resume_pdf, cover_letter_path=cover)
+
+                    dashboard.pipeline = FakePipeline(database, Path(tmp))
+                    dashboard._generate_documents_for_selected()
+                    for _ in range(40):
+                        root.update()
+                        if not dashboard._generate_in_progress:
+                            break
+                        time.sleep(0.02)
+                    self.assertFalse(dashboard._generate_in_progress)
+                    self.assertEqual(str(dashboard.generate_button["state"]), "normal")
+                    self.assertIn("Documents generated", dashboard.status_var.get())
+                    self.assertEqual(dashboard.generate_progress_var.get(), 8)
+                    row = database.get_review_row("dash-gen-1")
+                    self.assertEqual(row["document_status"], "generated")
+                    self.assertEqual(row["generated_at"], "2026-04-07T16:52:00+00:00")
+                finally:
+                    root.destroy()

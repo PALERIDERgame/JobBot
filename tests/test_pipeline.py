@@ -278,6 +278,119 @@ class PipelineTests(unittest.TestCase):
                 self.assertTrue(docs.cover_letter_path.exists())
                 row = database.get_review_row("7")
                 self.assertEqual(row["document_status"], "generated")
+                self.assertTrue(row["generated_at"])
+
+    def test_generate_documents_for_job_emits_progress_events(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                config.automation_mode = "semi_auto"
+                config.skip_ai_scoring_in_semi_auto = True
+                resume_path = Path(tmp) / "resume.txt"
+                resume_path.write_text(
+                    "Jane Candidate\njane@example.com\n555-123-4567\nSummary: Python engineer\nSkills: Python, SQL\nBuilt APIs\n",
+                    encoding="utf-8",
+                )
+                config.resume_source_path = str(resume_path)
+                database = Database(paths.database_file)
+                database.initialize()
+                pipeline = JobBotPipeline(config, paths, database)
+                sample_job = Job(
+                    id="70",
+                    title="Python Developer",
+                    employer="Acme",
+                    location="Remote",
+                    salary_range="100-120",
+                    description_full="Build APIs",
+                    apply_method="board",
+                    apply_url="https://example.com",
+                    hiring_manager_email="",
+                    source="jobspy",
+                    posted_at="2026-01-01T00:00:00+00:00",
+                    scraped_at="2026-01-01T00:00:00+00:00",
+                )
+                pipeline.scraper.fetch_jobs = lambda: [(sample_job, {"sample": True})]
+                pipeline.run()
+
+                def fake_generate(output_dir, job, resume, score, *, ai_notes="", tailoring_payload=None, progress_callback=None):
+                    if progress_callback:
+                        progress_callback("tailoring_resume", "Tailoring resume...", 3)
+                        progress_callback("exporting_pdf", "Exporting PDF...", 4)
+                        progress_callback("validating_pages", "Validating final page count...", 5)
+                        progress_callback("writing_cover_letter", "Writing cover letter...", 6)
+                    target_dir = output_dir / "Acme_2026-01-01_deadbeef"
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    resume_pdf = target_dir / "resume.pdf"
+                    cover = target_dir / "cover_letter.txt"
+                    resume_pdf.write_text("pdf", encoding="utf-8")
+                    cover.write_text("cover", encoding="utf-8")
+                    from doc_generator import GeneratedDocs
+                    return GeneratedDocs(output_dir=target_dir, resume_pdf_path=resume_pdf, cover_letter_path=cover)
+
+                pipeline.doc_generator.generate = fake_generate
+                events: list[tuple[str, str, int]] = []
+                pipeline.generate_documents_for_job("70", progress_callback=lambda stage, message, progress: events.append((stage, message, progress)))
+                self.assertEqual(
+                    [stage for stage, _message, _progress in events],
+                    ["starting", "loading_job", "parsing_resume", "tailoring_resume", "exporting_pdf", "validating_pages", "writing_cover_letter", "saving_database_state", "completed"],
+                )
+
+    def test_generate_documents_for_job_records_page_limit_failure(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                config.automation_mode = "semi_auto"
+                config.skip_ai_scoring_in_semi_auto = True
+                resume_path = Path(tmp) / "resume.txt"
+                resume_path.write_text(
+                    "Jane Candidate\njane@example.com\n555-123-4567\nSummary: Python engineer\nSkills: Python, SQL\nBuilt APIs\n",
+                    encoding="utf-8",
+                )
+                config.resume_source_path = str(resume_path)
+                database = Database(paths.database_file)
+                database.initialize()
+                pipeline = JobBotPipeline(config, paths, database)
+                sample_job = Job(
+                    id="71",
+                    title="Director of Ecommerce",
+                    employer="MILK BAR",
+                    location="New York, NY",
+                    salary_range="",
+                    description_full="Lead ecommerce growth, reporting, and site optimization.",
+                    apply_method="board",
+                    apply_url="https://example.com",
+                    hiring_manager_email="",
+                    source="jobspy",
+                    posted_at="2026-01-01T00:00:00+00:00",
+                    scraped_at="2026-01-01T00:00:00+00:00",
+                )
+                pipeline.scraper.fetch_jobs = lambda: [(sample_job, {"sample": True})]
+                pipeline.run()
+
+                from doc_generator import GeneratedDocs
+
+                def fake_generate(output_dir, job, resume, score, *, ai_notes="", tailoring_payload=None, progress_callback=None):
+                    if progress_callback:
+                        progress_callback("tailoring_resume", "Tailoring resume...", 3)
+                        progress_callback("exporting_pdf", "Exporting PDF...", 4)
+                        progress_callback("validating_pages", "Validating final page count...", 5)
+                    return GeneratedDocs(
+                        output_dir=output_dir,
+                        resume_pdf_path=Path(),
+                        cover_letter_path=Path(),
+                        resume_docx_path=Path(),
+                        status="failed",
+                        error_message="JobBot could not compress the tailored resume to 2 pages.",
+                    )
+
+                pipeline.doc_generator.generate = fake_generate
+                with self.assertRaisesRegex(ValueError, "compress the tailored resume to 2 pages"):
+                    pipeline.generate_documents_for_job("71")
+                row = database.get_review_row("71")
+                self.assertEqual(row["document_status"], "failed")
+                self.assertIn("compress the tailored resume to 2 pages", row["document_error"].lower())
 
     def test_load_resume_reparses_legacy_cache_without_structured_sections(self) -> None:
         with workspace_temp_dir() as tmp:
@@ -310,6 +423,57 @@ class PipelineTests(unittest.TestCase):
                 self.assertTrue(resume.header_lines)
                 self.assertTrue(resume.education_lines)
                 self.assertTrue(resume.work_experience_entries)
+
+    def test_load_resume_reparses_docx_cache_without_template_metadata(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                from docx import Document
+
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                resume_path = Path(tmp) / "Robert Thom Resume 2026.docx"
+                doc = Document()
+                doc.add_paragraph("ROBERT THOM")
+                doc.add_paragraph("robert@example.com | linkedin.com/in/example | (530) 220-4847")
+                doc.add_paragraph("WORK EXPERIENCE", style="Heading 1")
+                doc.add_paragraph("Underdog Strategies, New York, NY — Digital Advertising and Field Manager", style="Heading 2")
+                doc.add_paragraph("JULY 2024 - Present")
+                bullet = doc.add_paragraph(style="List Bullet")
+                bullet.add_run("Led digital ad strategy and reporting")
+                doc.add_paragraph("EDUCATION", style="Heading 1")
+                doc.add_paragraph("University of California, Davis", style="Heading 2")
+                doc.add_paragraph("KEY SKILLS", style="Heading 1")
+                doc.add_paragraph("Operations, Project Management, CRM, Data Analysis")
+                doc.save(str(resume_path))
+
+                config.resume_source_path = str(resume_path)
+                paths.resume_json.write_text(
+                    (
+                        '{'
+                        f'"source_path": "{str(resume_path).replace("\\", "\\\\")}", '
+                        '"raw_text": "legacy", '
+                        '"name": "WORK EXPERIENCE", '
+                        '"email": "old@example.com", '
+                        '"phone": "555", '
+                        '"summary": "legacy", '
+                        '"skills": ["legacy"], '
+                        '"experience_lines": ["legacy"], '
+                        '"header_lines": ["robert@example.com | linkedin.com/in/example | (530) 220-4847"], '
+                        '"education_lines": ["University of California, Davis"], '
+                        '"key_skills_lines": ["Operations, Project Management, CRM, Data Analysis"], '
+                        '"work_experience_entries": [{"role_line": "Underdog Strategies, New York, NY — Digital Advertising and Field Manager", "date_line": "JULY 2024 - Present", "bullets": ["Led digital ad strategy and reporting"]}]'
+                        '}'
+                    ),
+                    encoding="utf-8",
+                )
+                database = Database(paths.database_file)
+                database.initialize()
+                pipeline = JobBotPipeline(config, paths, database)
+                resume = pipeline._load_resume()
+                self.assertEqual(resume.name, "ROBERT THOM")
+                self.assertTrue(resume.key_skills_templates)
+                self.assertTrue(resume.work_experience_entries[0].role_template is not None)
+                self.assertTrue(resume.work_experience_entries[0].bullet_templates)
 
     def test_recent_duplicate_from_prior_day_window_is_skipped(self) -> None:
         with workspace_temp_dir() as tmp:

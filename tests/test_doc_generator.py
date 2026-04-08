@@ -2,9 +2,12 @@
 
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+from zipfile import ZipFile
 
 from database import Job
 from doc_generator import DocumentGenerator
+from document_tailoring import DocumentTailoringPayload
 from match_scorer import MatchScore
 from resume_parser import ResumeData, ResumeWorkEntry, parse_resume
 from test_support import workspace_temp_dir
@@ -70,6 +73,7 @@ class DocumentGeneratorTests(unittest.TestCase):
             _build_source_resume_docx(source_docx)
             generator = DocumentGenerator()
             generator._export_docx_to_pdf = lambda docx_path, pdf_path: pdf_path.write_bytes(b"pdf")
+            generator._count_pdf_pages = lambda pdf_path: 2
             resume = parse_resume(source_docx, Path(tmp) / "resume_cache.json")
             docs = generator.generate(
                 Path(tmp),
@@ -101,6 +105,16 @@ class DocumentGeneratorTests(unittest.TestCase):
                     for paragraph in numbered
                 )
             )
+            source_document = Document(str(source_docx))
+            source_bullet = next(paragraph for paragraph in source_document.paragraphs if paragraph.text.startswith("Led digital ad strategy"))
+            generated_bullet = next(paragraph for paragraph in document.paragraphs if paragraph.text.startswith("Drove") or paragraph.text.startswith("Led digital") or paragraph.text.startswith("Led"))
+            self.assertIsNotNone(generated_bullet.runs[0].font.size)
+            if source_bullet.runs[0].font.size is not None:
+                self.assertLess(generated_bullet.runs[0].font.size, source_bullet.runs[0].font.size)
+            with ZipFile(docs.resume_docx_path) as archive:
+                numbering_xml = archive.read("word/numbering.xml").decode("utf-8", errors="ignore")
+            self.assertIn('w:sz w:val="12"', numbering_xml)
+            self.assertIn('w:szCs w:val="12"', numbering_xml)
             key_skills_heading_idx = next(idx for idx, paragraph in enumerate(work_paragraphs) if paragraph.text.strip() == "KEY SKILLS")
             self.assertEqual(len([paragraph for paragraph in work_paragraphs[key_skills_heading_idx + 1:] if paragraph.text.strip()]), 1)
 
@@ -110,6 +124,7 @@ class DocumentGeneratorTests(unittest.TestCase):
             _build_source_resume_docx(source_docx)
             generator = DocumentGenerator()
             generator._export_docx_to_pdf = lambda docx_path, pdf_path: pdf_path.write_bytes(b"pdf")
+            generator._count_pdf_pages = lambda pdf_path: 2
             resume = parse_resume(source_docx, Path(tmp) / "resume_cache.json")
             docs = generator.generate(
                 Path(tmp),
@@ -121,7 +136,19 @@ class DocumentGeneratorTests(unittest.TestCase):
             from docx import Document
             document = Document(str(docs.resume_docx_path))
             text = "\n".join(paragraph.text for paragraph in document.paragraphs if paragraph.text.strip())
-            self.assertIn("focus on analytics and reporting", text.lower())
+            self.assertTrue(
+                any(
+                    phrase in text.lower()
+                    for phrase in (
+                        "kpi visibility",
+                        "growth marketing",
+                        "acquisition and retention",
+                        "across teams",
+                    )
+                )
+            )
+            self.assertNotIn("with a focus on", text.lower())
+            self.assertNotIn("digital growth initiatives, campaign planning, and customer acquisition efforts by", text.lower())
             self.assertNotIn("Target Role", text)
 
     def test_cover_letter_is_structured_and_tailored_for_relevant_job(self) -> None:
@@ -130,6 +157,7 @@ class DocumentGeneratorTests(unittest.TestCase):
             _build_source_resume_docx(source_docx)
             generator = DocumentGenerator()
             generator._export_docx_to_pdf = lambda docx_path, pdf_path: pdf_path.write_bytes(b"pdf")
+            generator._count_pdf_pages = lambda pdf_path: 2
             resume = parse_resume(source_docx, Path(tmp) / "resume_cache.json")
             docs = generator.generate(
                 Path(tmp),
@@ -148,6 +176,68 @@ class DocumentGeneratorTests(unittest.TestCase):
             self.assertNotIn("I believe my background is relevant", text)
             self.assertNotIn("â€”", text)
             self.assertNotIn("- Underdog Strategies", text)
+
+    def test_docx_generation_auto_fits_resume_to_two_pages(self) -> None:
+        with workspace_temp_dir() as tmp:
+            source_docx = Path(tmp) / "source_resume.docx"
+            _build_source_resume_docx(source_docx)
+            generator = DocumentGenerator()
+            generator._export_docx_to_pdf = lambda docx_path, pdf_path: pdf_path.write_bytes(b"pdf")
+            page_counts = iter([3, 2])
+            generator._count_pdf_pages = lambda pdf_path: next(page_counts)
+            resume = parse_resume(source_docx, Path(tmp) / "resume_cache.json")
+            docs = generator.generate(
+                Path(tmp),
+                Job("1", "Director of Ecommerce", "MILK BAR", "New York, NY", "", "Lead ecommerce growth, analytics, dashboard reporting, and site optimization.", "board", "https://example.com", "", "jobspy", "", ""),
+                resume,
+                MatchScore(0, "", [], [], False, "review", "", "2026-01-01T00:00:00+00:00"),
+                ai_notes="",
+            )
+            self.assertEqual(docs.status, "generated")
+            self.assertTrue(docs.resume_docx_path.exists())
+            self.assertTrue(docs.resume_pdf_path.exists())
+
+    def test_docx_generation_fails_only_after_exhausting_fit_attempts(self) -> None:
+        with workspace_temp_dir() as tmp:
+            source_docx = Path(tmp) / "source_resume.docx"
+            _build_source_resume_docx(source_docx)
+            generator = DocumentGenerator()
+            generator._export_docx_to_pdf = lambda docx_path, pdf_path: pdf_path.write_bytes(b"pdf")
+            generator._count_pdf_pages = lambda pdf_path: 3
+            resume = parse_resume(source_docx, Path(tmp) / "resume_cache.json")
+            docs = generator.generate(
+                Path(tmp),
+                Job("1", "Director of Ecommerce", "MILK BAR", "New York, NY", "", "Lead ecommerce growth, analytics, dashboard reporting, and site optimization.", "board", "https://example.com", "", "jobspy", "", ""),
+                resume,
+                MatchScore(0, "", [], [], False, "review", "", "2026-01-01T00:00:00+00:00"),
+                ai_notes="",
+            )
+            self.assertEqual(docs.status, "failed")
+            self.assertIn("compress the tailored resume to 2 pages", docs.error_message.lower())
+            self.assertEqual(docs.resume_docx_path, Path())
+            self.assertEqual(docs.resume_pdf_path, Path())
+
+    def test_docx_generation_emits_fit_progress_messages(self) -> None:
+        with workspace_temp_dir() as tmp:
+            source_docx = Path(tmp) / "source_resume.docx"
+            _build_source_resume_docx(source_docx)
+            generator = DocumentGenerator()
+            generator._export_docx_to_pdf = lambda docx_path, pdf_path: pdf_path.write_bytes(b"pdf")
+            page_counts = iter([3, 2])
+            generator._count_pdf_pages = lambda pdf_path: next(page_counts)
+            resume = parse_resume(source_docx, Path(tmp) / "resume_cache.json")
+            events: list[tuple[str, str, int]] = []
+            generator.generate(
+                Path(tmp),
+                Job("1", "Director of Ecommerce", "MILK BAR", "New York, NY", "", "Lead ecommerce growth, analytics, dashboard reporting, and site optimization.", "board", "https://example.com", "", "jobspy", "", ""),
+                resume,
+                MatchScore(0, "", [], [], False, "review", "", "2026-01-01T00:00:00+00:00"),
+                ai_notes="",
+                progress_callback=lambda stage, message, progress: events.append((stage, message, progress)),
+            )
+            messages = [message for _stage, message, _progress in events]
+            self.assertIn("Validating final page count...", messages)
+            self.assertIn("Resume is over 2 pages; tightening bullets...", messages)
 
     def test_cover_letter_uses_safe_signoff_when_resume_name_is_bad(self) -> None:
         generator = DocumentGenerator()
@@ -238,6 +328,100 @@ class DocumentGeneratorTests(unittest.TestCase):
             self.assertEqual(docs.resume_pdf_path, Path())
             self.assertEqual(docs.status, "generated_docx_only")
             self.assertIn("Word automation unavailable", docs.error_message)
+
+    def test_docx_pdf_export_uses_common_libreoffice_path_when_not_on_path(self) -> None:
+        with workspace_temp_dir() as tmp:
+            source_docx = Path(tmp) / "source_resume.docx"
+            pdf_path = Path(tmp) / "resume.pdf"
+            _build_source_resume_docx(source_docx)
+            generator = DocumentGenerator()
+
+            class _Completed:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            def _fake_run(*args, **kwargs):
+                pdf_path.write_bytes(b"pdf")
+                return _Completed()
+
+            with patch.object(generator, "_libreoffice_candidates", return_value=[r"C:\Program Files\LibreOffice\program\soffice.exe"]), patch(
+                "doc_generator.subprocess.run",
+                side_effect=_fake_run,
+            ) as run_mock:
+                generator._export_docx_to_pdf(source_docx, pdf_path)
+
+            self.assertTrue(pdf_path.exists())
+            self.assertIn(r"C:\Program Files\LibreOffice\program\soffice.exe", " ".join(run_mock.call_args.args[0]))
+
+    def test_dow_jones_style_bullets_avoid_repetitive_prefixes_and_bad_grammar(self) -> None:
+        with workspace_temp_dir() as tmp:
+            source_docx = Path(tmp) / "source_resume.docx"
+            _build_source_resume_docx(source_docx)
+            generator = DocumentGenerator()
+            generator._export_docx_to_pdf = lambda docx_path, pdf_path: pdf_path.write_bytes(b"pdf")
+            generator._count_pdf_pages = lambda pdf_path: 2
+            resume = parse_resume(source_docx, Path(tmp) / "resume_cache.json")
+            resume.work_experience_entries[0].bullets = [
+                "Spearheaded a new digital ad strategy for charter school clients, including sentiment analysis of ad copy, which boosted student inquiries by 35% and lowered cost per lead by 15% across key campaigns.",
+                "Managed and optimized social media campaigns, leading to a 50% increase in brand awareness and a 25% increase in engagement with key demographics in the Bronx.",
+                "Streamlined lead data review and updated real-time dashboards for executive leadership, developing metrics for canvasser productivity and providing immediate insights for campaign adjustments.",
+                "Led and trained a team of 15+ canvassers, exceeding monthly lead generation targets by an average of 10% through a new data-informed training program focused on effective community engagement.",
+            ]
+            docs = generator.generate(
+                Path(tmp),
+                Job("1", "Head of Marketing, Industries", "Dow Jones", "New York, NY", "", "Define marketing strategy, maximize ROI, align with sales, improve lead quality, and build performance dashboards for B2B growth.", "email", "https://example.com", "talent@example.com", "jobspy", "", ""),
+                resume,
+                MatchScore(0, "", [], [], False, "review", "", "2026-01-01T00:00:00+00:00"),
+                ai_notes="",
+            )
+            from docx import Document
+            document = Document(str(docs.resume_docx_path))
+            bullet_text = [p.text for p in document.paragraphs if p.text.strip() and p.style.name == "List Bullet"]
+            combined = "\n".join(bullet_text).lower()
+            self.assertNotIn("by and", combined)
+            self.assertNotIn("by a portfolio", combined)
+            self.assertNotIn("by met", combined)
+            self.assertNotIn("by set", combined)
+            self.assertNotIn("by crm", combined)
+            self.assertLess(combined.count("to support growth marketing and audience development"), 3)
+            self.assertTrue(
+                any(
+                    phrase in combined
+                    for phrase in (
+                        "b2b growth strategy",
+                        "sales alignment",
+                        "roi reporting",
+                        "kpi visibility",
+                    )
+                )
+            )
+
+    def test_should_escalate_tailoring_for_broken_local_output(self) -> None:
+        generator = DocumentGenerator()
+        job = Job("1", "Head of Marketing, Industries", "Dow Jones", "New York, NY", "", "Lead B2B growth, ROI reporting, sales alignment, and product marketing.", "email", "", "", "jobspy", "", "")
+        resume = ResumeData("", "", "Jane", "jane@example.com", "", "Summary", ["Marketing"], ["Built dashboards"])
+        payload = DocumentTailoringPayload(
+            work_entries=[
+                ResumeWorkEntry("Role", "2024", ["Managed optimized campaigns.", "Presented Presented that report.", "Created delivered both in-person."])
+            ],
+            key_skills=["Marketing"],
+            cover_letter_text="Letter",
+        )
+        self.assertTrue(generator.should_escalate_tailoring(job, resume, payload))
+
+    def test_validate_tailoring_payload_accepts_clean_payload(self) -> None:
+        generator = DocumentGenerator()
+        payload = DocumentTailoringPayload(
+            work_entries=[
+                ResumeWorkEntry("Role", "2024", ["Managed integrated campaigns and improved lead quality.", "Built dashboards for leadership reporting."])
+            ],
+            key_skills=["Marketing Strategy", "Dashboard Reporting"],
+            cover_letter_text="Letter",
+        )
+        valid, issues = generator.validate_tailoring_payload(payload)
+        self.assertTrue(valid)
+        self.assertEqual(issues, [])
 
     def test_docx_generation_fails_when_template_sections_are_missing(self) -> None:
         with workspace_temp_dir() as tmp:

@@ -1,0 +1,2 @@
+[console_scripts]
+omnara = omnara.cli:main
