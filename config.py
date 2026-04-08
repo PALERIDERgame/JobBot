@@ -42,6 +42,11 @@ class SourceConfig:
     api_url: str = "https://data.usajobs.gov/api/search"
     user_agent: str = "jobbot-demo@example.com"
     authorization_key: str = ""
+    adzuna_app_id: str = ""
+    adzuna_app_key: str = ""
+    adzuna_country: str = "us"
+    adzuna_category: str = ""
+    adzuna_sort: str = "date"
 
 
 @dataclass(slots=True)
@@ -195,8 +200,8 @@ def validate_config(config: JobBotConfig) -> None:
         raise ValueError("automation_mode must be 'semi_auto' or 'auto'")
     if config.llm_provider not in {"anthropic", "openai"}:
         raise ValueError("llm_provider must be 'anthropic' or 'openai'")
-    if config.source.provider not in {"usajobs", "jobspy"}:
-        raise ValueError("source.provider must be 'usajobs' or 'jobspy'")
+    if config.source.provider not in {"usajobs", "jobspy", "adzuna"}:
+        raise ValueError("source.provider must be 'usajobs', 'jobspy', or 'adzuna'")
     if not config.source.jobspy_sites:
         raise ValueError("source.jobspy_sites must contain at least one site")
     if config.source.days_back <= 0:

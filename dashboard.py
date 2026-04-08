@@ -26,8 +26,11 @@ MODEL_OPTIONS = {
 
 FIELD_TOOLTIPS = {
     "Resume source": "Path to your source resume file. DOCX is recommended for the highest-quality tailoring; PDF and plain text still work.",
-    "Source provider": "Choose where jobs are discovered. JobSpy searches boards by keyword; USAJobs uses the federal API.",
+    "Source provider": "Choose where jobs are discovered. Adzuna and USAJobs use official APIs; JobSpy scrapes boards by keyword.",
     "JobSpy sites": "Comma-separated JobSpy sites to query. Recommended: indeed, google.",
+    "Adzuna app id": "App ID from your Adzuna developer account.",
+    "Adzuna app key": "App key from your Adzuna developer account.",
+    "Adzuna country": "Adzuna country code, e.g., us, gb, ca.",
     "Results per page": "How many jobs to request per run. Semi-auto defaults to 100; auto defaults to 25.",
     "Cheap stage provider": "Model provider for the low-cost screening pass.",
     "Cheap stage model": "Specific low-cost model used for the cheap screening stage.",
@@ -117,6 +120,9 @@ class JobBotDashboard:
         self.results_per_page_var = tk.StringVar(value=str(config.source.results_per_page))
         self.usajobs_email_var = tk.StringVar(value=config.source.user_agent)
         self.usajobs_auth_key_var = tk.StringVar(value=config.source.authorization_key)
+        self.adzuna_app_id_var = tk.StringVar(value=config.source.adzuna_app_id)
+        self.adzuna_app_key_var = tk.StringVar(value=config.source.adzuna_app_key)
+        self.adzuna_country_var = tk.StringVar(value=config.source.adzuna_country or "us")
         self.include_titles_var = tk.StringVar(value=", ".join(config.include_titles))
         self.exclude_titles_var = tk.StringVar(value=", ".join(config.exclude_titles))
         self.force_keywords_var = tk.StringVar(value=", ".join(config.force_escalate_keywords))
@@ -162,6 +168,7 @@ class JobBotDashboard:
         self._review_rows: list[dict[str, object]] = []
         self._review_sort_column = "score"
         self._review_sort_desc = True
+        self._source_provider_user_set = False
         self._build_ui()
         self.refresh_view()
 
@@ -215,6 +222,9 @@ class JobBotDashboard:
             ("Results per page", self.results_per_page_var),
             ("USAJobs account email", self.usajobs_email_var),
             ("USAJobs authorization key", self.usajobs_auth_key_var),
+            ("Adzuna app id", self.adzuna_app_id_var),
+            ("Adzuna app key", self.adzuna_app_key_var),
+            ("Adzuna country", self.adzuna_country_var),
             ("Automation mode", self.automation_mode_var),
             ("Cheap stage provider", self.cheap_stage_provider_var),
             ("Cheap stage model", self.cheap_stage_model_var),
@@ -234,7 +244,7 @@ class JobBotDashboard:
             ("Client secrets path", self.client_secret_var),
         ]
         values_map = {
-            "Source provider": ("jobspy", "usajobs"),
+            "Source provider": ("jobspy", "adzuna", "usajobs"),
             "Automation mode": ("semi_auto", "auto"),
             "Cheap stage provider": ("ollama_local", "openai", "anthropic"),
             "Strong stage provider": ("anthropic", "openai"),
@@ -281,6 +291,8 @@ class JobBotDashboard:
             elif label in {"Source provider", "Automation mode", "Cheap stage provider", "Strong stage provider", "Doc stage provider"}:
                 combo = ttk.Combobox(frame, textvariable=var, values=values_map[label], state="readonly", width=67)
                 combo.grid(row=idx, column=1, columnspan=2, sticky="ew", pady=6)
+                if label == "Source provider":
+                    combo.bind("<<ComboboxSelected>>", self._on_source_provider_changed, add="+")
                 if label == "Strong stage provider":
                     combo.bind("<<ComboboxSelected>>", self._on_strong_provider_changed, add="+")
                 if label == "Doc stage provider":
@@ -299,7 +311,7 @@ class JobBotDashboard:
                     self.doc_stage_model_combo = combo
                 self._add_tooltip(combo, FIELD_TOOLTIPS[label])
             else:
-                show = "*" if label in {"Anthropic API key", "OpenAI API key", "USAJobs authorization key"} else ""
+                show = "*" if label in {"Anthropic API key", "OpenAI API key", "USAJobs authorization key", "Adzuna app key"} else ""
                 entry = ttk.Entry(frame, textvariable=var, width=70, show=show)
                 entry.grid(row=idx, column=1, columnspan=2, sticky="ew", pady=6)
                 self._bind_entry_autosave(entry)
@@ -496,9 +508,17 @@ class JobBotDashboard:
     def _on_doc_provider_changed(self, _event: object | None = None) -> None:
         self._sync_doc_model_dropdown()
 
+    def _on_source_provider_changed(self, _event: object | None = None) -> None:
+        self._source_provider_user_set = True
+
     def _on_automation_mode_changed(self, _event: object | None = None) -> None:
         mode = self.automation_mode_var.get().strip() or "semi_auto"
         self.results_per_page_var.set("100" if mode == "semi_auto" else "25")
+        if not self._source_provider_user_set:
+            default_provider = "jobspy" if mode == "semi_auto" else "adzuna"
+            self.source_provider_var.set(default_provider)
+        if mode == "auto" and not self.location_var.get().strip():
+            self.location_var.set("New York, NY")
 
     def _sync_strong_model_dropdown(self) -> None:
         if not self.strong_stage_model_combo:
@@ -552,12 +572,15 @@ class JobBotDashboard:
         config.openai_api_key = self.openai_api_key_var.get().strip()
         config.source.keyword = self.keyword_var.get().strip()
         config.source.location = self.location_var.get().strip()
-        config.source.provider = self.source_provider_var.get().strip() or "jobspy"
+        config.source.provider = self.source_provider_var.get().strip() or ("jobspy" if config.automation_mode == "semi_auto" else "adzuna")
         config.source.jobspy_sites = self._parse_csv(self.jobspy_sites_var.get()) or ["indeed", "google"]
         config.automation_mode = self.automation_mode_var.get().strip() or "semi_auto"
         config.source.results_per_page = int(self.results_per_page_var.get().strip() or ("100" if config.automation_mode == "semi_auto" else "25"))
         config.source.user_agent = self.usajobs_email_var.get().strip() or "jobbot-demo@example.com"
         config.source.authorization_key = self.usajobs_auth_key_var.get().strip()
+        config.source.adzuna_app_id = self.adzuna_app_id_var.get().strip()
+        config.source.adzuna_app_key = self.adzuna_app_key_var.get().strip()
+        config.source.adzuna_country = self.adzuna_country_var.get().strip() or "us"
         config.include_titles = self._parse_csv(self.include_titles_var.get())
         config.exclude_titles = self._parse_csv(self.exclude_titles_var.get())
         config.force_escalate_keywords = self._parse_csv(self.force_keywords_var.get())

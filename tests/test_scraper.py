@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from config import JobBotConfig
+from scrapers.adzuna_api import AdzunaScraper
 from scrapers.jobspy_scraper import JobSpyScraper
 from scrapers.scraper_router import ScraperRouter
 from scrapers.usajobs_api import USAJobsScraper
@@ -161,12 +162,61 @@ class ScraperTests(unittest.TestCase):
                 jobs = JobSpyScraper(config).fetch_jobs()
         self.assertEqual(jobs[0][0].employer, "Unknown Employer")
 
+    @patch("scrapers.adzuna_api.requests.get")
+    def test_adzuna_normalizes_response(self, get_mock) -> None:
+        payload = {
+            "results": [
+                {
+                    "id": 123,
+                    "title": "Python Developer",
+                    "company": {"display_name": "Acme"},
+                    "location": {"display_name": "New York, NY"},
+                    "description": "Email your resume to hiring@example.com",
+                    "redirect_url": "https://example.com/job",
+                    "created": "2026-01-01T00:00:00Z",
+                    "salary_min": 100000,
+                    "salary_max": 120000,
+                }
+            ]
+        }
+        response = MagicMock()
+        response.json.return_value = payload
+        response.raise_for_status.return_value = None
+        get_mock.return_value = response
+
+        config = JobBotConfig()
+        config.source.provider = "adzuna"
+        config.source.adzuna_app_id = "app_id"
+        config.source.adzuna_app_key = "app_key"
+        jobs = AdzunaScraper(config).fetch_jobs()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0][0].title, "Python Developer")
+        self.assertEqual(jobs[0][0].apply_method, "email")
+        self.assertEqual(jobs[0][0].hiring_manager_email, "hiring@example.com")
+
+    def test_adzuna_missing_credentials_raise_error(self) -> None:
+        config = JobBotConfig()
+        config.source.provider = "adzuna"
+        config.source.adzuna_app_id = ""
+        config.source.adzuna_app_key = ""
+        with self.assertRaisesRegex(RuntimeError, "Adzuna app_id/app_key are required"):
+            AdzunaScraper(config).fetch_jobs()
+
     def test_router_dispatches_jobspy(self) -> None:
         config = JobBotConfig()
         config.source.provider = "jobspy"
         router = ScraperRouter(config)
         router.fetch_jobs = router.fetch_jobs.__get__(router, ScraperRouter)
         with patch("scrapers.scraper_router.JobSpyScraper.fetch_jobs", return_value=[]) as fetch_mock:
+            self.assertEqual(router.fetch_jobs(), [])
+            fetch_mock.assert_called_once()
+
+    def test_router_dispatches_adzuna(self) -> None:
+        config = JobBotConfig()
+        config.source.provider = "adzuna"
+        router = ScraperRouter(config)
+        router.fetch_jobs = router.fetch_jobs.__get__(router, ScraperRouter)
+        with patch("scrapers.scraper_router.AdzunaScraper.fetch_jobs", return_value=[]) as fetch_mock:
             self.assertEqual(router.fetch_jobs(), [])
             fetch_mock.assert_called_once()
 
