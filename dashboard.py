@@ -816,6 +816,10 @@ class JobBotDashboard:
                 f"Provider / model:   {(row.get('tailoring_provider') or '') + ('/' + row.get('tailoring_model') if row.get('tailoring_model') else '') or 'N/A (local)'}",
                 f"AI attempted:       {'Yes' if self._doc_ai_attempted(row) else 'No'}",
                 f"AI accepted:        {'Yes' if row.get('tailoring_route') == 'openai' else ('No (fell back)' if row.get('tailoring_route') == 'fallback' else 'N/A')}",
+                f"Resume AI accepted: {self._doc_section_status(str(row.get('resume_ai_status') or ''))}",
+                f"Cover letter AI accepted: {self._doc_section_status(str(row.get('cover_letter_ai_status') or ''))}",
+                f"Rejected bullets repaired: {row.get('rejected_bullets_repaired', 0)}",
+                f"Cover letter fallback: {row.get('cover_letter_fallback') or 'None'}",
                 f"Fallback reason:    {row.get('tailoring_fallback_reason') or 'None'}",
                 f"AI retry count:     {row.get('tailoring_retry_count', 0)}",
                 f"Page-fit attempts:  {row.get('page_fit_attempts', 0)}",
@@ -846,6 +850,15 @@ class JobBotDashboard:
         if row.get("tailoring_provider") or row.get("tailoring_model") or row.get("tailoring_fallback_reason"):
             return True
         return int(row.get("tailoring_retry_count") or 0) > 0
+
+    @staticmethod
+    def _doc_section_status(value: str) -> str:
+        mapping = {
+            "accepted": "Yes",
+            "partial": "Partial",
+            "local": "No",
+        }
+        return mapping.get(value.strip().lower(), "N/A")
 
     def _open_apply_link(self) -> None:
         row = self._selected_row()
