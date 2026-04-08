@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from config import JobBotConfig
+from scrapers.adzuna_api import AdzunaScraper
 from scrapers.jobspy_scraper import JobSpyScraper
 from scrapers.usajobs_api import USAJobsScraper
 
@@ -11,6 +12,8 @@ class ScraperRouter:
 
     def fetch_jobs(self):
         provider = self.config.source.provider.lower()
+        if provider == "adzuna":
+            return AdzunaScraper(self.config).fetch_jobs()
         if provider == "usajobs":
             return USAJobsScraper(self.config).fetch_jobs()
         if provider == "jobspy":

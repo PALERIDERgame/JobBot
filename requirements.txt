@@ -11,3 +11,4 @@ pyinstaller
 python-jobspy
 python-docx
 pywin32
+requests

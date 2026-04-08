@@ -15,6 +15,7 @@ Current runtime stack
 - AI scoring and AI document-tailoring calls are in [match_scorer.py](C:\Projects\JobBot\match_scorer.py).
 - Structured AI document payload is in [document_tailoring.py](C:\Projects\JobBot\document_tailoring.py).
 - SQLite persistence is in [database.py](C:\Projects\JobBot\database.py).
+- Sources: Adzuna API, USAJobs API, JobSpy (scraping).
 
 What changed most recently
 - Resume generation is now DOCX-first when the resume source is `.docx`.
@@ -25,6 +26,9 @@ What changed most recently
 - Cover letters were rewritten from a resume-dump style into a short structured tailored-letter format.
 - Review Queue now shows generation progress stages and disables duplicate Generate clicks while work is in flight.
 - There is now a hybrid document-tailoring router: local deterministic tailoring first, then OpenAI escalation for cases that look too broken or too complex.
+- Added Adzuna source integration (official API) with config fields for `adzuna_app_id`, `adzuna_app_key`, and `adzuna_country`.
+- UI now defaults Adzuna as the source for `auto` mode and JobSpy for `semi_auto` unless the user overrides it.
+- Auto mode defaults `Location` to `New York, NY` if it is blank.
 
 Current document-generation architecture
 1. Resume source is loaded in [pipeline.py](C:\Projects\JobBot\pipeline.py) through `_load_resume()`.
@@ -116,6 +120,11 @@ Current database and persistence notes
 - Generated documents are stored via [database.py](C:\Projects\JobBot\database.py) in `generated_documents`.
 - Current stored metadata includes file paths, status, error message, and generated timestamp.
 - There is not yet a dedicated per-job document-generation log field or table.
+
+Current source configuration notes
+- Adzuna requires `app_id` and `app_key`; without them the scraper raises a clear error before a run.
+- Adzuna country defaults to `us`; location queries use `Location` (e.g., `New York, NY`).
+- JobSpy remains available for scraping but is now the default only in `semi_auto`.
 
 Current user expectations that matter
 - User wants the resume to visually match the original DOCX template as closely as possible.
