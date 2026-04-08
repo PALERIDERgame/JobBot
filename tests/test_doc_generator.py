@@ -348,10 +348,11 @@ class DocumentGeneratorTests(unittest.TestCase):
             with patch.object(generator, "_libreoffice_candidates", return_value=[r"C:\Program Files\LibreOffice\program\soffice.exe"]), patch(
                 "doc_generator.subprocess.run",
                 side_effect=_fake_run,
-            ) as run_mock:
-                generator._export_docx_to_pdf(source_docx, pdf_path)
+            ) as run_mock, patch.dict("sys.modules", {"win32com": None, "win32com.client": None}):
+                result = generator._export_docx_to_pdf(source_docx, pdf_path)
 
             self.assertTrue(pdf_path.exists())
+            self.assertEqual(result, "libreoffice")
             self.assertIn(r"C:\Program Files\LibreOffice\program\soffice.exe", " ".join(run_mock.call_args.args[0]))
 
     def test_dow_jones_style_bullets_avoid_repetitive_prefixes_and_bad_grammar(self) -> None:

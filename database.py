@@ -159,6 +159,13 @@ class Database:
             """
         )
         self._ensure_column("generated_documents", "resume_docx_path", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("generated_documents", "tailoring_route", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("generated_documents", "tailoring_provider", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("generated_documents", "tailoring_model", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("generated_documents", "tailoring_fallback_reason", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("generated_documents", "tailoring_retry_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("generated_documents", "pdf_exporter_used", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("generated_documents", "page_fit_attempts", "INTEGER NOT NULL DEFAULT 0")
         connection.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -314,13 +321,24 @@ class Database:
         status: str,
         error_message: str,
         generated_at: str,
+        tailoring_route: str = "",
+        tailoring_provider: str = "",
+        tailoring_model: str = "",
+        tailoring_fallback_reason: str = "",
+        tailoring_retry_count: int = 0,
+        pdf_exporter_used: str = "",
+        page_fit_attempts: int = 0,
     ) -> None:
         connection = self.connect()
         connection.execute(
             """
                 INSERT INTO generated_documents (
-                    job_id, output_dir, resume_docx_path, resume_pdf_path, cover_letter_path, status, error_message, generated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    job_id, output_dir, resume_docx_path, resume_pdf_path, cover_letter_path,
+                    status, error_message, generated_at,
+                    tailoring_route, tailoring_provider, tailoring_model,
+                    tailoring_fallback_reason, tailoring_retry_count,
+                    pdf_exporter_used, page_fit_attempts
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_id) DO UPDATE SET
                     output_dir=excluded.output_dir,
                     resume_docx_path=excluded.resume_docx_path,
@@ -328,9 +346,22 @@ class Database:
                     cover_letter_path=excluded.cover_letter_path,
                     status=excluded.status,
                     error_message=excluded.error_message,
-                    generated_at=excluded.generated_at
+                    generated_at=excluded.generated_at,
+                    tailoring_route=excluded.tailoring_route,
+                    tailoring_provider=excluded.tailoring_provider,
+                    tailoring_model=excluded.tailoring_model,
+                    tailoring_fallback_reason=excluded.tailoring_fallback_reason,
+                    tailoring_retry_count=excluded.tailoring_retry_count,
+                    pdf_exporter_used=excluded.pdf_exporter_used,
+                    page_fit_attempts=excluded.page_fit_attempts
             """,
-            (job_id, output_dir, resume_docx_path, resume_pdf_path, cover_letter_path, status, error_message, generated_at),
+            (
+                job_id, output_dir, resume_docx_path, resume_pdf_path, cover_letter_path,
+                status, error_message, generated_at,
+                tailoring_route, tailoring_provider, tailoring_model,
+                tailoring_fallback_reason, tailoring_retry_count,
+                pdf_exporter_used, page_fit_attempts,
+            ),
         )
         connection.commit()
 
@@ -524,6 +555,13 @@ class Database:
                 COALESCE(generated_documents.status, 'pending') AS document_status,
                 COALESCE(generated_documents.error_message, '') AS document_error,
                 COALESCE(generated_documents.generated_at, '') AS generated_at,
+                COALESCE(generated_documents.tailoring_route, '') AS tailoring_route,
+                COALESCE(generated_documents.tailoring_provider, '') AS tailoring_provider,
+                COALESCE(generated_documents.tailoring_model, '') AS tailoring_model,
+                COALESCE(generated_documents.tailoring_fallback_reason, '') AS tailoring_fallback_reason,
+                COALESCE(generated_documents.tailoring_retry_count, 0) AS tailoring_retry_count,
+                COALESCE(generated_documents.pdf_exporter_used, '') AS pdf_exporter_used,
+                COALESCE(generated_documents.page_fit_attempts, 0) AS page_fit_attempts,
                 COALESCE(deliveries.method, 'local') AS delivery_method,
                 COALESCE(deliveries.status, 'pending') AS delivery_status,
                 COALESCE(deliveries.message_id, '') AS message_id,

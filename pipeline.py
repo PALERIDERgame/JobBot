@@ -342,6 +342,13 @@ class JobBotPipeline:
             status=docs.status,
             error_message=docs.error_message,
             generated_at=datetime.now(timezone.utc).isoformat(),
+            tailoring_route=tailoring_payload.route,
+            tailoring_provider=tailoring_payload.provider,
+            tailoring_model=tailoring_payload.model,
+            tailoring_fallback_reason=tailoring_payload.fallback_reason,
+            tailoring_retry_count=tailoring_payload.retry_count,
+            pdf_exporter_used=docs.pdf_exporter_used,
+            page_fit_attempts=docs.page_fit_attempts,
         )
         return docs
 

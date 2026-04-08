@@ -137,6 +137,8 @@ class GeneratedDocs:
     resume_docx_path: Path = Path()
     status: str = "generated"
     error_message: str = ""
+    pdf_exporter_used: str = ""
+    page_fit_attempts: int = 0
 
 
 @dataclass(slots=True)
@@ -190,11 +192,14 @@ class DocumentGenerator:
 
         status = "generated"
         error_message = ""
+        pdf_exporter_used = ""
+        page_fit_attempts = 0
         if source_path and source_path.suffix.lower() == ".docx" and source_path.exists():
             fit_attempts = self._build_fit_attempts(resume, job)
             fit_succeeded = False
             try:
-                for attempt in fit_attempts:
+                for attempt_idx, attempt in enumerate(fit_attempts, 1):
+                    page_fit_attempts = attempt_idx
                     report("tailoring_resume", self._fit_attempt_message(attempt), 3)
                     self._build_docx_resume(
                         staged_resume_docx_path,
@@ -206,7 +211,7 @@ class DocumentGenerator:
                     )
                     try:
                         report("exporting_pdf", "Exporting resume PDF...", 4)
-                        self._export_docx_to_pdf(staged_resume_docx_path, staged_resume_pdf_path)
+                        pdf_exporter_used = self._export_docx_to_pdf(staged_resume_docx_path, staged_resume_pdf_path)
                         report("validating_pages", "Validating final page count...", 5)
                         if self._count_pdf_pages(staged_resume_pdf_path) <= 2:
                             fit_succeeded = True
@@ -229,6 +234,8 @@ class DocumentGenerator:
                         resume_docx_path=Path(),
                         status="failed",
                         error_message=str(exc),
+                        pdf_exporter_used=pdf_exporter_used,
+                        page_fit_attempts=page_fit_attempts,
                     )
                 raise
         else:
@@ -258,6 +265,8 @@ class DocumentGenerator:
             resume_docx_path=resume_docx_path,
             status=status,
             error_message=error_message,
+            pdf_exporter_used=pdf_exporter_used,
+            page_fit_attempts=page_fit_attempts,
         )
 
     def _build_docx_resume(
@@ -424,7 +433,8 @@ class DocumentGenerator:
             letter_text = self._compose_cover_letter(job, resume, score, clean_employer, signoff_name)
         path.write_text(letter_text, encoding="utf-8")
 
-    def _export_docx_to_pdf(self, docx_path: Path, pdf_path: Path) -> None:
+    def _export_docx_to_pdf(self, docx_path: Path, pdf_path: Path) -> str:
+        """Export docx to PDF. Returns the exporter name used ('word_com' or 'libreoffice')."""
         word_error = None
         try:
             import win32com.client  # type: ignore[import-not-found]
@@ -443,7 +453,7 @@ class DocumentGenerator:
                 document = word.Documents.Open(str(docx_path.resolve()))
                 document.SaveAs(str(pdf_path.resolve()), FileFormat=17)
                 LOGGER.info("Word PDF export succeeded for %s", docx_path)
-                return
+                return "word_com"
             except Exception as exc:
                 word_error = str(exc)
                 LOGGER.warning("Word PDF export failed for %s: %s", docx_path, exc)
@@ -464,7 +474,7 @@ class DocumentGenerator:
             )
             if completed.returncode == 0 and pdf_path.exists():
                 LOGGER.info("LibreOffice PDF export succeeded for %s via %s", docx_path, soffice)
-                return
+                return "libreoffice"
             error_text = (completed.stderr or completed.stdout or "LibreOffice PDF export failed").strip()
             libreoffice_errors.append(f"{soffice}: {error_text}")
             LOGGER.warning("LibreOffice PDF export failed for %s via %s: %s", docx_path, soffice, error_text)
