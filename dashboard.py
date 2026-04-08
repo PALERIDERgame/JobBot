@@ -144,6 +144,7 @@ class JobBotDashboard:
         self.last_run_label: ttk.Label | None = None
         self.details_text: tk.Text | None = None
         self.strong_stage_model_combo: ttk.Combobox | None = None
+        self.doc_stage_model_combo: ttk.Combobox | None = None
         self.setup_canvas: tk.Canvas | None = None
         self._tooltips: list[Tooltip] = []
         self._run_poll_after_id: str | None = None
@@ -282,15 +283,20 @@ class JobBotDashboard:
                 combo.grid(row=idx, column=1, columnspan=2, sticky="ew", pady=6)
                 if label == "Strong stage provider":
                     combo.bind("<<ComboboxSelected>>", self._on_strong_provider_changed, add="+")
+                if label == "Doc stage provider":
+                    combo.bind("<<ComboboxSelected>>", self._on_doc_provider_changed, add="+")
                 if label == "Automation mode":
                     combo.bind("<<ComboboxSelected>>", self._on_automation_mode_changed, add="+")
                 combo.bind("<<ComboboxSelected>>", self._autosave_setup, add="+")
                 self._add_tooltip(combo, FIELD_TOOLTIPS[label])
-            elif label == "Strong stage model":
+            elif label in {"Strong stage model", "Doc stage model"}:
                 combo = ttk.Combobox(frame, textvariable=var, state="readonly", width=67)
                 combo.grid(row=idx, column=1, columnspan=2, sticky="ew", pady=6)
                 combo.bind("<<ComboboxSelected>>", self._autosave_setup, add="+")
-                self.strong_stage_model_combo = combo
+                if label == "Strong stage model":
+                    self.strong_stage_model_combo = combo
+                else:
+                    self.doc_stage_model_combo = combo
                 self._add_tooltip(combo, FIELD_TOOLTIPS[label])
             else:
                 show = "*" if label in {"Anthropic API key", "OpenAI API key", "USAJobs authorization key"} else ""
@@ -300,6 +306,7 @@ class JobBotDashboard:
                 self._add_tooltip(entry, FIELD_TOOLTIPS[label])
 
         self._sync_strong_model_dropdown()
+        self._sync_doc_model_dropdown()
 
         check = ttk.Checkbutton(frame, text="Enable Gmail delivery", variable=self.gmail_enabled_var, command=self._autosave_setup)
         check.grid(row=len(labels), column=1, columnspan=2, sticky="w", pady=6)
@@ -486,6 +493,9 @@ class JobBotDashboard:
     def _on_strong_provider_changed(self, _event: object | None = None) -> None:
         self._sync_strong_model_dropdown()
 
+    def _on_doc_provider_changed(self, _event: object | None = None) -> None:
+        self._sync_doc_model_dropdown()
+
     def _on_automation_mode_changed(self, _event: object | None = None) -> None:
         mode = self.automation_mode_var.get().strip() or "semi_auto"
         self.results_per_page_var.set("100" if mode == "semi_auto" else "25")
@@ -499,6 +509,17 @@ class JobBotDashboard:
         current = self.strong_stage_model_var.get().strip()
         if current not in models and models:
             self.strong_stage_model_var.set(models[0])
+
+    def _sync_doc_model_dropdown(self) -> None:
+        if not self.doc_stage_model_combo:
+            return
+        provider = self.doc_stage_provider_var.get().strip() or "openai"
+        resolved_provider = self.cheap_stage_provider_var.get().strip() if provider == "cheap_stage" else provider
+        models = MODEL_OPTIONS.get(resolved_provider, ())
+        self.doc_stage_model_combo.configure(values=models)
+        current = self.doc_stage_model_var.get().strip()
+        if current not in models and models:
+            self.doc_stage_model_var.set(models[0])
 
     def _autosave_setup(self, _event: object | None = None) -> bool:
         return self._save_config(show_status_only=True)
@@ -793,7 +814,8 @@ class JobBotDashboard:
                 "--- Doc generation log ---",
                 f"Tailoring route:    {row.get('tailoring_route') or 'N/A'}",
                 f"Provider / model:   {(row.get('tailoring_provider') or '') + ('/' + row.get('tailoring_model') if row.get('tailoring_model') else '') or 'N/A (local)'}",
-                f"AI accepted:        {'Yes' if row.get('tailoring_route') == 'ai' else ('No (fell back)' if row.get('tailoring_route') == 'fallback' else 'N/A')}",
+                f"AI attempted:       {'Yes' if self._doc_ai_attempted(row) else 'No'}",
+                f"AI accepted:        {'Yes' if row.get('tailoring_route') == 'openai' else ('No (fell back)' if row.get('tailoring_route') == 'fallback' else 'N/A')}",
                 f"Fallback reason:    {row.get('tailoring_fallback_reason') or 'None'}",
                 f"AI retry count:     {row.get('tailoring_retry_count', 0)}",
                 f"Page-fit attempts:  {row.get('page_fit_attempts', 0)}",
@@ -815,6 +837,15 @@ class JobBotDashboard:
                 messagebox.showwarning("Job Bot", "Select a review item first.")
             return None
         return self.database.get_review_row(selected[0])
+
+    @staticmethod
+    def _doc_ai_attempted(row: dict[str, object]) -> bool:
+        route = str(row.get("tailoring_route") or "")
+        if route in {"openai", "fallback"}:
+            return True
+        if row.get("tailoring_provider") or row.get("tailoring_model") or row.get("tailoring_fallback_reason"):
+            return True
+        return int(row.get("tailoring_retry_count") or 0) > 0
 
     def _open_apply_link(self) -> None:
         row = self._selected_row()
