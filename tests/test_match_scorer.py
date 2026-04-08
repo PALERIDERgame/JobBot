@@ -111,19 +111,73 @@ class MatchScorerTests(unittest.TestCase):
             key_skills=["Python"],
             cover_letter_text="Local",
         )
-        payload = scorer.tailor_documents_with_ai(job, resume, local, alignment_notes="Strong fit")
-        self.assertIsNotNone(payload)
-        assert payload is not None
-        self.assertEqual(payload.route, "openai")
-        self.assertEqual(payload.work_entries[0].bullets[0], "Improved reporting cadence and dashboard visibility.")
-        self.assertIn("Lead Generation", payload.key_skills)
+        attempt = scorer.tailor_documents_with_ai(job, resume, local, alignment_notes="Strong fit")
+        self.assertTrue(attempt.attempted)
+        self.assertIsNotNone(attempt.payload)
+        assert attempt.payload is not None
+        self.assertEqual(attempt.payload.route, "openai")
+        self.assertEqual(attempt.payload.work_entries[0].bullets[0], "Improved reporting cadence and dashboard visibility.")
+        self.assertIn("Lead Generation", attempt.payload.key_skills)
 
     def test_tailor_documents_with_ai_ignores_non_openai_provider(self) -> None:
         config = JobBotConfig(doc_stage_provider="anthropic", doc_stage_model="claude-sonnet-4-20250514", anthropic_api_key="anthropic-test")
         scorer = MatchScorer(config)
-        payload = scorer.tailor_documents_with_ai(
+        attempt = scorer.tailor_documents_with_ai(
             Job("1", "Head of Marketing", "Acme", "Remote", "", "Lead B2B growth and reporting.", "board", "", "", "jobspy", "", ""),
             ResumeData("", "", "Jane", "jane@example.com", "", "Summary", ["Python"], ["Built APIs"]),
             DocumentTailoringPayload(),
         )
-        self.assertIsNone(payload)
+        self.assertFalse(attempt.attempted)
+        self.assertIsNone(attempt.payload)
+
+    def test_tailor_documents_with_ai_uses_doc_stage_model_not_cheap_stage_model(self) -> None:
+        config = JobBotConfig(
+            cheap_stage_provider="ollama_local",
+            cheap_stage_model="qwen2.5:7b",
+            doc_stage_provider="openai",
+            doc_stage_model="gpt-5-mini",
+            openai_api_key="openai-test",
+        )
+        scorer = MatchScorer(config)
+        scorer._build_client = MagicMock(return_value=object())
+        scorer._create_completion = MagicMock(
+            return_value='{"work_entries":[{"role_line":"Role 1","date_line":"2024","bullets":["Built dashboards for leadership."]}],"key_skills":["Dashboard Reporting"],"cover_letter_text":"Letter"}'
+        )
+        resume = ResumeData(
+            "",
+            "",
+            "Jane",
+            "jane@example.com",
+            "",
+            "Summary",
+            ["Python"],
+            ["Built APIs"],
+            work_experience_entries=[ResumeWorkEntry("Role 1", "2024", ["Built dashboards for leadership"])],
+        )
+        attempt = scorer.tailor_documents_with_ai(
+            Job("1", "Head of Marketing", "Acme", "Remote", "", "Lead B2B growth and reporting.", "board", "", "", "jobspy", "", ""),
+            resume,
+            DocumentTailoringPayload(work_entries=resume.work_experience_entries, key_skills=["Python"], cover_letter_text="Local"),
+        )
+        self.assertTrue(attempt.attempted)
+        scorer._create_completion.assert_called_once()
+        self.assertEqual(scorer._create_completion.call_args[0][1], "gpt-5-mini")
+
+    def test_tailor_documents_with_ai_rejects_invalid_openai_model_mismatch(self) -> None:
+        config = JobBotConfig(
+            doc_stage_provider="openai",
+            doc_stage_model="qwen2.5:7b",
+            openai_api_key="openai-test",
+        )
+        scorer = MatchScorer(config)
+        attempt = scorer.tailor_documents_with_ai(
+            Job("1", "Head of Marketing", "Acme", "Remote", "", "Lead B2B growth and reporting.", "board", "", "", "jobspy", "", ""),
+            ResumeData("", "", "Jane", "jane@example.com", "", "Summary", ["Python"], ["Built APIs"]),
+            DocumentTailoringPayload(),
+        )
+        self.assertFalse(attempt.attempted)
+        self.assertIn("model mismatch", attempt.failure_reason.lower())
+
+    def test_extract_json_text_recovers_markdown_wrapped_json(self) -> None:
+        cleaned = MatchScorer._extract_json_text("```json\nbefore\n{\"key\": 1}\nafter\n```")
+        self.assertEqual(cleaned, '{"key": 1}')

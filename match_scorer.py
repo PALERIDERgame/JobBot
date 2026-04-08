@@ -10,7 +10,7 @@ from urllib import error, request
 
 from config import JobBotConfig
 from database import Database, Job, StageEvaluationRecord
-from document_tailoring import DocumentTailoringPayload
+from document_tailoring import DocumentTailoringAttempt, DocumentTailoringPayload
 from resume_parser import ResumeData, ResumeWorkEntry
 
 
@@ -181,12 +181,29 @@ class MatchScorer:
         *,
         alignment_notes: str = "",
         retry_count: int = 0,
-    ) -> DocumentTailoringPayload | None:
+    ) -> DocumentTailoringAttempt:
         provider, model = self._resolve_doc_provider_model()
-        if provider == "cheap_stage":
-            provider, model = self.config.cheap_stage_provider, self.config.cheap_stage_model
-        if provider != "openai" or self._build_client(provider) is None:
-            return None
+        LOGGER.info("Resolved doc tailoring provider/model for %s: %s/%s", job.id, provider, model)
+        if provider != "openai":
+            return DocumentTailoringAttempt(attempted=False, provider=provider, model=model, retry_count=retry_count)
+        compatibility_error = self._validate_doc_provider_model(provider, model)
+        if compatibility_error:
+            LOGGER.warning("Skipping AI document tailoring for %s: %s", job.id, compatibility_error)
+            return DocumentTailoringAttempt(
+                attempted=False,
+                provider=provider,
+                model=model,
+                failure_reason=compatibility_error,
+                retry_count=retry_count,
+            )
+        if self._build_client(provider) is None:
+            return DocumentTailoringAttempt(
+                attempted=False,
+                provider=provider,
+                model=model,
+                failure_reason=f"{provider} client unavailable",
+                retry_count=retry_count,
+            )
 
         prompt = {
             "candidate": self._resume_summary(resume_data),
@@ -246,9 +263,25 @@ class MatchScorer:
                 payload = json.loads(cleaned_text)
             except json.JSONDecodeError:
                 payload = json.loads(cleaned_text.replace("\r\n", "\\n").replace("\n", "\\n"))
-        except Exception:
+        except json.JSONDecodeError:
+            LOGGER.exception("Failed to parse AI document tailoring response for %s", job.id)
+            LOGGER.warning("AI document tailoring parse preview for %s: %s", job.id, self._safe_preview(cleaned_text if 'cleaned_text' in locals() else text if 'text' in locals() else ""))
+            return DocumentTailoringAttempt(
+                attempted=True,
+                provider=provider,
+                model=model,
+                failure_reason="OpenAI response could not be parsed as JSON.",
+                retry_count=retry_count,
+            )
+        except Exception as exc:
             LOGGER.exception("Failed AI document tailoring for %s", job.id)
-            return None
+            return DocumentTailoringAttempt(
+                attempted=True,
+                provider=provider,
+                model=model,
+                failure_reason=f"OpenAI request failed: {exc}",
+                retry_count=retry_count,
+            )
 
         try:
             tailored_entries = self._parse_tailored_entries(payload.get("work_entries"), resume_data)
@@ -256,16 +289,29 @@ class MatchScorer:
             cover_letter_text = self._parse_tailored_cover_letter(payload.get("cover_letter_text"))
         except Exception:
             LOGGER.exception("Failed to parse AI document tailoring payload for %s", job.id)
-            return None
+            return DocumentTailoringAttempt(
+                attempted=True,
+                provider=provider,
+                model=model,
+                failure_reason="OpenAI payload structure could not be parsed.",
+                retry_count=retry_count,
+            )
 
-        return DocumentTailoringPayload(
-            work_entries=tailored_entries,
-            key_skills=key_skills,
-            cover_letter_text=cover_letter_text,
-            route="openai",
+        return DocumentTailoringAttempt(
+            attempted=True,
             provider=provider,
             model=model,
             retry_count=retry_count,
+            payload=DocumentTailoringPayload(
+                work_entries=tailored_entries,
+                key_skills=key_skills,
+                cover_letter_text=cover_letter_text,
+                route="openai",
+                ai_attempted=True,
+                provider=provider,
+                model=model,
+                retry_count=retry_count,
+            ),
         )
 
     def _evaluate(
@@ -556,7 +602,7 @@ class MatchScorer:
             max_output_tokens=1000,
         )
         usage = getattr(response, "usage", None)
-        return getattr(response, "output_text", "").strip(), int(getattr(usage, "input_tokens", 0) or 0), int(getattr(usage, "output_tokens", 0) or 0)
+        return self._extract_openai_response_text(response), int(getattr(usage, "input_tokens", 0) or 0), int(getattr(usage, "output_tokens", 0) or 0)
 
     def _create_completion(self, provider: str, model: str, prompt: dict[str, object], *, system_prompt: str) -> str:
         if provider == "ollama_local":
@@ -580,7 +626,7 @@ class MatchScorer:
             ],
             max_output_tokens=1000,
         )
-        return getattr(response, "output_text", "").strip()
+        return self._extract_openai_response_text(response)
 
     def _create_ollama_completion(self, model: str, prompt: dict[str, object], *, system_prompt: str) -> tuple[str, int, int]:
         body = json.dumps(
@@ -605,6 +651,32 @@ class MatchScorer:
         return str(payload.get("response", "")).strip(), int(payload.get("prompt_eval_count", 0)), int(payload.get("eval_count", 0))
 
     @staticmethod
+    def _extract_openai_response_text(response: object) -> str:
+        output_text = getattr(response, "output_text", "")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip()
+
+        parts: list[str] = []
+        for output_item in getattr(response, "output", []) or []:
+            for content_item in getattr(output_item, "content", []) or []:
+                text_value = getattr(content_item, "text", None)
+                if isinstance(text_value, str) and text_value.strip():
+                    parts.append(text_value.strip())
+                    continue
+                for attr in ("value", "output_text"):
+                    candidate = getattr(content_item, attr, None)
+                    if isinstance(candidate, str) and candidate.strip():
+                        parts.append(candidate.strip())
+                        break
+                annotations = getattr(content_item, "annotations", None)
+                if isinstance(annotations, list):
+                    for annotation in annotations:
+                        candidate = getattr(annotation, "text", None)
+                        if isinstance(candidate, str) and candidate.strip():
+                            parts.append(candidate.strip())
+        return "\n".join(parts).strip()
+
+    @staticmethod
     def _parse_keyword_response(text: str) -> list[str]:
         cleaned: list[str] = []
         try:
@@ -618,6 +690,23 @@ class MatchScorer:
             if keyword:
                 cleaned.append(keyword)
         return cleaned[:16]
+
+    @staticmethod
+    def _validate_doc_provider_model(provider: str, model: str) -> str:
+        if provider == "openai":
+            lowered = model.strip().lower()
+            if not lowered:
+                return "OpenAI model is blank."
+            if ":" in lowered or lowered.startswith("qwen") or lowered.startswith("llama") or lowered.startswith("mistral"):
+                return f"OpenAI model mismatch: {model} is not valid for provider openai."
+        return ""
+
+    @staticmethod
+    def _safe_preview(text: str, limit: int = 200) -> str:
+        cleaned = re.sub(r"\s+", " ", text or "").strip()
+        if len(cleaned) <= limit:
+            return cleaned
+        return cleaned[:limit].rstrip() + "..."
 
     @staticmethod
     def _parse_tailored_key_skills(value: object, fallback: list[str]) -> list[str]:
@@ -675,7 +764,12 @@ class MatchScorer:
         if cleaned.startswith("```"):
             cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
             cleaned = re.sub(r"\s*```$", "", cleaned)
-        return cleaned.strip()
+        cleaned = cleaned.strip()
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end >= start:
+            return cleaned[start:end + 1].strip()
+        return cleaned
 
     def _estimate_cost(self, provider: str, model: str, input_tokens: int, output_tokens: int) -> float:
         if not self.config.enable_cost_tracking:

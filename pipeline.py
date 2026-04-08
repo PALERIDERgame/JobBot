@@ -359,25 +359,54 @@ class JobBotPipeline:
             return local_payload
 
         LOGGER.info("Escalating document tailoring to AI for %s", job.id)
-        ai_payload = self.scorer.tailor_documents_with_ai(job, resume, local_payload, alignment_notes=ai_notes, retry_count=0)
+        first_attempt = self.scorer.tailor_documents_with_ai(job, resume, local_payload, alignment_notes=ai_notes, retry_count=0)
+        ai_payload = first_attempt.payload
         if ai_payload:
             valid, issues = self.doc_generator.validate_tailoring_payload(ai_payload)
             if valid:
                 LOGGER.info("AI tailoring accepted for %s via %s/%s", job.id, ai_payload.provider, ai_payload.model)
                 return ai_payload
             LOGGER.warning("AI tailoring quality check failed for %s: %s", job.id, ", ".join(issues))
-            retry_payload = self.scorer.tailor_documents_with_ai(job, resume, local_payload, alignment_notes=ai_notes, retry_count=1)
+            retry_attempt = self.scorer.tailor_documents_with_ai(job, resume, local_payload, alignment_notes=ai_notes, retry_count=1)
+            retry_payload = retry_attempt.payload
             if retry_payload:
                 valid, issues = self.doc_generator.validate_tailoring_payload(retry_payload)
                 if valid:
                     LOGGER.info("AI tailoring retry accepted for %s via %s/%s", job.id, retry_payload.provider, retry_payload.model)
                     return retry_payload
                 LOGGER.warning("AI tailoring retry failed for %s: %s", job.id, ", ".join(issues))
-
+                first_attempt = retry_attempt
+            else:
+                first_attempt = retry_attempt
+        elif first_attempt.attempted and self._should_retry_ai_attempt(first_attempt.failure_reason):
+            LOGGER.warning("AI tailoring parse failed for %s; retrying once", job.id)
+            retry_attempt = self.scorer.tailor_documents_with_ai(job, resume, local_payload, alignment_notes=ai_notes, retry_count=1)
+            retry_payload = retry_attempt.payload
+            if retry_payload:
+                valid, issues = self.doc_generator.validate_tailoring_payload(retry_payload)
+                if valid:
+                    LOGGER.info("AI tailoring retry accepted for %s via %s/%s", job.id, retry_payload.provider, retry_payload.model)
+                    return retry_payload
+                LOGGER.warning("AI tailoring retry failed for %s: %s", job.id, ", ".join(issues))
+            first_attempt = retry_attempt
+        elif first_attempt.attempted:
+            LOGGER.warning("AI tailoring failed for %s: %s", job.id, first_attempt.failure_reason)
         LOGGER.info("Falling back to local tailoring for %s", job.id)
         local_payload.route = "fallback"
-        local_payload.fallback_reason = "AI tailoring unavailable or failed quality checks."
+        local_payload.ai_attempted = first_attempt.attempted
+        local_payload.provider = first_attempt.provider
+        local_payload.model = first_attempt.model
+        if ai_payload and 'issues' in locals() and issues:
+            local_payload.fallback_reason = "OpenAI payload failed tailoring quality checks: " + ", ".join(issues)
+        else:
+            local_payload.fallback_reason = first_attempt.failure_reason or "AI tailoring unavailable."
+        local_payload.retry_count = first_attempt.retry_count
         return local_payload
+
+    @staticmethod
+    def _should_retry_ai_attempt(failure_reason: str) -> bool:
+        lowered = failure_reason.lower()
+        return "parsed as json" in lowered or "payload structure" in lowered
 
     def _deliver(self, job: Job, score: MatchScore, docs: GeneratedDocs) -> DeliveryResult:
         return self.gmail_client.deliver_match(job, score, docs)

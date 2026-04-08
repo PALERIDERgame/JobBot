@@ -8,12 +8,53 @@ from unittest.mock import patch
 
 from config import build_app_paths, load_or_create_config
 from database import Database, Job
+from document_tailoring import DocumentTailoringAttempt, DocumentTailoringPayload
 from match_scorer import StageEvaluation
 from pipeline import JobBotPipeline
+from resume_parser import ResumeData, ResumeWorkEntry
 from test_support import workspace_temp_dir
 
 
 class PipelineTests(unittest.TestCase):
+    def test_prepare_document_tailoring_records_specific_parse_failure_and_retry_count(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                database = Database(paths.database_file)
+                database.initialize()
+                pipeline = JobBotPipeline(config, paths, database)
+                local_payload = DocumentTailoringPayload(
+                    work_entries=[ResumeWorkEntry("Role 1", "2024", ["Built dashboards"])],
+                    key_skills=["Dashboard Reporting"],
+                    cover_letter_text="Local",
+                )
+                resume = ResumeData(
+                    "", "", "Jane", "jane@example.com", "", "Summary", ["Dashboard Reporting"], ["Built dashboards"],
+                    work_experience_entries=local_payload.work_entries,
+                )
+                job = Job("1", "Head of Marketing", "Acme", "Remote", "", "Lead B2B growth", "board", "", "", "jobspy", "", "")
+                score = StageEvaluation(
+                    "strong", "openai", "gpt-5-mini", "scored", "review", 80, 0.8, "Good fit", [], [], 0, 0, 0.0, "", ""
+                ).to_match_score(config.final_apply_threshold)
+                pipeline.doc_generator.build_local_tailoring_payload = lambda *args, **kwargs: local_payload
+                pipeline.doc_generator.should_escalate_tailoring = lambda *args, **kwargs: True
+                pipeline.scorer.tailor_documents_with_ai = lambda *args, **kwargs: DocumentTailoringAttempt(
+                    attempted=True,
+                    provider="openai",
+                    model="gpt-5-mini",
+                    failure_reason="OpenAI response could not be parsed as JSON.",
+                    retry_count=kwargs.get("retry_count", 0),
+                )
+
+                payload = pipeline._prepare_document_tailoring(job, resume, score, ai_notes="")
+                self.assertEqual(payload.route, "fallback")
+                self.assertTrue(payload.ai_attempted)
+                self.assertEqual(payload.provider, "openai")
+                self.assertEqual(payload.model, "gpt-5-mini")
+                self.assertEqual(payload.retry_count, 1)
+                self.assertIn("parsed as json", payload.fallback_reason.lower())
+
     def test_pipeline_records_completed_run(self) -> None:
         with workspace_temp_dir() as tmp:
             with patch.dict(os.environ, {"APPDATA": str(tmp)}):

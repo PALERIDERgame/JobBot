@@ -243,3 +243,72 @@ class DashboardSmokeTests(unittest.TestCase):
                     self.assertEqual(row["generated_at"], "2026-04-07T16:52:00+00:00")
                 finally:
                     root.destroy()
+
+    def test_refresh_review_queue_action_reloads_all_rows_and_updates_status(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                database = Database(paths.database_file)
+                database.initialize()
+                try:
+                    database.upsert_job(
+                        Job(
+                            id="older-review-row",
+                            title="Older Role",
+                            employer="Example Co",
+                            location="New York, NY, US",
+                            salary_range="",
+                            description_full="Older queued row",
+                            apply_method="board",
+                            apply_url="https://example.com/older",
+                            hiring_manager_email="",
+                            source="indeed",
+                            posted_at="2026-04-01",
+                            scraped_at="2026-04-01T12:00:00+00:00",
+                        ),
+                        {},
+                    )
+                    database.record_match_result(
+                        "older-review-row",
+                        score=70,
+                        rationale="Queued for review",
+                        strengths=[],
+                        gaps=[],
+                        is_match=True,
+                        status="review",
+                        error_message="",
+                        scored_at="2026-04-01T12:05:00+00:00",
+                    )
+                    database.create_run("2026-04-07T20:00:00+00:00", stage="completed")
+
+                    root = tk.Tk()
+                    root.withdraw()
+                    try:
+                        dashboard = JobBotDashboard(root, config, paths, database)
+                        dashboard._refresh_review_queue_action()
+                        self.assertIn("older-review-row", dashboard.review_tree.get_children())
+                        self.assertEqual(dashboard.status_var.get(), "Review Queue refreshed: 1 job loaded.")
+                    finally:
+                        root.destroy()
+                finally:
+                    database.close()
+
+    @unittest.skipIf(os.environ.get("CI") == "true", "Skipping Tk smoke test in CI")
+    def test_doc_provider_change_syncs_doc_model_options(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                database = Database(paths.database_file)
+                database.initialize()
+                root = tk.Tk()
+                root.withdraw()
+                try:
+                    dashboard = JobBotDashboard(root, config, paths, database)
+                    dashboard.doc_stage_model_var.set("qwen2.5:7b")
+                    dashboard.doc_stage_provider_var.set("openai")
+                    dashboard._on_doc_provider_changed()
+                    self.assertEqual(dashboard.doc_stage_model_var.get(), "gpt-5-mini")
+                finally:
+                    root.destroy()

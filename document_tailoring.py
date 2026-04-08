@@ -11,8 +11,18 @@ class DocumentTailoringPayload:
     key_skills: list[str] = field(default_factory=list)
     cover_letter_text: str = ""
     route: str = "local"
+    ai_attempted: bool = False
     provider: str = ""
     model: str = ""
     fallback_reason: str = ""
     retry_count: int = 0
 
+
+@dataclass(slots=True)
+class DocumentTailoringAttempt:
+    payload: DocumentTailoringPayload | None = None
+    attempted: bool = False
+    provider: str = ""
+    model: str = ""
+    failure_reason: str = ""
+    retry_count: int = 0
