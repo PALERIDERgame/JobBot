@@ -5,8 +5,9 @@ from unittest.mock import MagicMock
 
 from config import JobBotConfig
 from database import Job
+from document_tailoring import DocumentTailoringPayload
 from match_scorer import MatchScorer
-from resume_parser import ResumeData
+from resume_parser import ResumeData, ResumeWorkEntry
 
 
 class MatchScorerTests(unittest.TestCase):
@@ -81,3 +82,48 @@ class MatchScorerTests(unittest.TestCase):
         resume = ResumeData("", "", "Jane", "jane@example.com", "", "Python engineer", ["Python", "Automation"], ["Built APIs"])
         result = scorer.suggest_job_keywords(resume)
         self.assertEqual(result, "python developer automation llm tools api integration")
+
+    def test_tailor_documents_with_ai_returns_structured_payload(self) -> None:
+        config = JobBotConfig(doc_stage_provider="openai", doc_stage_model="gpt-5-mini", openai_api_key="openai-test")
+        scorer = MatchScorer(config)
+        scorer._build_client = MagicMock(return_value=object())
+        scorer._create_completion = MagicMock(
+            return_value=(
+                '{"work_entries":[{"role_line":"Role 1","date_line":"2024","bullets":["Improved reporting cadence and dashboard visibility."]}],'
+                '"key_skills":["Dashboard Reporting","Lead Generation"],'
+                '"cover_letter_text":"Dear Hiring Team at Acme,\\n\\nTest letter.\\n\\nSincerely,\\nJane"}'
+            )
+        )
+        job = Job("1", "Head of Marketing", "Acme", "Remote", "", "Lead B2B growth and reporting.", "board", "https://example.com", "", "jobspy", "", "")
+        resume = ResumeData(
+            "",
+            "",
+            "Jane",
+            "jane@example.com",
+            "",
+            "Python engineer",
+            ["Python"],
+            ["Built APIs"],
+            work_experience_entries=[ResumeWorkEntry("Role 1", "2024", ["Built dashboards for leadership"])],
+        )
+        local = DocumentTailoringPayload(
+            work_entries=[ResumeWorkEntry("Role 1", "2024", ["Built dashboards for leadership"])],
+            key_skills=["Python"],
+            cover_letter_text="Local",
+        )
+        payload = scorer.tailor_documents_with_ai(job, resume, local, alignment_notes="Strong fit")
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload.route, "openai")
+        self.assertEqual(payload.work_entries[0].bullets[0], "Improved reporting cadence and dashboard visibility.")
+        self.assertIn("Lead Generation", payload.key_skills)
+
+    def test_tailor_documents_with_ai_ignores_non_openai_provider(self) -> None:
+        config = JobBotConfig(doc_stage_provider="anthropic", doc_stage_model="claude-sonnet-4-20250514", anthropic_api_key="anthropic-test")
+        scorer = MatchScorer(config)
+        payload = scorer.tailor_documents_with_ai(
+            Job("1", "Head of Marketing", "Acme", "Remote", "", "Lead B2B growth and reporting.", "board", "", "", "jobspy", "", ""),
+            ResumeData("", "", "Jane", "jane@example.com", "", "Summary", ["Python"], ["Built APIs"]),
+            DocumentTailoringPayload(),
+        )
+        self.assertIsNone(payload)

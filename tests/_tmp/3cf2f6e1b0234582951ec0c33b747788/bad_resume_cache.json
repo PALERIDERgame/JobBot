@@ -1,0 +1,31 @@
+{
+  "source_path": "C:\\Projects\\JobBot\\tests\\_tmp\\3cf2f6e1b0234582951ec0c33b747788\\bad_resume.docx",
+  "raw_text": "ROBERT THOM\nKEY SKILLS\nOperations, Project Management",
+  "name": "ROBERT THOM",
+  "email": "",
+  "phone": "",
+  "summary": "Experienced professional with relevant background.",
+  "skills": [
+    "Operations",
+    "Project Management"
+  ],
+  "experience_lines": [],
+  "header_lines": [
+    "ROBERT THOM",
+    "KEY SKILLS"
+  ],
+  "education_lines": [],
+  "key_skills_lines": [
+    "Operations, Project Management"
+  ],
+  "work_experience_entries": [],
+  "key_skills_templates": [
+    {
+      "paragraph_index": 2,
+      "style_name": "Normal",
+      "has_numbering": false,
+      "left_indent": null,
+      "first_line_indent": null
+    }
+  ]
+}

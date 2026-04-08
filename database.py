@@ -482,6 +482,7 @@ class Database:
             COALESCE(generated_documents.cover_letter_path, '') AS cover_letter_path,
             COALESCE(generated_documents.status, 'pending') AS document_status,
             COALESCE(generated_documents.error_message, '') AS document_error,
+            COALESCE(generated_documents.generated_at, '') AS generated_at,
             COALESCE(deliveries.status, 'pending') AS delivery_status
         FROM jobs
         LEFT JOIN match_results ON match_results.job_id = jobs.id
@@ -522,6 +523,7 @@ class Database:
                 COALESCE(generated_documents.cover_letter_path, '') AS cover_letter_path,
                 COALESCE(generated_documents.status, 'pending') AS document_status,
                 COALESCE(generated_documents.error_message, '') AS document_error,
+                COALESCE(generated_documents.generated_at, '') AS generated_at,
                 COALESCE(deliveries.method, 'local') AS delivery_method,
                 COALESCE(deliveries.status, 'pending') AS delivery_status,
                 COALESCE(deliveries.message_id, '') AS message_id,

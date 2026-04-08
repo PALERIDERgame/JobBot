@@ -1,0 +1,109 @@
+{
+  "source_path": "C:\\Projects\\JobBot\\tests\\_tmp\\3751c8c06cf045cca06f6a47cd02432a\\source_resume.docx",
+  "raw_text": "ROBERT THOM\nrobert@example.com | linkedin.com/in/example | (530) 220-4847\nWORK EXPERIENCE\nUnderdog Strategies, New York, NY \u2014 Digital Advertising and Field Manager\nJULY 2024 - Present\n\u2022 Led digital ad strategy and reporting\n\u2022 Managed creative vendors and launches\nBehavioral Associates, New York, NY \u2014 Operations Manager\nJUNE 2023 - JULY 2024\n\u2022 Directed software implementation and internal systems\nEDUCATION\nUniversity of California, Davis\nKEY SKILLS\nOperations, Project Management, CRM, Data Analysis, Mailchimp, Google Analytics",
+  "name": "ROBERT THOM",
+  "email": "robert@example.com",
+  "phone": "(530) 220-4847",
+  "summary": "\u2022 Led digital ad strategy and reporting \u2022 Managed creative vendors and launches",
+  "skills": [
+    "Operations",
+    "Project Management",
+    "CRM",
+    "Data Analysis",
+    "Mailchimp",
+    "Google Analytics"
+  ],
+  "experience_lines": [
+    "Underdog Strategies, New York, NY \u2014 Digital Advertising and Field Manager",
+    "Behavioral Associates, New York, NY \u2014 Operations Manager"
+  ],
+  "header_lines": [
+    "ROBERT THOM",
+    "robert@example.com | linkedin.com/in/example | (530) 220-4847"
+  ],
+  "education_lines": [
+    "University of California, Davis"
+  ],
+  "key_skills_lines": [
+    "Operations, Project Management, CRM, Data Analysis, Mailchimp, Google Analytics"
+  ],
+  "work_experience_entries": [
+    {
+      "role_line": "Underdog Strategies, New York, NY \u2014 Digital Advertising and Field Manager",
+      "date_line": "JULY 2024 - Present",
+      "bullets": [
+        "Led digital ad strategy and reporting",
+        "Managed creative vendors and launches"
+      ],
+      "role_template": {
+        "paragraph_index": 3,
+        "style_name": "Heading 2",
+        "has_numbering": false,
+        "left_indent": null,
+        "first_line_indent": null
+      },
+      "date_template": {
+        "paragraph_index": 4,
+        "style_name": "Normal",
+        "has_numbering": false,
+        "left_indent": null,
+        "first_line_indent": null
+      },
+      "bullet_templates": [
+        {
+          "paragraph_index": 5,
+          "style_name": "List Bullet",
+          "has_numbering": false,
+          "left_indent": null,
+          "first_line_indent": null
+        },
+        {
+          "paragraph_index": 6,
+          "style_name": "List Bullet",
+          "has_numbering": false,
+          "left_indent": null,
+          "first_line_indent": null
+        }
+      ]
+    },
+    {
+      "role_line": "Behavioral Associates, New York, NY \u2014 Operations Manager",
+      "date_line": "JUNE 2023 - JULY 2024",
+      "bullets": [
+        "Directed software implementation and internal systems"
+      ],
+      "role_template": {
+        "paragraph_index": 7,
+        "style_name": "Heading 2",
+        "has_numbering": false,
+        "left_indent": null,
+        "first_line_indent": null
+      },
+      "date_template": {
+        "paragraph_index": 8,
+        "style_name": "Heading 3",
+        "has_numbering": false,
+        "left_indent": null,
+        "first_line_indent": null
+      },
+      "bullet_templates": [
+        {
+          "paragraph_index": 9,
+          "style_name": "List Bullet",
+          "has_numbering": false,
+          "left_indent": null,
+          "first_line_indent": null
+        }
+      ]
+    }
+  ],
+  "key_skills_templates": [
+    {
+      "paragraph_index": 13,
+      "style_name": "Normal",
+      "has_numbering": false,
+      "left_indent": null,
+      "first_line_indent": null
+    }
+  ]
+}

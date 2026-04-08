@@ -9,6 +9,7 @@ from config import AppPaths, JobBotConfig, resolve_output_dir
 from deterministic_filter import apply_deterministic_filter
 from database import Database, Job
 from doc_generator import DocumentGenerator, GeneratedDocs
+from document_tailoring import DocumentTailoringPayload
 from gmail_client import DeliveryResult, GmailClient
 from match_scorer import MatchScore, MatchScorer, StageEvaluation
 from resume_parser import ResumeData, load_cached_resume, parse_resume
@@ -37,6 +38,11 @@ class JobBotPipeline:
         self.scorer = MatchScorer(config, database)
         self.doc_generator = DocumentGenerator()
         self.gmail_client = GmailClient(config.gmail, paths.token_file)
+
+    @staticmethod
+    def _emit_progress(progress_callback, stage: str, message: str, progress: int) -> None:
+        if progress_callback:
+            progress_callback(stage, message, progress)
 
     def run(self) -> PipelineResult:
         started_at = datetime.now(timezone.utc).isoformat()
@@ -175,8 +181,13 @@ class JobBotPipeline:
                     jobs_matched=jobs_matched,
                 )
                 resume = resume or self._load_resume()
-                ai_notes = self.scorer.document_generation_notes(job, resume, strong_eval)
-                docs = self._generate_documents(job, resume, strong_eval.to_match_score(self.config.final_apply_threshold), output_dir, ai_notes=ai_notes)
+                docs = self._generate_documents(
+                    job,
+                    resume,
+                    strong_eval.to_match_score(self.config.final_apply_threshold),
+                    output_dir,
+                    ai_notes=strong_eval.rationale,
+                )
                 jobs_matched += 1
                 if self.config.automation_mode == "auto" and job.apply_method == "email":
                     self.database.update_run(
@@ -239,12 +250,23 @@ class JobBotPipeline:
     def _load_resume(self) -> ResumeData:
         cached = load_cached_resume(self.paths.resume_json)
         source_path = self._resolve_resume_path(self.config.resume_source_path.strip())
+        cache_has_docx_templates = True
+        if cached and source_path.suffix.lower() == ".docx":
+            cache_has_docx_templates = bool(
+                cached.key_skills_templates
+                and cached.work_experience_entries
+                and all(
+                    entry.role_template is not None and entry.bullet_templates
+                    for entry in cached.work_experience_entries
+                )
+            )
         if (
             cached
             and cached.source_path == str(source_path)
             and cached.header_lines
             and cached.education_lines
             and cached.work_experience_entries
+            and cache_has_docx_templates
         ):
             return cached
         if not source_path:
@@ -299,8 +321,18 @@ class JobBotPipeline:
             scored_at=datetime.now(timezone.utc).isoformat(),
         )
 
-    def _generate_documents(self, job: Job, resume: ResumeData, score: MatchScore, output_dir: Path, *, ai_notes: str) -> GeneratedDocs:
-        docs = self.doc_generator.generate(output_dir, job, resume, score, ai_notes=ai_notes)
+    def _generate_documents(self, job: Job, resume: ResumeData, score: MatchScore, output_dir: Path, *, ai_notes: str, progress_callback=None) -> GeneratedDocs:
+        tailoring_payload = self._prepare_document_tailoring(job, resume, score, ai_notes=ai_notes)
+        docs = self.doc_generator.generate(
+            output_dir,
+            job,
+            resume,
+            score,
+            ai_notes="",
+            tailoring_payload=tailoring_payload,
+            progress_callback=progress_callback,
+        )
+        self._emit_progress(progress_callback, "saving_database_state", "Saving document metadata...", 7)
         self.database.record_generated_documents(
             job.id,
             output_dir=str(docs.output_dir),
@@ -313,13 +345,44 @@ class JobBotPipeline:
         )
         return docs
 
+    def _prepare_document_tailoring(self, job: Job, resume: ResumeData, score: MatchScore, *, ai_notes: str) -> DocumentTailoringPayload:
+        local_payload = self.doc_generator.build_local_tailoring_payload(job, resume, score, ai_notes=ai_notes)
+        if not self.doc_generator.should_escalate_tailoring(job, resume, local_payload):
+            LOGGER.info("Using local tailoring for %s", job.id)
+            return local_payload
+
+        LOGGER.info("Escalating document tailoring to AI for %s", job.id)
+        ai_payload = self.scorer.tailor_documents_with_ai(job, resume, local_payload, alignment_notes=ai_notes, retry_count=0)
+        if ai_payload:
+            valid, issues = self.doc_generator.validate_tailoring_payload(ai_payload)
+            if valid:
+                LOGGER.info("AI tailoring accepted for %s via %s/%s", job.id, ai_payload.provider, ai_payload.model)
+                return ai_payload
+            LOGGER.warning("AI tailoring quality check failed for %s: %s", job.id, ", ".join(issues))
+            retry_payload = self.scorer.tailor_documents_with_ai(job, resume, local_payload, alignment_notes=ai_notes, retry_count=1)
+            if retry_payload:
+                valid, issues = self.doc_generator.validate_tailoring_payload(retry_payload)
+                if valid:
+                    LOGGER.info("AI tailoring retry accepted for %s via %s/%s", job.id, retry_payload.provider, retry_payload.model)
+                    return retry_payload
+                LOGGER.warning("AI tailoring retry failed for %s: %s", job.id, ", ".join(issues))
+
+        LOGGER.info("Falling back to local tailoring for %s", job.id)
+        local_payload.route = "fallback"
+        local_payload.fallback_reason = "AI tailoring unavailable or failed quality checks."
+        return local_payload
+
     def _deliver(self, job: Job, score: MatchScore, docs: GeneratedDocs) -> DeliveryResult:
         return self.gmail_client.deliver_match(job, score, docs)
 
-    def generate_documents_for_job(self, job_id: str) -> GeneratedDocs:
+    def generate_documents_for_job(self, job_id: str, *, progress_callback=None) -> GeneratedDocs:
+        LOGGER.info("Manual document generation started for %s", job_id)
+        self._emit_progress(progress_callback, "starting", "Starting document generation...", 0)
         row = self.database.get_review_row(job_id)
         if not row:
             raise ValueError("Selected job could not be found")
+        self._emit_progress(progress_callback, "loading_job", f"Loading {row['title']} at {row['employer']}...", 1)
+        self._emit_progress(progress_callback, "parsing_resume", "Loading and parsing resume...", 2)
         resume = self._load_resume()
         job = Job(
             id=row["id"],
@@ -347,7 +410,16 @@ class JobBotPipeline:
         )
         output_dir = resolve_output_dir(self.config, self.paths)
         output_dir.mkdir(parents=True, exist_ok=True)
-        return self._generate_documents(job, resume, score, output_dir, ai_notes="")
+        try:
+            docs = self._generate_documents(job, resume, score, output_dir, ai_notes=row["rationale"], progress_callback=progress_callback)
+            if docs.status == "failed":
+                raise ValueError(docs.error_message or "Document generation failed.")
+            self._emit_progress(progress_callback, "completed", "Documents generated.", 8)
+            LOGGER.info("Manual document generation completed for %s", job_id)
+            return docs
+        except Exception:
+            LOGGER.exception("Manual document generation failed for %s", job_id)
+            raise
 
     def approve_and_send(self, job_id: str) -> DeliveryResult:
         row = self.database.get_review_row(job_id)
@@ -401,7 +473,7 @@ class JobBotPipeline:
         if docs_missing:
             output_dir = resolve_output_dir(self.config, self.paths)
             output_dir.mkdir(parents=True, exist_ok=True)
-            docs = self._generate_documents(job, resume, score, output_dir, ai_notes="")
+            docs = self._generate_documents(job, resume, score, output_dir, ai_notes=row["rationale"])
         delivery = self._deliver(job, score, docs)
         self.database.record_delivery(
             job.id,
