@@ -407,7 +407,7 @@ class DocumentGeneratorTests(unittest.TestCase):
                 ResumeWorkEntry("Role", "2024", ["Managed optimized campaigns.", "Presented Presented that report.", "Created delivered both in-person."])
             ],
             key_skills=["Marketing"],
-            cover_letter_text="Letter",
+            cover_letter_text="Dear Hiring Team at Dow Jones,\n\nI am excited to apply for the role and bring experience in reporting, campaigns, and stakeholder coordination.\n\nSincerely,\nJane",
         )
         self.assertTrue(generator.should_escalate_tailoring(job, resume, payload))
 
@@ -418,7 +418,7 @@ class DocumentGeneratorTests(unittest.TestCase):
                 ResumeWorkEntry("Role", "2024", ["Managed integrated campaigns and improved lead quality.", "Built dashboards for leadership reporting."])
             ],
             key_skills=["Marketing Strategy", "Dashboard Reporting"],
-            cover_letter_text="Letter",
+            cover_letter_text="Dear Hiring Team at Acme,\n\nI am excited to apply for the role and would bring experience in integrated campaigns, leadership reporting, and audience growth.\n\nSincerely,\nJane",
         )
         valid, issues = generator.validate_tailoring_payload(payload)
         self.assertTrue(valid)

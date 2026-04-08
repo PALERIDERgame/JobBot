@@ -156,6 +156,11 @@ class DashboardSmokeTests(unittest.TestCase):
         self.assertEqual(JobBotDashboard._document_status_text(""), "Not generated")
         self.assertIn("Generated but missing on disk:", JobBotDashboard._document_status_text("C:\\missing\\resume.pdf"))
 
+    def test_doc_section_status_reports_yes_partial_and_no(self) -> None:
+        self.assertEqual(JobBotDashboard._doc_section_status("accepted"), "Yes")
+        self.assertEqual(JobBotDashboard._doc_section_status("partial"), "Partial")
+        self.assertEqual(JobBotDashboard._doc_section_status("local"), "No")
+
     @unittest.skipIf(os.environ.get("CI") == "true", "Skipping Tk smoke test in CI")
     def test_generate_documents_updates_progress_and_reenables_button(self) -> None:
         with workspace_temp_dir() as tmp:

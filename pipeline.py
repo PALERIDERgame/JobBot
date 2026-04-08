@@ -322,7 +322,7 @@ class JobBotPipeline:
         )
 
     def _generate_documents(self, job: Job, resume: ResumeData, score: MatchScore, output_dir: Path, *, ai_notes: str, progress_callback=None) -> GeneratedDocs:
-        tailoring_payload = self._prepare_document_tailoring(job, resume, score, ai_notes=ai_notes)
+        tailoring_payload = self._prepare_document_tailoring(job, resume, score, ai_notes=ai_notes, progress_callback=progress_callback)
         docs = self.doc_generator.generate(
             output_dir,
             job,
@@ -347,47 +347,115 @@ class JobBotPipeline:
             tailoring_model=tailoring_payload.model,
             tailoring_fallback_reason=tailoring_payload.fallback_reason,
             tailoring_retry_count=tailoring_payload.retry_count,
+            resume_ai_status=tailoring_payload.resume_ai_status,
+            cover_letter_ai_status=tailoring_payload.cover_letter_ai_status,
+            rejected_bullets_repaired=tailoring_payload.rejected_bullets_repaired,
+            cover_letter_fallback=tailoring_payload.cover_letter_fallback,
+            ai_validation_attempts=tailoring_payload.ai_validation_attempts,
+            resume_retry_performed=tailoring_payload.resume_retry_performed,
+            cover_letter_retry_performed=tailoring_payload.cover_letter_retry_performed,
+            ai_repair_applied=tailoring_payload.ai_repair_applied,
             pdf_exporter_used=docs.pdf_exporter_used,
             page_fit_attempts=docs.page_fit_attempts,
         )
         return docs
 
-    def _prepare_document_tailoring(self, job: Job, resume: ResumeData, score: MatchScore, *, ai_notes: str) -> DocumentTailoringPayload:
+    def _prepare_document_tailoring(self, job: Job, resume: ResumeData, score: MatchScore, *, ai_notes: str, progress_callback=None) -> DocumentTailoringPayload:
         local_payload = self.doc_generator.build_local_tailoring_payload(job, resume, score, ai_notes=ai_notes)
+        local_payload.ai_validation_attempts = 0
         if not self.doc_generator.should_escalate_tailoring(job, resume, local_payload):
             LOGGER.info("Using local tailoring for %s", job.id)
             return local_payload
 
         LOGGER.info("Escalating document tailoring to AI for %s", job.id)
+        self._emit_progress(progress_callback, "validating_ai", "Validating AI content...", 3)
         first_attempt = self.scorer.tailor_documents_with_ai(job, resume, local_payload, alignment_notes=ai_notes, retry_count=0)
         ai_payload = first_attempt.payload
+        best_partial_payload: DocumentTailoringPayload | None = None
         if ai_payload:
-            valid, issues = self.doc_generator.validate_tailoring_payload(ai_payload)
-            if valid:
-                LOGGER.info("AI tailoring accepted for %s via %s/%s", job.id, ai_payload.provider, ai_payload.model)
-                return ai_payload
+            repaired_payload, issues, failed_sections = self.doc_generator.repair_ai_tailoring_payload(ai_payload, local_payload)
+            repaired_payload.ai_validation_attempts = 1
+            repaired_payload.retry_count = first_attempt.retry_count
+            if repaired_payload.ai_repair_applied:
+                self._emit_progress(progress_callback, "repairing_ai", "Repairing invalid AI content...", 3)
+            valid, validation_issues = self.doc_generator.validate_tailoring_payload(repaired_payload)
+            issues = issues + validation_issues
+            if valid and not failed_sections:
+                LOGGER.info("AI tailoring accepted for %s via %s/%s", job.id, repaired_payload.provider, repaired_payload.model)
+                return repaired_payload
+            if valid and repaired_payload.route == "openai":
+                best_partial_payload = repaired_payload
             LOGGER.warning("AI tailoring quality check failed for %s: %s", job.id, ", ".join(issues))
-            retry_attempt = self.scorer.tailor_documents_with_ai(job, resume, local_payload, alignment_notes=ai_notes, retry_count=1)
+            retry_sections = self._retry_sections_for_failed_parts(failed_sections)
+            retry_preview = best_partial_payload or local_payload
+            if "resume" in retry_sections:
+                retry_preview.resume_retry_performed = True
+                self._emit_progress(progress_callback, "retrying_resume", "Retrying resume bullet generation...", 3)
+            if "cover_letter" in retry_sections:
+                retry_preview.cover_letter_retry_performed = True
+                self._emit_progress(progress_callback, "retrying_cover_letter", "Retrying cover letter generation...", 3)
+            retry_attempt = self.scorer.tailor_documents_with_ai(
+                job,
+                resume,
+                retry_preview,
+                alignment_notes=ai_notes,
+                retry_count=1,
+                requested_sections=retry_sections,
+            )
             retry_payload = retry_attempt.payload
             if retry_payload:
-                valid, issues = self.doc_generator.validate_tailoring_payload(retry_payload)
-                if valid:
-                    LOGGER.info("AI tailoring retry accepted for %s via %s/%s", job.id, retry_payload.provider, retry_payload.model)
-                    return retry_payload
-                LOGGER.warning("AI tailoring retry failed for %s: %s", job.id, ", ".join(issues))
+                retry_payload = self._preserve_unrequested_sections(retry_payload, retry_preview, retry_sections)
+                repaired_retry_payload, retry_issues, retry_failed_sections = self.doc_generator.repair_ai_tailoring_payload(retry_payload, retry_preview)
+                repaired_retry_payload = self._restore_unrequested_section_statuses(repaired_retry_payload, retry_preview, retry_sections)
+                repaired_retry_payload.ai_validation_attempts = 2
+                repaired_retry_payload.retry_count = retry_attempt.retry_count
+                repaired_retry_payload.resume_retry_performed = "resume" in retry_sections
+                repaired_retry_payload.cover_letter_retry_performed = "cover_letter" in retry_sections
+                repaired_retry_payload.ai_repair_applied = repaired_retry_payload.ai_repair_applied or bool(best_partial_payload and best_partial_payload.ai_repair_applied)
+                valid, retry_validation_issues = self.doc_generator.validate_tailoring_payload(repaired_retry_payload)
+                retry_issues = retry_issues + retry_validation_issues
+                if valid and not retry_failed_sections:
+                    LOGGER.info("AI tailoring retry accepted for %s via %s/%s", job.id, repaired_retry_payload.provider, repaired_retry_payload.model)
+                    return repaired_retry_payload
+                if valid and repaired_retry_payload.route == "openai":
+                    repaired_retry_payload.fallback_reason = "; ".join(retry_issues) if retry_issues else ""
+                    LOGGER.info("AI tailoring partially accepted for %s via %s/%s", job.id, repaired_retry_payload.provider, repaired_retry_payload.model)
+                    return repaired_retry_payload
+                LOGGER.warning("AI tailoring retry failed for %s: %s", job.id, ", ".join(retry_issues))
+                if best_partial_payload:
+                    best_partial_payload.ai_validation_attempts = 2
+                    best_partial_payload.resume_retry_performed = "resume" in retry_sections
+                    best_partial_payload.cover_letter_retry_performed = "cover_letter" in retry_sections
+                    LOGGER.info("Using best partial AI tailoring for %s after retry failure", job.id)
+                    return best_partial_payload
                 first_attempt = retry_attempt
             else:
+                if best_partial_payload:
+                    best_partial_payload.ai_validation_attempts = 2
+                    best_partial_payload.resume_retry_performed = "resume" in retry_sections
+                    best_partial_payload.cover_letter_retry_performed = "cover_letter" in retry_sections
+                    LOGGER.info("Using best partial AI tailoring for %s after retry returned no payload", job.id)
+                    return best_partial_payload
                 first_attempt = retry_attempt
         elif first_attempt.attempted and self._should_retry_ai_attempt(first_attempt.failure_reason):
             LOGGER.warning("AI tailoring parse failed for %s; retrying once", job.id)
+            self._emit_progress(progress_callback, "retrying_ai", "Retrying AI content generation...", 3)
             retry_attempt = self.scorer.tailor_documents_with_ai(job, resume, local_payload, alignment_notes=ai_notes, retry_count=1)
             retry_payload = retry_attempt.payload
             if retry_payload:
-                valid, issues = self.doc_generator.validate_tailoring_payload(retry_payload)
-                if valid:
-                    LOGGER.info("AI tailoring retry accepted for %s via %s/%s", job.id, retry_payload.provider, retry_payload.model)
-                    return retry_payload
-                LOGGER.warning("AI tailoring retry failed for %s: %s", job.id, ", ".join(issues))
+                repaired_retry_payload, retry_issues, retry_failed_sections = self.doc_generator.repair_ai_tailoring_payload(retry_payload, local_payload)
+                repaired_retry_payload.ai_validation_attempts = 2
+                repaired_retry_payload.retry_count = retry_attempt.retry_count
+                valid, retry_validation_issues = self.doc_generator.validate_tailoring_payload(repaired_retry_payload)
+                retry_issues = retry_issues + retry_validation_issues
+                if valid and not retry_failed_sections:
+                    LOGGER.info("AI tailoring retry accepted for %s via %s/%s", job.id, repaired_retry_payload.provider, repaired_retry_payload.model)
+                    return repaired_retry_payload
+                if valid and repaired_retry_payload.route == "openai":
+                    repaired_retry_payload.fallback_reason = "; ".join(retry_issues) if retry_issues else ""
+                    LOGGER.info("AI tailoring partially accepted for %s via %s/%s", job.id, repaired_retry_payload.provider, repaired_retry_payload.model)
+                    return repaired_retry_payload
+                LOGGER.warning("AI tailoring retry failed for %s: %s", job.id, ", ".join(retry_issues))
             first_attempt = retry_attempt
         elif first_attempt.attempted:
             LOGGER.warning("AI tailoring failed for %s: %s", job.id, first_attempt.failure_reason)
@@ -401,7 +469,49 @@ class JobBotPipeline:
         else:
             local_payload.fallback_reason = first_attempt.failure_reason or "AI tailoring unavailable."
         local_payload.retry_count = first_attempt.retry_count
+        local_payload.resume_ai_status = "local"
+        local_payload.cover_letter_ai_status = "local"
+        local_payload.cover_letter_fallback = "local" if first_attempt.attempted else ""
+        local_payload.ai_validation_attempts = 2 if first_attempt.retry_count else 1 if first_attempt.attempted else 0
+        local_payload.resume_retry_performed = False
+        local_payload.cover_letter_retry_performed = False
+        local_payload.ai_repair_applied = False
         return local_payload
+
+    @staticmethod
+    def _retry_sections_for_failed_parts(failed_sections: set[str]) -> set[str]:
+        if not failed_sections:
+            return {"resume", "cover_letter"}
+        return set(failed_sections)
+
+    @staticmethod
+    def _preserve_unrequested_sections(
+        payload: DocumentTailoringPayload,
+        baseline: DocumentTailoringPayload,
+        requested_sections: set[str],
+    ) -> DocumentTailoringPayload:
+        if "resume" not in requested_sections:
+            payload.work_entries = baseline.work_entries
+            payload.key_skills = baseline.key_skills
+        if "cover_letter" not in requested_sections:
+            payload.cover_letter_text = baseline.cover_letter_text
+        return payload
+
+    @staticmethod
+    def _restore_unrequested_section_statuses(
+        payload: DocumentTailoringPayload,
+        baseline: DocumentTailoringPayload,
+        requested_sections: set[str],
+    ) -> DocumentTailoringPayload:
+        if "resume" not in requested_sections:
+            payload.resume_ai_status = baseline.resume_ai_status
+            payload.rejected_bullets_repaired = baseline.rejected_bullets_repaired
+        if "cover_letter" not in requested_sections:
+            payload.cover_letter_ai_status = baseline.cover_letter_ai_status
+            payload.cover_letter_fallback = baseline.cover_letter_fallback
+        if payload.resume_ai_status in {"accepted", "partial"} or payload.cover_letter_ai_status == "accepted":
+            payload.route = "openai"
+        return payload
 
     @staticmethod
     def _should_retry_ai_attempt(failure_reason: str) -> bool:

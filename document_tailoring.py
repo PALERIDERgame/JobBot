@@ -16,6 +16,14 @@ class DocumentTailoringPayload:
     model: str = ""
     fallback_reason: str = ""
     retry_count: int = 0
+    resume_ai_status: str = "local"
+    cover_letter_ai_status: str = "local"
+    rejected_bullets_repaired: int = 0
+    cover_letter_fallback: str = ""
+    ai_validation_attempts: int = 0
+    resume_retry_performed: bool = False
+    cover_letter_retry_performed: bool = False
+    ai_repair_applied: bool = False
 
 
 @dataclass(slots=True)

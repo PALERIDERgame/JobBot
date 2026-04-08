@@ -417,7 +417,10 @@ class DocumentGenerator:
         signoff_name = self._signoff_name(resume)
         if tailoring_payload and tailoring_payload.cover_letter_text:
             letter_text = self._normalize_output_text(tailoring_payload.cover_letter_text).strip()
-            if "sincerely" not in letter_text.lower():
+            cover_letter_ok, _ = self._cover_letter_quality_issue(letter_text)
+            if not cover_letter_ok:
+                letter_text = self._compose_cover_letter(job, resume, score, clean_employer, signoff_name)
+            elif "sincerely" not in letter_text.lower():
                 letter_text = "\n".join([letter_text, "", f"Sincerely,\n{signoff_name}"])
         elif ai_notes:
             letter_text = "\n".join(
@@ -794,6 +797,81 @@ class DocumentGenerator:
         issues = self._tailoring_quality_issues(payload)
         return not issues, issues
 
+    def repair_ai_tailoring_payload(
+        self,
+        ai_payload: DocumentTailoringPayload,
+        fallback_payload: DocumentTailoringPayload,
+    ) -> tuple[DocumentTailoringPayload, list[str], set[str]]:
+        repaired = deepcopy(ai_payload)
+        issues: list[str] = []
+        failed_sections: set[str] = set()
+        repaired_bullets = 0
+
+        if len(ai_payload.work_entries) != len(fallback_payload.work_entries):
+            repaired.work_entries = fallback_payload.work_entries
+            issues.append("resume_structure_mismatch")
+            failed_sections.add("resume")
+        else:
+            repaired_entries: list[ResumeWorkEntry] = []
+            ai_bullets_kept = 0
+            for ai_entry, fallback_entry in zip(ai_payload.work_entries, fallback_payload.work_entries):
+                repaired_entry_bullets: list[str] = []
+                for idx, ai_bullet in enumerate(ai_entry.bullets):
+                    normalized = self._normalize_output_text(ai_bullet)
+                    issue = self._bullet_quality_issue(normalized)
+                    if issue:
+                        issues.append(issue)
+                        failed_sections.add("resume")
+                        repaired_bullets += 1
+                        replacement = fallback_entry.bullets[min(idx, len(fallback_entry.bullets) - 1)] if fallback_entry.bullets else normalized
+                        repaired_entry_bullets.append(replacement)
+                    else:
+                        repaired_entry_bullets.append(normalized)
+                        if idx < len(fallback_entry.bullets) and normalized != fallback_entry.bullets[idx]:
+                            ai_bullets_kept += 1
+                if not repaired_entry_bullets:
+                    repaired_entry_bullets = list(fallback_entry.bullets)
+                    issues.append(f"resume_entry_fallback:{fallback_entry.role_line}")
+                    failed_sections.add("resume")
+                repaired_entries.append(
+                    ResumeWorkEntry(
+                        role_line=fallback_entry.role_line,
+                        date_line=fallback_entry.date_line,
+                        bullets=repaired_entry_bullets,
+                        role_template=fallback_entry.role_template,
+                        date_template=fallback_entry.date_template,
+                        bullet_templates=fallback_entry.bullet_templates,
+                    )
+                )
+            repaired.work_entries = repaired_entries
+            if ai_bullets_kept == 0:
+                repaired.resume_ai_status = "local"
+            elif repaired_bullets > 0:
+                repaired.resume_ai_status = "partial"
+            else:
+                repaired.resume_ai_status = "accepted"
+
+        cover_ok, cover_issue = self._cover_letter_quality_issue(ai_payload.cover_letter_text)
+        if cover_ok:
+            repaired.cover_letter_text = self._normalize_output_text(ai_payload.cover_letter_text).strip()
+            repaired.cover_letter_ai_status = "accepted"
+            repaired.cover_letter_fallback = ""
+        else:
+            repaired.cover_letter_text = fallback_payload.cover_letter_text
+            repaired.cover_letter_ai_status = "local"
+            repaired.cover_letter_fallback = "local"
+            failed_sections.add("cover_letter")
+            if cover_issue:
+                issues.append(cover_issue)
+
+        repaired.key_skills = ai_payload.key_skills or fallback_payload.key_skills
+        repaired.rejected_bullets_repaired = repaired_bullets
+        repaired.ai_repair_applied = repaired_bullets > 0 or repaired.cover_letter_ai_status != "accepted"
+        repaired.route = "openai" if (
+            repaired.resume_ai_status in {"accepted", "partial"} or repaired.cover_letter_ai_status == "accepted"
+        ) else "fallback"
+        return repaired, issues, failed_sections
+
     def _build_resume_work_entries(self, job: Job, resume: ResumeData, *, fit_options: ResumeFitOptions | None = None, source_entries=None):
         entries = self._tailor_work_entries(resume, job, fit_options=fit_options, source_entries=source_entries)
         built = []
@@ -812,25 +890,57 @@ class DocumentGenerator:
 
     def _tailoring_quality_issues(self, payload: DocumentTailoringPayload) -> list[str]:
         issues: list[str] = []
+        cover_ok, cover_issue = self._cover_letter_quality_issue(payload.cover_letter_text)
+        if not cover_ok and cover_issue:
+            issues.append(cover_issue)
         bullets = [bullet for entry in payload.work_entries for bullet in entry.bullets]
         repeated_endings: dict[str, int] = {}
         for bullet in bullets:
             normalized = self._normalize_output_text(bullet)
+            issue = self._bullet_quality_issue(normalized)
+            if issue:
+                issues.append(issue)
             lowered = normalized.lower()
-            if re.search(r"\b(\w+)\s+\1\b", lowered):
-                issues.append(f"duplicate_word:{normalized}")
-            if re.search(r"\b(managed|led|created|captured|presented|recruited|streamlined)\s+(optimized|trained|delivered|cleaned|managed|presented)\b", lowered):
-                issues.append(f"broken_conjunction:{normalized}")
-            if re.search(r"\b(both in-person|both in person)\.?$", lowered):
-                issues.append(f"fragment:{normalized}")
-            if len(re.findall(r"\w+", normalized)) < 5:
-                issues.append(f"too_short:{normalized}")
             ending = " ".join(re.findall(r"[a-z0-9+#&'-]+", lowered)[-5:])
             if ending:
                 repeated_endings[ending] = repeated_endings.get(ending, 0) + 1
         if any(count > 2 for count in repeated_endings.values()):
             issues.append("repeated_closing_phrases")
         return issues
+
+    @staticmethod
+    def _cover_letter_quality_issue(text: str) -> tuple[bool, str]:
+        raw_text = str(text or "")
+        normalized = DocumentGenerator._normalize_output_text(raw_text).strip()
+        lowered = normalized.lower()
+        if not normalized:
+            return False, "cover_letter_missing"
+        if lowered in {"{'type': 'string'}", '{"type":"string"}', '{"type": "string"}'}:
+            return False, "cover_letter_placeholder"
+        if normalized.startswith("{") and "type" in lowered and "string" in lowered and len(normalized) < 120:
+            return False, "cover_letter_placeholder"
+        lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+        if len(lines) <= 2 and any(line.lower().startswith("sincerely") for line in lines):
+            return False, "cover_letter_signoff_only"
+        if len(re.findall(r"[A-Za-z]{2,}", normalized)) < 20:
+            return False, "cover_letter_too_short"
+        return True, ""
+
+    @staticmethod
+    def _bullet_quality_issue(text: str) -> str:
+        normalized = DocumentGenerator._normalize_output_text(text)
+        lowered = normalized.lower()
+        if re.search(r"\b(\w+)\s+\1\b", lowered):
+            return f"duplicate_word:{normalized}"
+        if re.search(r"\b(managed optimized|led trained|created delivered|planned ran|presented presented|captured cleaned)\b", lowered):
+            return f"broken_conjunction:{normalized}"
+        if re.search(r"\bidentify likely supporters execute\b", lowered):
+            return f"missing_connector:{normalized}"
+        if re.search(r"\b(both in-person|both in person)\.?$", lowered):
+            return f"fragment:{normalized}"
+        if len(re.findall(r"\w+", normalized)) < 5:
+            return f"too_short:{normalized}"
+        return ""
 
     def _tailor_work_entries(
         self,

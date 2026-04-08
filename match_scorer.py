@@ -181,6 +181,7 @@ class MatchScorer:
         *,
         alignment_notes: str = "",
         retry_count: int = 0,
+        requested_sections: set[str] | None = None,
     ) -> DocumentTailoringAttempt:
         provider, model = self._resolve_doc_provider_model()
         LOGGER.info("Resolved doc tailoring provider/model for %s: %s/%s", job.id, provider, model)
@@ -232,6 +233,7 @@ class MatchScorer:
             "instructions": {
                 "return_json": True,
                 "fields": ["work_entries", "key_skills", "cover_letter_text"],
+                "retry_sections": sorted(requested_sections) if requested_sections else ["resume", "cover_letter"],
                 "constraints": [
                     "Preserve employers, role titles, dates, and chronology exactly.",
                     "Return one work entry for each source work entry in the same order.",
@@ -247,6 +249,7 @@ class MatchScorer:
                     "Avoid repeated openings or repeated closing clauses across bullets.",
                     "Reject any broken grammar such as duplicated verbs or dropped conjunctions.",
                     "Prefer preserving the original sentence when uncertain.",
+                    "If retry_sections excludes a section, preserve that section from current_preview.",
                 ]
             )
 

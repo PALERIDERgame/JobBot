@@ -16,6 +16,165 @@ from test_support import workspace_temp_dir
 
 
 class PipelineTests(unittest.TestCase):
+    def test_prepare_document_tailoring_retries_only_cover_letter_when_resume_is_salvageable(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                database = Database(paths.database_file)
+                database.initialize()
+                pipeline = JobBotPipeline(config, paths, database)
+                local_payload = DocumentTailoringPayload(
+                    work_entries=[ResumeWorkEntry("Role 1", "2024", ["Built dashboards for leadership reporting and campaign planning."])],
+                    key_skills=["Dashboard Reporting"],
+                    cover_letter_text="Dear Hiring Team at Acme,\n\nI am excited to apply for the Head of Marketing role and bring dashboard reporting and operational leadership experience.\n\nSincerely,\nJane",
+                )
+                first_ai = DocumentTailoringPayload(
+                    work_entries=[ResumeWorkEntry("Role 1", "2024", ["Improved KPI visibility and reporting cadence for senior leadership teams."])],
+                    key_skills=["Dashboard Reporting", "KPI Reporting"],
+                    cover_letter_text="{'type': 'string'}",
+                    route="openai",
+                    ai_attempted=True,
+                    provider="openai",
+                    model="gpt-5-mini",
+                )
+                retry_ai = DocumentTailoringPayload(
+                    work_entries=[ResumeWorkEntry("Role 1", "2024", ["Changed but should be ignored."])],
+                    key_skills=["Changed"],
+                    cover_letter_text="Dear Hiring Team at Acme,\n\nI am excited to apply for the Head of Marketing role and would bring experience in KPI visibility, reporting, and cross-functional execution.\n\nSincerely,\nJane",
+                    route="openai",
+                    ai_attempted=True,
+                    provider="openai",
+                    model="gpt-5-mini",
+                )
+                resume = ResumeData(
+                    "", "", "Jane", "jane@example.com", "", "Summary", ["Dashboard Reporting"], ["Built dashboards"],
+                    work_experience_entries=local_payload.work_entries,
+                )
+                job = Job("1", "Head of Marketing", "Acme", "Remote", "", "Lead B2B growth", "board", "", "", "jobspy", "", "")
+                score = StageEvaluation(
+                    "strong", "openai", "gpt-5-mini", "scored", "review", 80, 0.8, "Good fit", [], [], 0, 0, 0.0, "", ""
+                ).to_match_score(config.final_apply_threshold)
+                pipeline.doc_generator.build_local_tailoring_payload = lambda *args, **kwargs: local_payload
+                pipeline.doc_generator.should_escalate_tailoring = lambda *args, **kwargs: True
+                requested_sections: list[set[str] | None] = []
+
+                def fake_tailor(*args, **kwargs):
+                    requested_sections.append(kwargs.get("requested_sections"))
+                    if kwargs.get("retry_count", 0) == 0:
+                        return DocumentTailoringAttempt(attempted=True, provider="openai", model="gpt-5-mini", retry_count=0, payload=first_ai)
+                    return DocumentTailoringAttempt(attempted=True, provider="openai", model="gpt-5-mini", retry_count=1, payload=retry_ai)
+
+                pipeline.scorer.tailor_documents_with_ai = fake_tailor
+                payload = pipeline._prepare_document_tailoring(job, resume, score, ai_notes="")
+                self.assertEqual(requested_sections[1], {"cover_letter"})
+                self.assertEqual(payload.route, "openai")
+                self.assertEqual(payload.resume_ai_status, "accepted")
+                self.assertEqual(payload.cover_letter_ai_status, "accepted")
+                self.assertFalse(payload.resume_retry_performed)
+                self.assertTrue(payload.cover_letter_retry_performed)
+                self.assertEqual(payload.work_entries[0].bullets[0], "Improved KPI visibility and reporting cadence for senior leadership teams.")
+
+    def test_prepare_document_tailoring_uses_best_partial_when_retry_fails(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                database = Database(paths.database_file)
+                database.initialize()
+                pipeline = JobBotPipeline(config, paths, database)
+                local_payload = DocumentTailoringPayload(
+                    work_entries=[ResumeWorkEntry("Role 1", "2024", ["Managed and optimized campaigns.", "Presented the report to leadership."])],
+                    key_skills=["Dashboard Reporting"],
+                    cover_letter_text="Dear Hiring Team at Acme,\n\nI am excited to apply for the role and bring dashboard reporting and operational leadership experience.\n\nSincerely,\nJane",
+                )
+                first_ai = DocumentTailoringPayload(
+                    work_entries=[ResumeWorkEntry("Role 1", "2024", ["Improved KPI visibility and reporting cadence.", "Presented Presented that report."])],
+                    key_skills=["Dashboard Reporting"],
+                    cover_letter_text="Dear Hiring Team at Acme,\n\nI am excited to apply for the role and would bring experience in reporting and cross-functional execution.\n\nSincerely,\nJane",
+                    route="openai",
+                    ai_attempted=True,
+                    provider="openai",
+                    model="gpt-5-mini",
+                )
+                resume = ResumeData(
+                    "", "", "Jane", "jane@example.com", "", "Summary", ["Dashboard Reporting"], ["Built dashboards"],
+                    work_experience_entries=local_payload.work_entries,
+                )
+                job = Job("1", "Head of Marketing", "Acme", "Remote", "", "Lead B2B growth", "board", "", "", "jobspy", "", "")
+                score = StageEvaluation(
+                    "strong", "openai", "gpt-5-mini", "scored", "review", 80, 0.8, "Good fit", [], [], 0, 0, 0.0, "", ""
+                ).to_match_score(config.final_apply_threshold)
+                pipeline.doc_generator.build_local_tailoring_payload = lambda *args, **kwargs: local_payload
+                pipeline.doc_generator.should_escalate_tailoring = lambda *args, **kwargs: True
+
+                def fake_tailor(*args, **kwargs):
+                    if kwargs.get("retry_count", 0) == 0:
+                        return DocumentTailoringAttempt(attempted=True, provider="openai", model="gpt-5-mini", retry_count=0, payload=first_ai)
+                    return DocumentTailoringAttempt(attempted=True, provider="openai", model="gpt-5-mini", failure_reason="OpenAI request failed: timeout", retry_count=1)
+
+                pipeline.scorer.tailor_documents_with_ai = fake_tailor
+                payload = pipeline._prepare_document_tailoring(job, resume, score, ai_notes="")
+                self.assertEqual(payload.route, "openai")
+                self.assertEqual(payload.resume_ai_status, "partial")
+                self.assertEqual(payload.cover_letter_ai_status, "accepted")
+                self.assertEqual(payload.rejected_bullets_repaired, 1)
+                self.assertEqual(payload.work_entries[0].bullets[0], "Improved KPI visibility and reporting cadence.")
+                self.assertEqual(payload.work_entries[0].bullets[1], "Presented the report to leadership.")
+
+    def test_prepare_document_tailoring_emits_section_retry_progress_messages(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                database = Database(paths.database_file)
+                database.initialize()
+                pipeline = JobBotPipeline(config, paths, database)
+                local_payload = DocumentTailoringPayload(
+                    work_entries=[ResumeWorkEntry("Role 1", "2024", ["Built dashboards for leadership reporting and campaign planning."])],
+                    key_skills=["Dashboard Reporting"],
+                    cover_letter_text="Dear Hiring Team at Acme,\n\nI am excited to apply for the role and bring dashboard reporting experience.\n\nSincerely,\nJane",
+                )
+                first_ai = DocumentTailoringPayload(
+                    work_entries=[ResumeWorkEntry("Role 1", "2024", ["Built dashboards for leadership reporting and campaign planning."])],
+                    key_skills=["Dashboard Reporting"],
+                    cover_letter_text="{'type': 'string'}",
+                    route="openai",
+                    ai_attempted=True,
+                    provider="openai",
+                    model="gpt-5-mini",
+                )
+                retry_ai = DocumentTailoringPayload(
+                    work_entries=[ResumeWorkEntry("Role 1", "2024", ["Ignore this retry bullet because resume changes should be preserved."])],
+                    key_skills=["Dashboard Reporting"],
+                    cover_letter_text="Dear Hiring Team at Acme,\n\nI am excited to apply for the role and bring dashboard reporting experience.\n\nSincerely,\nJane",
+                    route="openai",
+                    ai_attempted=True,
+                    provider="openai",
+                    model="gpt-5-mini",
+                )
+                resume = ResumeData(
+                    "", "", "Jane", "jane@example.com", "", "Summary", ["Dashboard Reporting"], ["Built dashboards"],
+                    work_experience_entries=local_payload.work_entries,
+                )
+                job = Job("1", "Head of Marketing", "Acme", "Remote", "", "Lead B2B growth", "board", "", "", "jobspy", "", "")
+                score = StageEvaluation(
+                    "strong", "openai", "gpt-5-mini", "scored", "review", 80, 0.8, "Good fit", [], [], 0, 0, 0.0, "", ""
+                ).to_match_score(config.final_apply_threshold)
+                pipeline.doc_generator.build_local_tailoring_payload = lambda *args, **kwargs: local_payload
+                pipeline.doc_generator.should_escalate_tailoring = lambda *args, **kwargs: True
+                pipeline.scorer.tailor_documents_with_ai = lambda *args, **kwargs: (
+                    DocumentTailoringAttempt(attempted=True, provider="openai", model="gpt-5-mini", retry_count=0, payload=first_ai)
+                    if kwargs.get("retry_count", 0) == 0
+                    else DocumentTailoringAttempt(attempted=True, provider="openai", model="gpt-5-mini", retry_count=1, payload=retry_ai)
+                )
+                events: list[tuple[str, str, int]] = []
+                pipeline._prepare_document_tailoring(job, resume, score, ai_notes="", progress_callback=lambda stage, message, progress: events.append((stage, message, progress)))
+                messages = [message for _stage, message, _progress in events]
+                self.assertIn("Validating AI content...", messages)
+                self.assertIn("Repairing invalid AI content...", messages)
+                self.assertIn("Retrying cover letter generation...", messages)
+
     def test_prepare_document_tailoring_records_specific_parse_failure_and_retry_count(self) -> None:
         with workspace_temp_dir() as tmp:
             with patch.dict(os.environ, {"APPDATA": str(tmp)}):

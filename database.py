@@ -164,6 +164,14 @@ class Database:
         self._ensure_column("generated_documents", "tailoring_model", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("generated_documents", "tailoring_fallback_reason", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("generated_documents", "tailoring_retry_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("generated_documents", "resume_ai_status", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("generated_documents", "cover_letter_ai_status", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("generated_documents", "rejected_bullets_repaired", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("generated_documents", "cover_letter_fallback", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("generated_documents", "ai_validation_attempts", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("generated_documents", "resume_retry_performed", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("generated_documents", "cover_letter_retry_performed", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("generated_documents", "ai_repair_applied", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("generated_documents", "pdf_exporter_used", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("generated_documents", "page_fit_attempts", "INTEGER NOT NULL DEFAULT 0")
         connection.commit()
@@ -326,6 +334,14 @@ class Database:
         tailoring_model: str = "",
         tailoring_fallback_reason: str = "",
         tailoring_retry_count: int = 0,
+        resume_ai_status: str = "",
+        cover_letter_ai_status: str = "",
+        rejected_bullets_repaired: int = 0,
+        cover_letter_fallback: str = "",
+        ai_validation_attempts: int = 0,
+        resume_retry_performed: bool = False,
+        cover_letter_retry_performed: bool = False,
+        ai_repair_applied: bool = False,
         pdf_exporter_used: str = "",
         page_fit_attempts: int = 0,
     ) -> None:
@@ -337,8 +353,10 @@ class Database:
                     status, error_message, generated_at,
                     tailoring_route, tailoring_provider, tailoring_model,
                     tailoring_fallback_reason, tailoring_retry_count,
+                    resume_ai_status, cover_letter_ai_status, rejected_bullets_repaired, cover_letter_fallback,
+                    ai_validation_attempts, resume_retry_performed, cover_letter_retry_performed, ai_repair_applied,
                     pdf_exporter_used, page_fit_attempts
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_id) DO UPDATE SET
                     output_dir=excluded.output_dir,
                     resume_docx_path=excluded.resume_docx_path,
@@ -352,6 +370,14 @@ class Database:
                     tailoring_model=excluded.tailoring_model,
                     tailoring_fallback_reason=excluded.tailoring_fallback_reason,
                     tailoring_retry_count=excluded.tailoring_retry_count,
+                    resume_ai_status=excluded.resume_ai_status,
+                    cover_letter_ai_status=excluded.cover_letter_ai_status,
+                    rejected_bullets_repaired=excluded.rejected_bullets_repaired,
+                    cover_letter_fallback=excluded.cover_letter_fallback,
+                    ai_validation_attempts=excluded.ai_validation_attempts,
+                    resume_retry_performed=excluded.resume_retry_performed,
+                    cover_letter_retry_performed=excluded.cover_letter_retry_performed,
+                    ai_repair_applied=excluded.ai_repair_applied,
                     pdf_exporter_used=excluded.pdf_exporter_used,
                     page_fit_attempts=excluded.page_fit_attempts
             """,
@@ -360,6 +386,8 @@ class Database:
                 status, error_message, generated_at,
                 tailoring_route, tailoring_provider, tailoring_model,
                 tailoring_fallback_reason, tailoring_retry_count,
+                resume_ai_status, cover_letter_ai_status, rejected_bullets_repaired, cover_letter_fallback,
+                ai_validation_attempts, int(resume_retry_performed), int(cover_letter_retry_performed), int(ai_repair_applied),
                 pdf_exporter_used, page_fit_attempts,
             ),
         )
@@ -560,6 +588,14 @@ class Database:
                 COALESCE(generated_documents.tailoring_model, '') AS tailoring_model,
                 COALESCE(generated_documents.tailoring_fallback_reason, '') AS tailoring_fallback_reason,
                 COALESCE(generated_documents.tailoring_retry_count, 0) AS tailoring_retry_count,
+                COALESCE(generated_documents.resume_ai_status, '') AS resume_ai_status,
+                COALESCE(generated_documents.cover_letter_ai_status, '') AS cover_letter_ai_status,
+                COALESCE(generated_documents.rejected_bullets_repaired, 0) AS rejected_bullets_repaired,
+                COALESCE(generated_documents.cover_letter_fallback, '') AS cover_letter_fallback,
+                COALESCE(generated_documents.ai_validation_attempts, 0) AS ai_validation_attempts,
+                COALESCE(generated_documents.resume_retry_performed, 0) AS resume_retry_performed,
+                COALESCE(generated_documents.cover_letter_retry_performed, 0) AS cover_letter_retry_performed,
+                COALESCE(generated_documents.ai_repair_applied, 0) AS ai_repair_applied,
                 COALESCE(generated_documents.pdf_exporter_used, '') AS pdf_exporter_used,
                 COALESCE(generated_documents.page_fit_attempts, 0) AS page_fit_attempts,
                 COALESCE(deliveries.method, 'local') AS delivery_method,
