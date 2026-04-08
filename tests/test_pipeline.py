@@ -16,6 +16,115 @@ from test_support import workspace_temp_dir
 
 
 class PipelineTests(unittest.TestCase):
+    def test_prepare_document_tailoring_accepts_successful_retry(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                database = Database(paths.database_file)
+                database.initialize()
+                pipeline = JobBotPipeline(config, paths, database)
+                local_payload = DocumentTailoringPayload(
+                    work_entries=[ResumeWorkEntry("Role 1", "2024", ["Built dashboards"])],
+                    key_skills=["Dashboard Reporting"],
+                    cover_letter_text="Local",
+                )
+                ai_payload = DocumentTailoringPayload(
+                    work_entries=[ResumeWorkEntry("Role 1", "2024", ["Improved KPI visibility and reporting cadence."])],
+                    key_skills=["Dashboard Reporting", "KPI Reporting"],
+                    cover_letter_text="AI Letter",
+                    route="openai",
+                    ai_attempted=True,
+                    provider="openai",
+                    model="gpt-5-mini",
+                    retry_count=1,
+                )
+                resume = ResumeData(
+                    "", "", "Jane", "jane@example.com", "", "Summary", ["Dashboard Reporting"], ["Built dashboards"],
+                    work_experience_entries=local_payload.work_entries,
+                )
+                job = Job("1", "Head of Marketing", "Acme", "Remote", "", "Lead B2B growth", "board", "", "", "jobspy", "", "")
+                score = StageEvaluation(
+                    "strong", "openai", "gpt-5-mini", "scored", "review", 80, 0.8, "Good fit", [], [], 0, 0, 0.0, "", ""
+                ).to_match_score(config.final_apply_threshold)
+                pipeline.doc_generator.build_local_tailoring_payload = lambda *args, **kwargs: local_payload
+                pipeline.doc_generator.should_escalate_tailoring = lambda *args, **kwargs: True
+
+                attempts = [
+                    DocumentTailoringAttempt(
+                        attempted=True,
+                        provider="openai",
+                        model="gpt-5-mini",
+                        failure_reason="OpenAI response could not be parsed as JSON.",
+                        retry_count=0,
+                    ),
+                    DocumentTailoringAttempt(
+                        attempted=True,
+                        provider="openai",
+                        model="gpt-5-mini",
+                        retry_count=1,
+                        payload=ai_payload,
+                    ),
+                ]
+                pipeline.scorer.tailor_documents_with_ai = lambda *args, **kwargs: attempts.pop(0)
+
+                payload = pipeline._prepare_document_tailoring(job, resume, score, ai_notes="")
+                self.assertEqual(payload.route, "openai")
+                self.assertTrue(payload.ai_attempted)
+                self.assertEqual(payload.provider, "openai")
+                self.assertEqual(payload.model, "gpt-5-mini")
+                self.assertEqual(payload.retry_count, 1)
+                self.assertEqual(payload.work_entries[0].bullets[0], "Improved KPI visibility and reporting cadence.")
+
+    def test_prepare_document_tailoring_accepts_partial_ai_payload_with_local_repairs(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                database = Database(paths.database_file)
+                database.initialize()
+                pipeline = JobBotPipeline(config, paths, database)
+                local_payload = DocumentTailoringPayload(
+                    work_entries=[ResumeWorkEntry("Role 1", "2024", ["Managed and optimized social media campaigns.", "Presented the report to leadership."])],
+                    key_skills=["Dashboard Reporting"],
+                    cover_letter_text="Dear Hiring Team at Acme,\n\nLocal letter body with enough detail to pass validation.\n\nSincerely,\nJane",
+                )
+                ai_payload = DocumentTailoringPayload(
+                    work_entries=[ResumeWorkEntry("Role 1", "2024", ["Improved KPI visibility and reporting cadence.", "Presented Presented that report."])],
+                    key_skills=["Dashboard Reporting", "Lead Generation"],
+                    cover_letter_text="{'type': 'string'}",
+                    route="openai",
+                    ai_attempted=True,
+                    provider="openai",
+                    model="gpt-5-mini",
+                )
+                resume = ResumeData(
+                    "", "", "Jane", "jane@example.com", "", "Summary", ["Dashboard Reporting"], ["Built dashboards"],
+                    work_experience_entries=local_payload.work_entries,
+                )
+                job = Job("1", "Head of Marketing", "Acme", "Remote", "", "Lead B2B growth", "board", "", "", "jobspy", "", "")
+                score = StageEvaluation(
+                    "strong", "openai", "gpt-5-mini", "scored", "review", 80, 0.8, "Good fit", [], [], 0, 0, 0.0, "", ""
+                ).to_match_score(config.final_apply_threshold)
+                pipeline.doc_generator.build_local_tailoring_payload = lambda *args, **kwargs: local_payload
+                pipeline.doc_generator.should_escalate_tailoring = lambda *args, **kwargs: True
+                pipeline.scorer.tailor_documents_with_ai = lambda *args, **kwargs: DocumentTailoringAttempt(
+                    attempted=True,
+                    provider="openai",
+                    model="gpt-5-mini",
+                    retry_count=kwargs.get("retry_count", 0),
+                    payload=ai_payload,
+                )
+
+                payload = pipeline._prepare_document_tailoring(job, resume, score, ai_notes="")
+                self.assertEqual(payload.route, "openai")
+                self.assertEqual(payload.resume_ai_status, "partial")
+                self.assertEqual(payload.cover_letter_ai_status, "local")
+                self.assertEqual(payload.cover_letter_fallback, "local")
+                self.assertEqual(payload.rejected_bullets_repaired, 1)
+                self.assertEqual(payload.work_entries[0].bullets[0], "Improved KPI visibility and reporting cadence.")
+                self.assertEqual(payload.work_entries[0].bullets[1], "Presented the report to leadership.")
+
     def test_prepare_document_tailoring_records_specific_parse_failure_and_retry_count(self) -> None:
         with workspace_temp_dir() as tmp:
             with patch.dict(os.environ, {"APPDATA": str(tmp)}):

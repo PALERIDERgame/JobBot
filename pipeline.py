@@ -347,6 +347,10 @@ class JobBotPipeline:
             tailoring_model=tailoring_payload.model,
             tailoring_fallback_reason=tailoring_payload.fallback_reason,
             tailoring_retry_count=tailoring_payload.retry_count,
+            resume_ai_status=tailoring_payload.resume_ai_status,
+            cover_letter_ai_status=tailoring_payload.cover_letter_ai_status,
+            rejected_bullets_repaired=tailoring_payload.rejected_bullets_repaired,
+            cover_letter_fallback=tailoring_payload.cover_letter_fallback,
             pdf_exporter_used=docs.pdf_exporter_used,
             page_fit_attempts=docs.page_fit_attempts,
         )
@@ -362,19 +366,27 @@ class JobBotPipeline:
         first_attempt = self.scorer.tailor_documents_with_ai(job, resume, local_payload, alignment_notes=ai_notes, retry_count=0)
         ai_payload = first_attempt.payload
         if ai_payload:
-            valid, issues = self.doc_generator.validate_tailoring_payload(ai_payload)
-            if valid:
-                LOGGER.info("AI tailoring accepted for %s via %s/%s", job.id, ai_payload.provider, ai_payload.model)
-                return ai_payload
+            repaired_payload, issues = self.doc_generator.repair_ai_tailoring_payload(ai_payload, local_payload)
+            valid, validation_issues = self.doc_generator.validate_tailoring_payload(repaired_payload)
+            issues = issues + validation_issues
+            if valid and not issues:
+                LOGGER.info("AI tailoring accepted for %s via %s/%s", job.id, repaired_payload.provider, repaired_payload.model)
+                return repaired_payload
             LOGGER.warning("AI tailoring quality check failed for %s: %s", job.id, ", ".join(issues))
             retry_attempt = self.scorer.tailor_documents_with_ai(job, resume, local_payload, alignment_notes=ai_notes, retry_count=1)
             retry_payload = retry_attempt.payload
             if retry_payload:
-                valid, issues = self.doc_generator.validate_tailoring_payload(retry_payload)
-                if valid:
-                    LOGGER.info("AI tailoring retry accepted for %s via %s/%s", job.id, retry_payload.provider, retry_payload.model)
-                    return retry_payload
-                LOGGER.warning("AI tailoring retry failed for %s: %s", job.id, ", ".join(issues))
+                repaired_retry_payload, retry_issues = self.doc_generator.repair_ai_tailoring_payload(retry_payload, local_payload)
+                valid, retry_validation_issues = self.doc_generator.validate_tailoring_payload(repaired_retry_payload)
+                retry_issues = retry_issues + retry_validation_issues
+                if valid and not retry_issues:
+                    LOGGER.info("AI tailoring retry accepted for %s via %s/%s", job.id, repaired_retry_payload.provider, repaired_retry_payload.model)
+                    return repaired_retry_payload
+                if valid and repaired_retry_payload.route == "openai":
+                    repaired_retry_payload.fallback_reason = "; ".join(retry_issues) if retry_issues else ""
+                    LOGGER.info("AI tailoring partially accepted for %s via %s/%s", job.id, repaired_retry_payload.provider, repaired_retry_payload.model)
+                    return repaired_retry_payload
+                LOGGER.warning("AI tailoring retry failed for %s: %s", job.id, ", ".join(retry_issues))
                 first_attempt = retry_attempt
             else:
                 first_attempt = retry_attempt
@@ -383,11 +395,17 @@ class JobBotPipeline:
             retry_attempt = self.scorer.tailor_documents_with_ai(job, resume, local_payload, alignment_notes=ai_notes, retry_count=1)
             retry_payload = retry_attempt.payload
             if retry_payload:
-                valid, issues = self.doc_generator.validate_tailoring_payload(retry_payload)
-                if valid:
-                    LOGGER.info("AI tailoring retry accepted for %s via %s/%s", job.id, retry_payload.provider, retry_payload.model)
-                    return retry_payload
-                LOGGER.warning("AI tailoring retry failed for %s: %s", job.id, ", ".join(issues))
+                repaired_retry_payload, retry_issues = self.doc_generator.repair_ai_tailoring_payload(retry_payload, local_payload)
+                valid, retry_validation_issues = self.doc_generator.validate_tailoring_payload(repaired_retry_payload)
+                retry_issues = retry_issues + retry_validation_issues
+                if valid and not retry_issues:
+                    LOGGER.info("AI tailoring retry accepted for %s via %s/%s", job.id, repaired_retry_payload.provider, repaired_retry_payload.model)
+                    return repaired_retry_payload
+                if valid and repaired_retry_payload.route == "openai":
+                    repaired_retry_payload.fallback_reason = "; ".join(retry_issues) if retry_issues else ""
+                    LOGGER.info("AI tailoring partially accepted for %s via %s/%s", job.id, repaired_retry_payload.provider, repaired_retry_payload.model)
+                    return repaired_retry_payload
+                LOGGER.warning("AI tailoring retry failed for %s: %s", job.id, ", ".join(retry_issues))
             first_attempt = retry_attempt
         elif first_attempt.attempted:
             LOGGER.warning("AI tailoring failed for %s: %s", job.id, first_attempt.failure_reason)
@@ -396,6 +414,10 @@ class JobBotPipeline:
         local_payload.ai_attempted = first_attempt.attempted
         local_payload.provider = first_attempt.provider
         local_payload.model = first_attempt.model
+        local_payload.resume_ai_status = "local"
+        local_payload.cover_letter_ai_status = "local"
+        local_payload.rejected_bullets_repaired = 0
+        local_payload.cover_letter_fallback = "local" if first_attempt.attempted else ""
         if ai_payload and 'issues' in locals() and issues:
             local_payload.fallback_reason = "OpenAI payload failed tailoring quality checks: " + ", ".join(issues)
         else:
