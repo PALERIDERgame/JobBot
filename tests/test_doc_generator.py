@@ -38,6 +38,67 @@ def _build_source_resume_docx(path: Path) -> None:
 
 
 class DocumentGeneratorTests(unittest.TestCase):
+    def test_repair_ai_tailoring_payload_falls_back_for_bad_cover_letter_and_broken_bullets(self) -> None:
+        generator = DocumentGenerator()
+        local_payload = DocumentTailoringPayload(
+            work_entries=[
+                ResumeWorkEntry("Role 1", "2024", ["Managed and optimized social media campaigns.", "Presented the report to leadership."])
+            ],
+            key_skills=["Dashboard Reporting"],
+            cover_letter_text="Dear Hiring Team at Acme,\n\nI am excited to apply for the Head of Marketing role.\n\nSincerely,\nJane",
+            route="local",
+        )
+        ai_payload = DocumentTailoringPayload(
+            work_entries=[
+                ResumeWorkEntry("Role 1", "2024", ["Managed optimized social media campaigns.", "Presented Presented that report."])
+            ],
+            key_skills=["Dashboard Reporting", "Lead Generation"],
+            cover_letter_text="{'type': 'string'}",
+            route="openai",
+            ai_attempted=True,
+            provider="openai",
+            model="gpt-5-mini",
+        )
+        repaired, issues = generator.repair_ai_tailoring_payload(ai_payload, local_payload)
+        self.assertEqual(repaired.cover_letter_text, local_payload.cover_letter_text)
+        self.assertEqual(repaired.cover_letter_ai_status, "local")
+        self.assertEqual(repaired.cover_letter_fallback, "local")
+        self.assertEqual(repaired.resume_ai_status, "local")
+        self.assertEqual(repaired.rejected_bullets_repaired, 2)
+        self.assertEqual(repaired.work_entries[0].bullets, local_payload.work_entries[0].bullets)
+        self.assertTrue(any(issue.startswith("cover_letter_") for issue in issues))
+        self.assertTrue(any("broken_conjunction" in issue or "duplicate_word" in issue for issue in issues))
+
+    def test_repair_ai_tailoring_payload_keeps_valid_bullets_and_marks_partial(self) -> None:
+        generator = DocumentGenerator()
+        local_payload = DocumentTailoringPayload(
+            work_entries=[
+                ResumeWorkEntry("Role 1", "2024", ["Managed and optimized social media campaigns.", "Presented the report to leadership."])
+            ],
+            key_skills=["Dashboard Reporting"],
+            cover_letter_text="Dear Hiring Team at Acme,\n\nI am excited to apply for the Head of Marketing role with a background in reporting and operations.\n\nSincerely,\nJane",
+            route="local",
+        )
+        ai_payload = DocumentTailoringPayload(
+            work_entries=[
+                ResumeWorkEntry("Role 1", "2024", ["Improved reporting cadence and dashboard visibility for leadership.", "Presented Presented that report."])
+            ],
+            key_skills=["Dashboard Reporting", "Lead Generation"],
+            cover_letter_text="Dear Hiring Team at Acme,\n\nI am excited to apply for the Head of Marketing role and would bring experience in dashboard reporting, cross-functional execution, and audience growth.\n\nSincerely,\nJane",
+            route="openai",
+            ai_attempted=True,
+            provider="openai",
+            model="gpt-5-mini",
+        )
+        repaired, issues = generator.repair_ai_tailoring_payload(ai_payload, local_payload)
+        self.assertEqual(repaired.route, "openai")
+        self.assertEqual(repaired.resume_ai_status, "partial")
+        self.assertEqual(repaired.cover_letter_ai_status, "accepted")
+        self.assertEqual(repaired.rejected_bullets_repaired, 1)
+        self.assertEqual(repaired.work_entries[0].bullets[0], "Improved reporting cadence and dashboard visibility for leadership.")
+        self.assertEqual(repaired.work_entries[0].bullets[1], "Presented the report to leadership.")
+        self.assertTrue(any("duplicate_word" in issue for issue in issues))
+
     def test_generate_creates_files(self) -> None:
         with workspace_temp_dir() as tmp:
             generator = DocumentGenerator()

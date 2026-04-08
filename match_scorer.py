@@ -247,6 +247,7 @@ class MatchScorer:
                     "Avoid repeated openings or repeated closing clauses across bullets.",
                     "Reject any broken grammar such as duplicated verbs or dropped conjunctions.",
                     "Prefer preserving the original sentence when uncertain.",
+                    "Return a real cover letter body, not a type stub, placeholder, or signoff-only output.",
                 ]
             )
 
@@ -256,8 +257,35 @@ class MatchScorer:
             "Do not invent employers, titles, or dates. Preserve chronology. "
             "Improve wording quality and relevance while keeping claims plausibly grounded in the source resume."
         )
+        if retry_count > 0:
+            system_prompt += " Return raw JSON only. Do not include prose, markdown fences, or commentary. Do not return placeholder values for cover_letter_text."
         try:
-            text = self._create_completion(provider, model, prompt, system_prompt=system_prompt)
+            text, extraction_meta = self._create_doc_tailoring_completion(
+                provider,
+                model,
+                prompt,
+                system_prompt=system_prompt,
+            )
+            LOGGER.info(
+                "OpenAI doc tailoring extraction for %s: mode=%s shape=%s text_length=%s",
+                job.id,
+                extraction_meta.get("mode", "unknown"),
+                extraction_meta.get("shape_summary", "unknown"),
+                extraction_meta.get("text_length", 0),
+            )
+            if not text.strip():
+                LOGGER.warning(
+                    "AI document tailoring had no extractable text for %s; shape=%s",
+                    job.id,
+                    extraction_meta.get("shape_summary", "unknown"),
+                )
+                return DocumentTailoringAttempt(
+                    attempted=True,
+                    provider=provider,
+                    model=model,
+                    failure_reason="OpenAI response did not contain extractable text.",
+                    retry_count=retry_count,
+                )
             cleaned_text = self._extract_json_text(text)
             try:
                 payload = json.loads(cleaned_text)
@@ -265,7 +293,16 @@ class MatchScorer:
                 payload = json.loads(cleaned_text.replace("\r\n", "\\n").replace("\n", "\\n"))
         except json.JSONDecodeError:
             LOGGER.exception("Failed to parse AI document tailoring response for %s", job.id)
-            LOGGER.warning("AI document tailoring parse preview for %s: %s", job.id, self._safe_preview(cleaned_text if 'cleaned_text' in locals() else text if 'text' in locals() else ""))
+            LOGGER.warning(
+                "AI document tailoring parse preview for %s: %s",
+                job.id,
+                self._safe_preview(cleaned_text if 'cleaned_text' in locals() else text if 'text' in locals() else ""),
+            )
+            LOGGER.warning(
+                "AI document tailoring response shape for %s: %s",
+                job.id,
+                extraction_meta.get("shape_summary", "unknown") if 'extraction_meta' in locals() else "unknown",
+            )
             return DocumentTailoringAttempt(
                 attempted=True,
                 provider=provider,
@@ -485,14 +522,33 @@ class MatchScorer:
         return None
 
     def _build_cheap_prompt(self, job: Job, resume_data: ResumeData, *, force_escalate: bool) -> dict[str, object]:
+        screening: dict[str, object] = {}
+        if self.config.source.location and self.config.source.location.strip():
+            screening["target_location"] = self.config.source.location.strip()
+            screening["location_note"] = (
+                "Accept remote jobs regardless of location. "
+                "Accept jobs whose location is in the same metro area as target_location. "
+                "Reject jobs clearly in a different city or state."
+            )
+        if self.config.salary_floor > 0:
+            screening["salary_floor_usd"] = self.config.salary_floor
+            screening["salary_note"] = (
+                "If the job lists a salary or range, reject if the lower bound annualised "
+                "is clearly below salary_floor_usd. If salary is unlisted or ambiguous, do not reject."
+            )
         return {
             "resume_summary": self._resume_summary(resume_data),
             "job": self._job_summary(job),
             "force_escalate": force_escalate,
+            "screening_constraints": screening,
             "instructions": {
                 "return_json": True,
                 "fields": ["score", "confidence", "rationale", "strengths", "gaps"],
-                "goal": "Fast screening. Reject obvious mismatches but be recall-friendly.",
+                "goal": (
+                    "Fast screening. Apply screening_constraints first — if the job clearly fails "
+                    "location or salary constraints score it below 20. "
+                    "Otherwise reject obvious resume mismatches but be recall-friendly."
+                ),
             },
         }
 
@@ -568,6 +624,51 @@ class MatchScorer:
             "Return only valid JSON with keys score, confidence, rationale, strengths, and gaps."
         )
         return self._create_completion_with_usage_for_system(provider, model, prompt, system_prompt=system_prompt)
+
+    def _create_doc_tailoring_completion(
+        self,
+        provider: str,
+        model: str,
+        prompt: dict[str, object],
+        *,
+        system_prompt: str,
+    ) -> tuple[str, dict[str, object]]:
+        if provider != "openai":
+            text = self._create_completion(provider, model, prompt, system_prompt=system_prompt)
+            return text, {"mode": "text", "shape_summary": "non-openai", "text_length": len(text)}
+
+        client = self._build_client(provider)
+        response = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(prompt)},
+            ],
+            max_output_tokens=1200,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "document_tailoring_payload",
+                    "strict": True,
+                    "description": "Structured tailored resume and cover letter content.",
+                    "schema": self._document_tailoring_json_schema(),
+                },
+                "verbosity": "low",
+            },
+        )
+        structured = self._extract_openai_structured_payload(response)
+        if structured:
+            return structured, {
+                "mode": "json_schema",
+                "shape_summary": self._describe_openai_response_shape(response),
+                "text_length": len(structured),
+            }
+        text = self._extract_openai_response_text(response)
+        return text, {
+            "mode": "text_fallback",
+            "shape_summary": self._describe_openai_response_shape(response),
+            "text_length": len(text),
+        }
 
     def _create_completion_with_usage_for_system(
         self,
@@ -677,6 +778,59 @@ class MatchScorer:
         return "\n".join(parts).strip()
 
     @staticmethod
+    def _extract_openai_structured_payload(response: object) -> str:
+        payload_dump = None
+        if hasattr(response, "model_dump"):
+            try:
+                payload_dump = response.model_dump(mode="python")
+            except TypeError:
+                payload_dump = response.model_dump()
+        elif isinstance(response, dict):
+            payload_dump = response
+        candidate = MatchScorer._find_document_tailoring_payload(payload_dump)
+        return json.dumps(candidate, ensure_ascii=True) if candidate is not None else ""
+
+    @staticmethod
+    def _find_document_tailoring_payload(value: object) -> dict[str, object] | None:
+        if isinstance(value, dict):
+            required = {"work_entries", "key_skills", "cover_letter_text"}
+            if required.issubset(value.keys()):
+                return {
+                    "work_entries": value.get("work_entries"),
+                    "key_skills": value.get("key_skills"),
+                    "cover_letter_text": value.get("cover_letter_text"),
+                }
+            for nested in value.values():
+                found = MatchScorer._find_document_tailoring_payload(nested)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = MatchScorer._find_document_tailoring_payload(item)
+                if found is not None:
+                    return found
+        return None
+
+    @staticmethod
+    def _describe_openai_response_shape(response: object) -> str:
+        output = getattr(response, "output", None)
+        if not output:
+            return "no-output-items"
+        item_types: list[str] = []
+        for output_item in output:
+            item_type = getattr(output_item, "type", "unknown")
+            content = getattr(output_item, "content", None)
+            content_types: list[str] = []
+            if content:
+                for content_item in content:
+                    content_types.append(getattr(content_item, "type", type(content_item).__name__))
+            if content_types:
+                item_types.append(f"{item_type}({','.join(content_types)})")
+            else:
+                item_types.append(str(item_type))
+        return ";".join(item_types)
+
+    @staticmethod
     def _parse_keyword_response(text: str) -> list[str]:
         cleaned: list[str] = []
         try:
@@ -707,6 +861,33 @@ class MatchScorer:
         if len(cleaned) <= limit:
             return cleaned
         return cleaned[:limit].rstrip() + "..."
+
+    @staticmethod
+    def _document_tailoring_json_schema() -> dict[str, object]:
+        work_entry_schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "role_line": {"type": "string"},
+                "date_line": {"type": "string"},
+                "bullets": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                },
+            },
+            "required": ["role_line", "date_line", "bullets"],
+        }
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "work_entries": {"type": "array", "items": work_entry_schema},
+                "key_skills": {"type": "array", "items": {"type": "string"}},
+                "cover_letter_text": {"type": "string"},
+            },
+            "required": ["work_entries", "key_skills", "cover_letter_text"],
+        }
 
     @staticmethod
     def _parse_tailored_key_skills(value: object, fallback: list[str]) -> list[str]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from unittest.mock import MagicMock
 
@@ -87,11 +88,10 @@ class MatchScorerTests(unittest.TestCase):
         config = JobBotConfig(doc_stage_provider="openai", doc_stage_model="gpt-5-mini", openai_api_key="openai-test")
         scorer = MatchScorer(config)
         scorer._build_client = MagicMock(return_value=object())
-        scorer._create_completion = MagicMock(
+        scorer._create_doc_tailoring_completion = MagicMock(
             return_value=(
-                '{"work_entries":[{"role_line":"Role 1","date_line":"2024","bullets":["Improved reporting cadence and dashboard visibility."]}],'
-                '"key_skills":["Dashboard Reporting","Lead Generation"],'
-                '"cover_letter_text":"Dear Hiring Team at Acme,\\n\\nTest letter.\\n\\nSincerely,\\nJane"}'
+                '{"work_entries":[{"role_line":"Role 1","date_line":"2024","bullets":["Improved reporting cadence and dashboard visibility."]}],"key_skills":["Dashboard Reporting","Lead Generation"],"cover_letter_text":"Dear Hiring Team at Acme,\\n\\nTest letter.\\n\\nSincerely,\\nJane"}',
+                {"mode": "json_schema", "shape_summary": "message(output_text)", "text_length": 250},
             )
         )
         job = Job("1", "Head of Marketing", "Acme", "Remote", "", "Lead B2B growth and reporting.", "board", "https://example.com", "", "jobspy", "", "")
@@ -140,8 +140,11 @@ class MatchScorerTests(unittest.TestCase):
         )
         scorer = MatchScorer(config)
         scorer._build_client = MagicMock(return_value=object())
-        scorer._create_completion = MagicMock(
-            return_value='{"work_entries":[{"role_line":"Role 1","date_line":"2024","bullets":["Built dashboards for leadership."]}],"key_skills":["Dashboard Reporting"],"cover_letter_text":"Letter"}'
+        scorer._create_doc_tailoring_completion = MagicMock(
+            return_value=(
+                '{"work_entries":[{"role_line":"Role 1","date_line":"2024","bullets":["Built dashboards for leadership."]}],"key_skills":["Dashboard Reporting"],"cover_letter_text":"Letter"}',
+                {"mode": "json_schema", "shape_summary": "message(output_text)", "text_length": 180},
+            )
         )
         resume = ResumeData(
             "",
@@ -160,8 +163,8 @@ class MatchScorerTests(unittest.TestCase):
             DocumentTailoringPayload(work_entries=resume.work_experience_entries, key_skills=["Python"], cover_letter_text="Local"),
         )
         self.assertTrue(attempt.attempted)
-        scorer._create_completion.assert_called_once()
-        self.assertEqual(scorer._create_completion.call_args[0][1], "gpt-5-mini")
+        scorer._create_doc_tailoring_completion.assert_called_once()
+        self.assertEqual(scorer._create_doc_tailoring_completion.call_args[0][1], "gpt-5-mini")
 
     def test_tailor_documents_with_ai_rejects_invalid_openai_model_mismatch(self) -> None:
         config = JobBotConfig(
@@ -181,3 +184,124 @@ class MatchScorerTests(unittest.TestCase):
     def test_extract_json_text_recovers_markdown_wrapped_json(self) -> None:
         cleaned = MatchScorer._extract_json_text("```json\nbefore\n{\"key\": 1}\nafter\n```")
         self.assertEqual(cleaned, '{"key": 1}')
+
+    def test_create_doc_tailoring_completion_extracts_structured_payload_from_model_dump(self) -> None:
+        config = JobBotConfig(doc_stage_provider="openai", doc_stage_model="gpt-5-mini", openai_api_key="openai-test")
+        scorer = MatchScorer(config)
+
+        class FakeResponse:
+            output = []
+
+            def model_dump(self, mode: str = "python") -> dict[str, object]:
+                return {
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [],
+                        }
+                    ],
+                    "response": {
+                        "work_entries": [
+                            {"role_line": "Role 1", "date_line": "2024", "bullets": ["Built dashboards for leadership."]}
+                        ],
+                        "key_skills": ["Dashboard Reporting"],
+                        "cover_letter_text": "Letter",
+                    },
+                }
+
+        fake_client = MagicMock()
+        fake_client.responses.create.return_value = FakeResponse()
+        scorer._build_client = MagicMock(return_value=fake_client)
+
+        text, meta = scorer._create_doc_tailoring_completion(
+            "openai",
+            "gpt-5-mini",
+            {"job": "test"},
+            system_prompt="Return JSON",
+        )
+        payload = json.loads(text)
+        self.assertEqual(payload["key_skills"], ["Dashboard Reporting"])
+        self.assertEqual(meta["mode"], "json_schema")
+
+    def test_create_doc_tailoring_completion_extracts_text_content_fallback(self) -> None:
+        config = JobBotConfig(doc_stage_provider="openai", doc_stage_model="gpt-5-mini", openai_api_key="openai-test")
+        scorer = MatchScorer(config)
+
+        class Content:
+            def __init__(self, text: str) -> None:
+                self.type = "output_text"
+                self.text = text
+
+        class OutputItem:
+            def __init__(self, text: str) -> None:
+                self.type = "message"
+                self.content = [Content(text)]
+
+        class FakeResponse:
+            def __init__(self, text: str) -> None:
+                self.output = [OutputItem(text)]
+
+        fake_client = MagicMock()
+        fake_client.responses.create.return_value = FakeResponse('{"work_entries":[],"key_skills":[],"cover_letter_text":"Letter"}')
+        scorer._build_client = MagicMock(return_value=fake_client)
+
+        text, meta = scorer._create_doc_tailoring_completion(
+            "openai",
+            "gpt-5-mini",
+            {"job": "test"},
+            system_prompt="Return JSON",
+        )
+        self.assertEqual(json.loads(text)["cover_letter_text"], "Letter")
+        self.assertEqual(meta["mode"], "text_fallback")
+
+    def test_tailor_documents_with_ai_reports_no_extractable_text(self) -> None:
+        config = JobBotConfig(doc_stage_provider="openai", doc_stage_model="gpt-5-mini", openai_api_key="openai-test")
+        scorer = MatchScorer(config)
+        scorer._build_client = MagicMock(return_value=object())
+        scorer._create_doc_tailoring_completion = MagicMock(
+            return_value=("", {"mode": "text_fallback", "shape_summary": "no-output-items", "text_length": 0})
+        )
+        resume = ResumeData(
+            "",
+            "",
+            "Jane",
+            "jane@example.com",
+            "",
+            "Summary",
+            ["Python"],
+            ["Built APIs"],
+            work_experience_entries=[ResumeWorkEntry("Role 1", "2024", ["Built dashboards"])],
+        )
+        attempt = scorer.tailor_documents_with_ai(
+            Job("1", "Head of Marketing", "Acme", "Remote", "", "Lead B2B growth", "board", "", "", "jobspy", "", ""),
+            resume,
+            DocumentTailoringPayload(work_entries=resume.work_experience_entries, key_skills=["Python"], cover_letter_text="Local"),
+        )
+        self.assertTrue(attempt.attempted)
+        self.assertEqual(attempt.failure_reason, "OpenAI response did not contain extractable text.")
+
+    def test_tailor_documents_with_ai_reports_invalid_json(self) -> None:
+        config = JobBotConfig(doc_stage_provider="openai", doc_stage_model="gpt-5-mini", openai_api_key="openai-test")
+        scorer = MatchScorer(config)
+        scorer._build_client = MagicMock(return_value=object())
+        scorer._create_doc_tailoring_completion = MagicMock(
+            return_value=("not json at all", {"mode": "text_fallback", "shape_summary": "message(output_text)", "text_length": 14})
+        )
+        resume = ResumeData(
+            "",
+            "",
+            "Jane",
+            "jane@example.com",
+            "",
+            "Summary",
+            ["Python"],
+            ["Built APIs"],
+            work_experience_entries=[ResumeWorkEntry("Role 1", "2024", ["Built dashboards"])],
+        )
+        attempt = scorer.tailor_documents_with_ai(
+            Job("1", "Head of Marketing", "Acme", "Remote", "", "Lead B2B growth", "board", "", "", "jobspy", "", ""),
+            resume,
+            DocumentTailoringPayload(work_entries=resume.work_experience_entries, key_skills=["Python"], cover_letter_text="Local"),
+        )
+        self.assertTrue(attempt.attempted)
+        self.assertEqual(attempt.failure_reason, "OpenAI response could not be parsed as JSON.")
