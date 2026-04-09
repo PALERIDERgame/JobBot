@@ -18,6 +18,8 @@ LOGGER = logging.getLogger(__name__)
 PROMPT_VERSION = "cost_funnel_v2"
 
 OPENAI_PRICE_PER_MTOKEN = {
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    "gpt-4o": {"input": 2.50, "output": 10.00},
     "gpt-5-nano": {"input": 0.20, "output": 1.25},
     "gpt-5-mini": {"input": 0.25, "output": 2.00},
 }
