@@ -625,7 +625,14 @@ class MatchScorer:
                 system=system_prompt,
                 messages=[{"role": "user", "content": json.dumps(prompt)}],
             )
-            text = "".join(block.text for block in response.content if getattr(block, "type", "") == "text").strip()
+            text = ""
+            for block in response.content:
+                block_text = getattr(block, "text", None)
+                if block_text:
+                    text = block_text.strip()
+                    break
+            if not text:
+                LOGGER.warning("Anthropic returned empty text. stop_reason=%s content=%r", getattr(response, "stop_reason", None), response.content)
             usage = getattr(response, "usage", None)
             return text, int(getattr(usage, "input_tokens", 0) or 0), int(getattr(usage, "output_tokens", 0) or 0)
 
@@ -656,7 +663,11 @@ class MatchScorer:
                 system=system_prompt,
                 messages=[{"role": "user", "content": json.dumps(prompt)}],
             )
-            return "".join(block.text for block in response.content if getattr(block, "type", "") == "text").strip()
+            for block in response.content:
+                block_text = getattr(block, "text", None)
+                if block_text:
+                    return block_text.strip()
+            return ""
         response = client.chat.completions.create(
             model=model,
             messages=[
