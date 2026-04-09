@@ -133,11 +133,14 @@ _INFERENCE_BLOCKLIST = (
 class GeneratedDocs:
     output_dir: Path
     resume_pdf_path: Path
-    cover_letter_path: Path
+    cover_letter_pdf_path: Path
     resume_docx_path: Path = Path()
+    cover_letter_docx_path: Path = Path()
+    cover_letter_txt_path: Path = Path()
     status: str = "generated"
     error_message: str = ""
     pdf_exporter_used: str = ""
+    cover_letter_pdf_exporter_used: str = ""
     page_fit_attempts: int = 0
 
 
@@ -184,15 +187,20 @@ class DocumentGenerator:
 
         staged_resume_pdf_path = staging_dir / "resume.pdf"
         staged_resume_docx_path = staging_dir / "resume.docx"
-        staged_cover_letter_path = staging_dir / "cover_letter.txt"
+        staged_cover_letter_txt_path = staging_dir / "cover_letter.txt"
+        staged_cover_letter_docx_path = staging_dir / "cover_letter.docx"
+        staged_cover_letter_pdf_path = staging_dir / "cover_letter.pdf"
         resume_pdf_path = output_dir / "resume.pdf"
         resume_docx_path = output_dir / "resume.docx"
-        cover_letter_path = output_dir / "cover_letter.txt"
+        cover_letter_txt_path = output_dir / "cover_letter.txt"
+        cover_letter_docx_path = output_dir / "cover_letter.docx"
+        cover_letter_pdf_path = output_dir / "cover_letter.pdf"
         source_path = Path(resume.source_path) if resume.source_path else None
 
         status = "generated"
         error_message = ""
         pdf_exporter_used = ""
+        cover_letter_pdf_exporter_used = ""
         page_fit_attempts = 0
         if source_path and source_path.suffix.lower() == ".docx" and source_path.exists():
             fit_attempts = self._build_fit_attempts(resume, job)
@@ -230,11 +238,14 @@ class DocumentGenerator:
                     return GeneratedDocs(
                         output_dir=output_dir,
                         resume_pdf_path=Path(),
-                        cover_letter_path=Path(),
+                        cover_letter_pdf_path=Path(),
                         resume_docx_path=Path(),
+                        cover_letter_docx_path=Path(),
+                        cover_letter_txt_path=Path(),
                         status="failed",
                         error_message=str(exc),
                         pdf_exporter_used=pdf_exporter_used,
+                        cover_letter_pdf_exporter_used=cover_letter_pdf_exporter_used,
                         page_fit_attempts=page_fit_attempts,
                     )
                 raise
@@ -245,27 +256,39 @@ class DocumentGenerator:
             staged_resume_docx_path = Path()
 
         report("writing_cover_letter", "Writing cover letter...", 6)
-        self._build_cover_letter(
-            staged_cover_letter_path,
+        cover_letter_text = self._build_cover_letter_text(
             job,
             resume,
             score,
             ai_notes=ai_notes,
             tailoring_payload=tailoring_payload,
         )
+        staged_cover_letter_txt_path.write_text(cover_letter_text, encoding="utf-8")
+        self._build_cover_letter_docx(staged_cover_letter_docx_path, cover_letter_text)
+        try:
+            cover_letter_pdf_exporter_used = self._export_docx_to_pdf(staged_cover_letter_docx_path, staged_cover_letter_pdf_path)
+        except Exception as exc:
+            status = "generated_cover_letter_docx_only" if status == "generated" else status
+            error_message = str(exc) if not error_message else error_message
+            staged_cover_letter_pdf_path = Path()
         resume_docx_path = self._promote_staged_file(staged_resume_docx_path, resume_docx_path)
         resume_pdf_path = self._promote_staged_file(staged_resume_pdf_path, resume_pdf_path)
-        cover_letter_path = self._promote_staged_file(staged_cover_letter_path, cover_letter_path)
+        cover_letter_txt_path = self._promote_staged_file(staged_cover_letter_txt_path, cover_letter_txt_path)
+        cover_letter_docx_path = self._promote_staged_file(staged_cover_letter_docx_path, cover_letter_docx_path)
+        cover_letter_pdf_path = self._promote_staged_file(staged_cover_letter_pdf_path, cover_letter_pdf_path)
         shutil.rmtree(staging_dir, ignore_errors=True)
         LOGGER.info("Generated documents for %s at %s", job.id, output_dir)
         return GeneratedDocs(
             output_dir=output_dir,
             resume_pdf_path=resume_pdf_path,
-            cover_letter_path=cover_letter_path,
+            cover_letter_pdf_path=cover_letter_pdf_path,
             resume_docx_path=resume_docx_path,
+            cover_letter_docx_path=cover_letter_docx_path,
+            cover_letter_txt_path=cover_letter_txt_path,
             status=status,
             error_message=error_message,
             pdf_exporter_used=pdf_exporter_used,
+            cover_letter_pdf_exporter_used=cover_letter_pdf_exporter_used,
             page_fit_attempts=page_fit_attempts,
         )
 
@@ -403,16 +426,15 @@ class DocumentGenerator:
             )
         doc.build(story)
 
-    def _build_cover_letter(
+    def _build_cover_letter_text(
         self,
-        path: Path,
         job: Job,
         resume: ResumeData,
         score: MatchScore,
         *,
         ai_notes: str,
         tailoring_payload: DocumentTailoringPayload | None = None,
-    ) -> None:
+    ) -> str:
         clean_employer = self._display_employer(job.employer)
         signoff_name = self._signoff_name(resume)
         if tailoring_payload and tailoring_payload.cover_letter_text:
@@ -434,7 +456,19 @@ class DocumentGenerator:
             )
         else:
             letter_text = self._compose_cover_letter(job, resume, score, clean_employer, signoff_name)
-        path.write_text(letter_text, encoding="utf-8")
+        return letter_text
+
+    @staticmethod
+    def _build_cover_letter_docx(path: Path, letter_text: str) -> None:
+        try:
+            from docx import Document as DocxDocument
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError("python-docx is required to generate DOCX cover letters") from exc
+
+        document = DocxDocument()
+        for line in letter_text.splitlines():
+            document.add_paragraph(line)
+        document.save(str(path))
 
     def _export_docx_to_pdf(self, docx_path: Path, pdf_path: Path) -> str:
         """Export docx to PDF. Returns the exporter name used ('word_com' or 'libreoffice')."""

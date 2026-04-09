@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from application_routing import EmailApplyAssessment, assess_email_apply
 from config import AppPaths, JobBotConfig, resolve_output_dir
 from deterministic_filter import apply_deterministic_filter
 from database import Database, Job
@@ -52,6 +53,8 @@ class JobBotPipeline:
         self.portal_filler = PortalFiller(headless=True)
         self.portal_readiness = self.portal_filler.check_readiness()
         self._log_portal_readiness("startup", self.portal_readiness)
+        gmail_ready, gmail_summary = self.gmail_client.readiness_status()
+        LOGGER.info("Gmail readiness: %s (%s)", gmail_summary, "ready" if gmail_ready else "not_ready")
 
     @staticmethod
     def _log_portal_readiness(context: str, readiness: PortalAutofillReadiness) -> None:
@@ -221,7 +224,7 @@ class JobBotPipeline:
                         jobs_seen=jobs_seen,
                         jobs_matched=jobs_matched,
                     )
-                    delivery = self._deliver(job, strong_eval.to_match_score(self.config.final_apply_threshold), docs)
+                    delivery = self._deliver(job, resume, strong_eval.to_match_score(self.config.final_apply_threshold), docs)
                     self.database.record_delivery(
                         job.id,
                         method=delivery.method,
@@ -362,7 +365,9 @@ class JobBotPipeline:
             output_dir=str(docs.output_dir),
             resume_docx_path=str(docs.resume_docx_path) if docs.resume_docx_path != Path() else "",
             resume_pdf_path=str(docs.resume_pdf_path) if docs.resume_pdf_path != Path() else "",
-            cover_letter_path=str(docs.cover_letter_path),
+            cover_letter_path=str(docs.cover_letter_txt_path) if docs.cover_letter_txt_path != Path() else "",
+            cover_letter_docx_path=str(docs.cover_letter_docx_path) if docs.cover_letter_docx_path != Path() else "",
+            cover_letter_pdf_path=str(docs.cover_letter_pdf_path) if docs.cover_letter_pdf_path != Path() else "",
             status=docs.status,
             error_message=docs.error_message,
             generated_at=datetime.now(timezone.utc).isoformat(),
@@ -542,8 +547,17 @@ class JobBotPipeline:
         lowered = failure_reason.lower()
         return "parsed as json" in lowered or "payload structure" in lowered
 
-    def _deliver(self, job: Job, score: MatchScore, docs: GeneratedDocs) -> DeliveryResult:
-        return self.gmail_client.deliver_match(job, score, docs, allow_fallback=False)
+    def _deliver(self, job: Job, resume: ResumeData, score: MatchScore, docs: GeneratedDocs) -> DeliveryResult:
+        assessment = self._assess_email_delivery(job)
+        if not assessment.is_explicit:
+            return DeliveryResult("manual", "blocked_hr_email", "", f"Blocked send: {assessment.reason}")
+        return self.gmail_client.deliver_match(
+            job,
+            score,
+            docs,
+            sender_name=self.doc_generator._signoff_name(resume),
+            allow_fallback=False,
+        )
 
     def generate_documents_for_job(self, job_id: str, *, progress_callback=None) -> GeneratedDocs:
         LOGGER.info("Manual document generation started for %s", job_id)
@@ -628,8 +642,10 @@ class JobBotPipeline:
         docs = GeneratedDocs(
             output_dir=Path(row["output_dir"]) if row["output_dir"] else Path(),
             resume_pdf_path=Path(row["resume_pdf_path"]) if row["resume_pdf_path"] else Path(),
-            cover_letter_path=Path(row["cover_letter_path"]) if row["cover_letter_path"] else Path(),
+            cover_letter_pdf_path=Path(row["cover_letter_pdf_path"]) if row.get("cover_letter_pdf_path") else Path(),
             resume_docx_path=Path(row["resume_docx_path"]) if row.get("resume_docx_path") else Path(),
+            cover_letter_docx_path=Path(row["cover_letter_docx_path"]) if row.get("cover_letter_docx_path") else Path(),
+            cover_letter_txt_path=Path(row["cover_letter_path"]) if row["cover_letter_path"] else Path(),
             status=row.get("document_status", "pending"),
             error_message=row.get("document_error", ""),
         )
@@ -640,8 +656,8 @@ class JobBotPipeline:
         )
         docs_missing = (
             resume_missing
-            or not row["cover_letter_path"]
-            or not docs.cover_letter_path.exists()
+            or not row.get("cover_letter_pdf_path")
+            or not docs.cover_letter_pdf_path.exists()
         )
         if self.config.automation_mode == "semi_auto" and docs_missing:
             raise ValueError("Generate documents first before approving and sending in semi_auto.")
@@ -691,19 +707,32 @@ class JobBotPipeline:
         progress_callback=None,
     ) -> ApprovalResult:
         if job.apply_method == "email":
-            self._emit_progress(progress_callback, "sending_email", "Sending employer email application...", 6)
-            result = self.gmail_client.deliver_match(job, score, docs, allow_fallback=False)
-            if result.status == "failed" and not job.hiring_manager_email:
-                result.error_message = "Employer email not detected for this job."
+            assessment = self._assess_email_delivery(job)
+            if not assessment.is_explicit:
+                self._emit_progress(progress_callback, "blocked_email", "Blocking send because no validated HR email is present...", 6)
+                result = DeliveryResult("manual", "blocked_hr_email", "", f"Blocked send: {assessment.reason}")
+            else:
+                self._emit_progress(progress_callback, "sending_email", "Sending employer email application...", 6)
+                result = self.gmail_client.deliver_match(
+                    job,
+                    score,
+                    docs,
+                    sender_name=self.doc_generator._signoff_name(resume),
+                    allow_fallback=False,
+                )
             log = "\n".join(
                 [
                     "Route: email",
                     f"Documents: {docs_action}",
+                    f"HR email: {assessment.confidence}",
+                    f"HR email review: {assessment.reason}",
+                    f"Validated HR recipient: {assessment.email or 'Not present'}",
                     f"Final status: {result.status} via {result.method}",
                     f"Message: {result.error_message or 'Application email sent.'}",
                 ]
             )
-            return ApprovalResult(result, log, "email", docs_action, "")
+            route = "email" if assessment.is_explicit else "manual"
+            return ApprovalResult(result, log, route, docs_action, "")
         if not job.apply_url:
             result = DeliveryResult("manual", "failed", "", "No application URL available for manual or portal apply.")
             log = "\n".join(
@@ -862,6 +891,10 @@ class JobBotPipeline:
         self.portal_readiness = self.portal_filler.check_readiness()
         self._log_portal_readiness("refresh", self.portal_readiness)
         return self.portal_readiness
+
+    @staticmethod
+    def _assess_email_delivery(job: Job) -> EmailApplyAssessment:
+        return assess_email_apply(job.description_full or "", job.apply_url, existing_email=job.hiring_manager_email or "")
 
     @staticmethod
     def _open_apply_url(apply_url: str) -> bool:

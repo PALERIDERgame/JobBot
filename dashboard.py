@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from application_routing import EmailApplyAssessment, assess_email_apply
 from config import AppPaths, JobBotConfig, load_or_create_config, save_config
 from database import Database
 from match_scorer import MatchScorer
@@ -111,6 +112,7 @@ class JobBotDashboard:
         self.pipeline = JobBotPipeline(config, paths, database)
         self.status_var = tk.StringVar(value="Ready")
         self.portal_readiness_var = tk.StringVar(value="Portal autofill: checking...")
+        self.gmail_readiness_var = tk.StringVar(value="Gmail send readiness: checking...")
 
         self.resume_var = tk.StringVar(value=config.resume_source_path)
         self.threshold_var = tk.StringVar(value=str(config.scoring_threshold))
@@ -179,6 +181,7 @@ class JobBotDashboard:
         self._source_provider_user_set = False
         self._build_ui()
         self._refresh_portal_readiness()
+        self._refresh_gmail_readiness()
         self.refresh_view()
 
     def _build_ui(self) -> None:
@@ -345,6 +348,9 @@ class JobBotDashboard:
         portal_test_button.grid(row=0, column=1, sticky="e", padx=(8, 0))
         self.portal_test_buttons.append(portal_test_button)
         self._add_tooltip(portal_test_button, "Run an in-app headless Chromium launch check and report the exact portal runtime readiness.")
+        gmail_status = ttk.Label(frame, textvariable=self.gmail_readiness_var)
+        gmail_status.grid(row=len(labels) + 3, column=1, columnspan=2, sticky="w", pady=(6, 0))
+        self._add_tooltip(gmail_status, "Shows whether Gmail email sending looks configured before you try Approve and Send on email jobs.")
 
     def _build_run_tab(self, frame: ttk.Frame) -> None:
         top = ttk.Frame(frame)
@@ -374,7 +380,7 @@ class JobBotDashboard:
         self._add_tooltip(self.cost_text, "Tracked estimated API costs by stage.")
 
     def _build_review_tab(self, frame: ttk.Frame) -> None:
-        columns = ("title", "employer", "posted_at", "score", "source", "email", "document_status", "delivery_status")
+        columns = ("title", "employer", "posted_at", "score", "source", "hr_email", "document_status", "delivery_status")
         tree_container = ttk.Frame(frame)
         tree_container.pack(fill="both", expand=True)
         tree_container.columnconfigure(0, weight=1)
@@ -382,12 +388,13 @@ class JobBotDashboard:
 
         tree = ttk.Treeview(tree_container, columns=columns, show="headings", height=18)
         for column in columns:
-            tree.heading(column, text=column.replace("_", " ").title(), command=lambda col=column: self._sort_review_rows(col))
+            heading_text = "HR Email" if column == "hr_email" else column.replace("_", " ").title()
+            tree.heading(column, text=heading_text, command=lambda col=column: self._sort_review_rows(col))
             tree.column(column, width=150, anchor="w")
         tree.column("title", width=250)
         tree.column("employer", width=180)
         tree.column("posted_at", width=150)
-        tree.column("email", width=90, anchor="center")
+        tree.column("hr_email", width=90, anchor="center")
         review_scrollbar = ttk.Scrollbar(tree_container, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=review_scrollbar.set)
         tree.grid(row=0, column=0, sticky="nsew")
@@ -425,6 +432,9 @@ class JobBotDashboard:
         portal_status = ttk.Label(buttons, textvariable=self.portal_readiness_var)
         portal_status.pack(side="left", padx=(12, 0))
         self._add_tooltip(portal_status, "Shows whether browser-based portal autofill is available on this machine.")
+        gmail_status = ttk.Label(buttons, textvariable=self.gmail_readiness_var)
+        gmail_status.pack(side="left", padx=(12, 0))
+        self._add_tooltip(gmail_status, "Shows whether Gmail email sending looks configured before you try Approve and Send on email jobs.")
 
         progress_frame = ttk.Frame(frame)
         progress_frame.pack(fill="x", pady=(8, 0))
@@ -579,6 +589,7 @@ class JobBotDashboard:
             self.config = updated_config
             self.pipeline = JobBotPipeline(self.config, self.paths, self.database)
             self._refresh_portal_readiness()
+            self._refresh_gmail_readiness()
             if show_status_only:
                 self.status_var.set("Settings saved.")
             return True
@@ -709,7 +720,14 @@ class JobBotDashboard:
         employer = str(row.get("employer") or "this employer")
         apply_method = str(row.get("apply_method") or "")
         if apply_method == "email":
-            destination = str(row.get("hiring_manager_email") or "the detected employer email")
+            assessment = self._email_apply_assessment_for_row(row)
+            destination = assessment.email or str(row.get("hiring_manager_email") or "the detected HR email")
+            if not assessment.is_explicit:
+                return (
+                    f"HR email sending is blocked for {title} at {employer}.",
+                    f"JobBot will not send to {destination}. {assessment.reason}",
+                    "Continue",
+                )
             return (
                 f"You are about to send an application email for {title} at {employer}.",
                 f"This will send the generated resume and cover letter to {destination}. Make sure the documents look right before continuing.",
@@ -768,6 +786,7 @@ class JobBotDashboard:
 
     def refresh_view(self) -> None:
         self._refresh_portal_readiness()
+        self._refresh_gmail_readiness()
         self._refresh_logs()
         self._refresh_costs()
         self._refresh_runs()
@@ -837,7 +856,7 @@ class JobBotDashboard:
                     self._format_posted_at(str(row.get("posted_at") or "")),
                     row["score"],
                     row["source"],
-                    self._email_status(row),
+                    self._hr_email_status(row),
                     row["document_status"],
                     row["delivery_status"],
                 ),
@@ -850,8 +869,8 @@ class JobBotDashboard:
             value = row.get(self._review_sort_column)
             if self._review_sort_column == "score":
                 return int(value or 0)
-            if self._review_sort_column == "email":
-                return self._email_status(row)
+            if self._review_sort_column == "hr_email":
+                return self._hr_email_status(row)
             return str(value or "").lower()
 
         return sorted(self._review_rows, key=sort_value, reverse=self._review_sort_desc)
@@ -887,6 +906,7 @@ class JobBotDashboard:
             self.details_text.delete("1.0", tk.END)
             self.details_text.insert("1.0", "Select a job to review its description, match notes, and generated files.")
             return
+        email_assessment = self._email_apply_assessment_for_row(row)
         details = "\n".join(
             [
                 f"Title: {row['title']}",
@@ -898,12 +918,14 @@ class JobBotDashboard:
                 f"Score: {row['score']}",
                 f"Match status: {row['match_status']}",
                 f"Apply method: {row['apply_method']}",
+                f"HR email: {email_assessment.confidence}",
                 f"Portal autofill readiness: {self._portal_readiness_for_row(row)}",
-                f"Destination email: {row['hiring_manager_email'] or 'Not detected'}",
+                f"HR email destination: {row['hiring_manager_email'] or 'Not present'}",
                 f"Delivery status: {row['delivery_status']}",
                 f"Delivery method: {row['delivery_method']}",
                 f"Apply URL: {row['apply_url']}",
                 f"Delivery detail: {row['delivery_error'] or 'None'}",
+                f"HR email review: {email_assessment.reason}",
                 "",
                 "Match rationale:",
                 row["rationale"] or "No rationale available.",
@@ -914,8 +936,11 @@ class JobBotDashboard:
                 "Generated resume (PDF):",
                 self._document_status_text(row["resume_pdf_path"]),
                 "",
-                "Generated cover letter:",
-                self._document_status_text(row["cover_letter_path"]),
+                "Generated cover letter (DOCX):",
+                self._document_status_text(row.get("cover_letter_docx_path", "")),
+                "",
+                "Generated cover letter (PDF):",
+                self._document_status_text(row.get("cover_letter_pdf_path", "")),
                 "",
                 f"Document status: {row['document_status']}",
                 f"Generated at: {self._format_generated_at(str(row.get('generated_at') or '')) or 'Not generated'}",
@@ -969,8 +994,18 @@ class JobBotDashboard:
         return int(row.get("tailoring_retry_count") or 0) > 0
 
     @staticmethod
-    def _email_status(row: dict[str, object]) -> str:
+    def _hr_email_status(row: dict[str, object]) -> str:
         return "present" if str(row.get("hiring_manager_email") or "").strip() else "not present"
+
+    @staticmethod
+    def _email_apply_assessment_for_row(row: dict[str, object]):
+        if str(row.get("apply_method") or "") != "email" and not str(row.get("hiring_manager_email") or "").strip():
+            return EmailApplyAssessment(False, "", "not present", "No validated HR/application email was found in the posting.")
+        return assess_email_apply(
+            str(row.get("description_full") or ""),
+            str(row.get("apply_url") or ""),
+            existing_email=str(row.get("hiring_manager_email") or ""),
+        )
 
     @staticmethod
     def _doc_section_status(value: str) -> str:
@@ -1000,7 +1035,7 @@ class JobBotDashboard:
         row = self._selected_row()
         if not row:
             return
-        cover_letter_path = row["cover_letter_path"]
+        cover_letter_path = row.get("cover_letter_pdf_path") or row.get("cover_letter_docx_path") or row.get("cover_letter_path")
         if not cover_letter_path:
             messagebox.showwarning("Job Bot", "No generated cover letter is available for this row yet. Click Generate first.")
             return
@@ -1182,6 +1217,12 @@ class JobBotDashboard:
         if callable(readiness_fn):
             readiness = readiness_fn()
             self.portal_readiness_var.set(readiness.summary)
+
+    def _refresh_gmail_readiness(self) -> None:
+        readiness_fn = getattr(getattr(self.pipeline, "gmail_client", None), "readiness_status", None)
+        if callable(readiness_fn):
+            _ready, summary = readiness_fn()
+            self.gmail_readiness_var.set(summary)
 
     def _portal_readiness_for_row(self, row: dict[str, object]) -> str:
         if str(row.get("apply_method") or "") == "email":

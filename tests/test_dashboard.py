@@ -13,10 +13,26 @@ from dashboard import JobBotDashboard
 from doc_generator import GeneratedDocs
 from database import Job
 from gmail_client import DeliveryResult
+from portal_filler import PortalAutofillReadiness
 from test_support import workspace_temp_dir
 
 
 class DashboardSmokeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._portal_readiness_patcher = patch(
+            "pipeline.PortalFiller.check_readiness",
+            return_value=PortalAutofillReadiness(
+                ready=False,
+                summary="Portal autofill: unavailable (test stub)",
+                reason_code="test_stub",
+                technical_detail="",
+            ),
+        )
+        self._portal_readiness_patcher.start()
+
+    def tearDown(self) -> None:
+        self._portal_readiness_patcher.stop()
+
     @unittest.skipIf(os.environ.get("CI") == "true", "Skipping Tk smoke test in CI")
     def test_dashboard_dependencies_initialize(self) -> None:
         with workspace_temp_dir() as tmp:
@@ -218,20 +234,32 @@ class DashboardSmokeTests(unittest.TestCase):
                             target_dir = self.base / "output"
                             target_dir.mkdir(parents=True, exist_ok=True)
                             resume_pdf = target_dir / "resume.pdf"
-                            cover = target_dir / "cover_letter.txt"
+                            cover_txt = target_dir / "cover_letter.txt"
+                            cover_docx = target_dir / "cover_letter.docx"
+                            cover_pdf = target_dir / "cover_letter.pdf"
                             resume_pdf.write_text("pdf", encoding="utf-8")
-                            cover.write_text("cover", encoding="utf-8")
+                            cover_txt.write_text("cover", encoding="utf-8")
+                            cover_docx.write_text("docx", encoding="utf-8")
+                            cover_pdf.write_text("pdf", encoding="utf-8")
                             self.db.record_generated_documents(
                                 job_id,
                                 output_dir=str(target_dir),
                                 resume_docx_path="",
                                 resume_pdf_path=str(resume_pdf),
-                                cover_letter_path=str(cover),
+                                cover_letter_path=str(cover_txt),
+                                cover_letter_docx_path=str(cover_docx),
+                                cover_letter_pdf_path=str(cover_pdf),
                                 status="generated",
                                 error_message="",
                                 generated_at="2026-04-07T16:52:00+00:00",
                             )
-                            return GeneratedDocs(output_dir=target_dir, resume_pdf_path=resume_pdf, cover_letter_path=cover)
+                            return GeneratedDocs(
+                                output_dir=target_dir,
+                                resume_pdf_path=resume_pdf,
+                                cover_letter_pdf_path=cover_pdf,
+                                cover_letter_docx_path=cover_docx,
+                                cover_letter_txt_path=cover_txt,
+                            )
 
                     dashboard.pipeline = FakePipeline(database, Path(tmp))
                     dashboard._generate_documents_for_selected()
@@ -301,7 +329,7 @@ class DashboardSmokeTests(unittest.TestCase):
                     database.close()
 
     @unittest.skipIf(os.environ.get("CI") == "true", "Skipping Tk smoke test in CI")
-    def test_review_queue_shows_email_presence_column(self) -> None:
+    def test_review_queue_shows_hr_email_presence_column(self) -> None:
         with workspace_temp_dir() as tmp:
             with patch.dict(os.environ, {"APPDATA": str(tmp)}):
                 paths = build_app_paths()
@@ -343,6 +371,64 @@ class DashboardSmokeTests(unittest.TestCase):
                         dashboard = JobBotDashboard(root, config, paths, database)
                         values = dashboard.review_tree.item("email-present-row", "values")
                         self.assertEqual(values[5], "present")
+                    finally:
+                        root.destroy()
+                finally:
+                    database.close()
+
+    @unittest.skipIf(os.environ.get("CI") == "true", "Skipping Tk smoke test in CI")
+    def test_review_details_show_not_present_hr_email(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                database = Database(paths.database_file)
+                database.initialize()
+                try:
+                    database.upsert_job(
+                        Job(
+                            id="email-risk-row",
+                            title="VP Communications",
+                            employer="Acme",
+                            location="New York, NY, US",
+                            salary_range="",
+                            description_full=(
+                                "For privacy questions, contact compliance@acme.com.\n"
+                                "This inbox is not monitored for application status updates."
+                            ),
+                            apply_method="email",
+                            apply_url="https://example.com/job",
+                            hiring_manager_email="compliance@acme.com",
+                            source="indeed",
+                            posted_at="2026-04-01",
+                            scraped_at="2026-04-01T12:00:00+00:00",
+                        ),
+                        {},
+                    )
+                    database.record_match_result(
+                        "email-risk-row",
+                        score=70,
+                        rationale="Queued for review",
+                        strengths=[],
+                        gaps=[],
+                        is_match=True,
+                        status="review",
+                        error_message="",
+                        scored_at="2026-04-01T12:05:00+00:00",
+                    )
+                    root = tk.Tk()
+                    root.withdraw()
+                    try:
+                        dashboard = JobBotDashboard(root, config, paths, database)
+                        dashboard.review_tree.selection_set("email-risk-row")
+                        dashboard._refresh_selected_details()
+                        details = dashboard.details_text.get("1.0", tk.END)
+                        self.assertIn("HR email: not present", details)
+                        self.assertIn("HR email review: No validated HR/application email was found in the posting.", details)
+                        heading, body, button = dashboard._approve_and_send_confirmation_copy(database.get_review_row("email-risk-row"))
+                        self.assertIn("blocked", heading.lower())
+                        self.assertIn("will not send", body.lower())
+                        self.assertEqual(button, "Continue")
                     finally:
                         root.destroy()
                 finally:
@@ -412,6 +498,30 @@ class DashboardSmokeTests(unittest.TestCase):
                     root.destroy()
 
     @unittest.skipIf(os.environ.get("CI") == "true", "Skipping Tk smoke test in CI")
+    def test_dashboard_shows_gmail_readiness(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                database = Database(paths.database_file)
+                database.initialize()
+                root = tk.Tk()
+                root.withdraw()
+                try:
+                    dashboard = JobBotDashboard(root, config, paths, database)
+                    dashboard.pipeline.gmail_client.readiness_status = lambda: (
+                        False,
+                        "Gmail send readiness: authentication required",
+                    )
+                    dashboard._refresh_gmail_readiness()
+                    self.assertEqual(
+                        dashboard.gmail_readiness_var.get(),
+                        "Gmail send readiness: authentication required",
+                    )
+                finally:
+                    root.destroy()
+
+    @unittest.skipIf(os.environ.get("CI") == "true", "Skipping Tk smoke test in CI")
     def test_approve_and_send_confirmation_copy_for_email_job(self) -> None:
         with workspace_temp_dir() as tmp:
             with patch.dict(os.environ, {"APPDATA": str(tmp)}):
@@ -428,6 +538,8 @@ class DashboardSmokeTests(unittest.TestCase):
                             "title": "Head of Marketing",
                             "employer": "Acme",
                             "apply_method": "email",
+                            "apply_url": "https://example.com/job",
+                            "description_full": "Please send your resume and cover letter to talent@example.com to apply.",
                             "hiring_manager_email": "talent@example.com",
                         }
                     )

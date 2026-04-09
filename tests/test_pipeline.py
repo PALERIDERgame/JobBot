@@ -9,15 +9,62 @@ from unittest.mock import patch
 from config import build_app_paths, load_or_create_config
 from database import Database, Job
 from document_tailoring import DocumentTailoringAttempt, DocumentTailoringPayload
+from doc_generator import GeneratedDocs
 from gmail_client import DeliveryResult
 from match_scorer import StageEvaluation
 from pipeline import JobBotPipeline
-from portal_filler import PortalResult
+from portal_filler import PortalAutofillReadiness, PortalResult
 from resume_parser import ResumeData, ResumeWorkEntry
 from test_support import workspace_temp_dir
 
 
 class PipelineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._portal_readiness_patcher = patch(
+            "pipeline.PortalFiller.check_readiness",
+            return_value=PortalAutofillReadiness(
+                ready=False,
+                summary="Portal autofill: unavailable (test stub)",
+                reason_code="test_stub",
+                technical_detail="",
+            ),
+        )
+        self._portal_readiness_patcher.start()
+        self._doc_generate_patcher = patch("pipeline.DocumentGenerator.generate", new=self._fake_generate)
+        self._doc_generate_patcher.start()
+
+    def tearDown(self) -> None:
+        self._doc_generate_patcher.stop()
+        self._portal_readiness_patcher.stop()
+
+    @staticmethod
+    def _fake_generate(_generator, output_dir, job, resume, score, *, ai_notes="", tailoring_payload=None, progress_callback=None):
+        if progress_callback:
+            progress_callback("tailoring_resume", "Tailoring resume...", 3)
+            progress_callback("exporting_pdf", "Exporting PDF...", 4)
+            progress_callback("validating_pages", "Validating final page count...", 5)
+            progress_callback("writing_cover_letter", "Writing cover letter...", 6)
+        target_dir = Path(output_dir) / f"{job.employer}_{job.id[:8]}"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        resume_pdf = target_dir / "resume.pdf"
+        cover_txt = target_dir / "cover_letter.txt"
+        cover_docx = target_dir / "cover_letter.docx"
+        cover_pdf = target_dir / "cover_letter.pdf"
+        resume_pdf.write_text("pdf", encoding="utf-8")
+        cover_txt.write_text("cover", encoding="utf-8")
+        cover_docx.write_text("docx", encoding="utf-8")
+        cover_pdf.write_text("pdf", encoding="utf-8")
+        return GeneratedDocs(
+            output_dir=target_dir,
+            resume_pdf_path=resume_pdf,
+            cover_letter_pdf_path=cover_pdf,
+            cover_letter_docx_path=cover_docx,
+            cover_letter_txt_path=cover_txt,
+            pdf_exporter_used="word_com",
+            cover_letter_pdf_exporter_used="word_com",
+            page_fit_attempts=1,
+        )
+
     def test_prepare_document_tailoring_retries_only_cover_letter_when_resume_is_salvageable(self) -> None:
         with workspace_temp_dir() as tmp:
             with patch.dict(os.environ, {"APPDATA": str(tmp)}):
@@ -413,15 +460,16 @@ class PipelineTests(unittest.TestCase):
                 out = Path(tmp) / "output"
                 out.mkdir(parents=True, exist_ok=True)
                 resume_pdf = out / "resume.pdf"
-                cover = out / "cover_letter.txt"
+                cover = out / "cover_letter.pdf"
                 resume_pdf.write_text("pdf", encoding="utf-8")
-                cover.write_text("cover", encoding="utf-8")
+                cover.write_text("pdf", encoding="utf-8")
                 database.record_generated_documents(
                     "approve-email-1",
                     output_dir=str(out),
                     resume_docx_path="",
                     resume_pdf_path=str(resume_pdf),
-                    cover_letter_path=str(cover),
+                    cover_letter_pdf_path=str(cover),
+                    cover_letter_path="",
                     status="generated",
                     error_message="",
                     generated_at="2026-01-01T00:00:00+00:00",
@@ -440,6 +488,236 @@ class PipelineTests(unittest.TestCase):
                 row = database.get_review_row("approve-email-1")
                 self.assertEqual(row["delivery_status"], "sent")
                 self.assertEqual(row["delivery_method"], "gmail_employer")
+
+    def test_approve_and_send_email_failure_records_approval_log(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                config.automation_mode = "semi_auto"
+                config.skip_ai_scoring_in_semi_auto = True
+                config.gmail.enabled = True
+                config.gmail.sender_email = "robert@example.com"
+                config.gmail.client_secrets_file = str(Path(tmp) / "client_secret.json")
+                Path(config.gmail.client_secrets_file).write_text("{}", encoding="utf-8")
+                resume_path = Path(tmp) / "resume.txt"
+                resume_path.write_text(
+                    "Jane Candidate\njane@example.com\n555-123-4567\nSummary: Marketing leader\nSkills: Marketing\nBuilt APIs\n",
+                    encoding="utf-8",
+                )
+                config.resume_source_path = str(resume_path)
+                database = Database(paths.database_file)
+                database.initialize()
+                pipeline = JobBotPipeline(config, paths, database)
+                database.upsert_job(
+                    Job(
+                        id="approve-email-fail-1",
+                        title="VP Communications",
+                        employer="Acme",
+                        location="Remote",
+                        salary_range="",
+                        description_full="Email your resume to recruiting@example.com",
+                        apply_method="email",
+                        apply_url="https://example.com",
+                        hiring_manager_email="recruiting@example.com",
+                        source="jobspy",
+                        posted_at="2026-01-01T00:00:00+00:00",
+                        scraped_at="2026-01-01T00:00:00+00:00",
+                    ),
+                    {},
+                )
+                database.record_match_result(
+                    "approve-email-fail-1",
+                    score=82,
+                    rationale="Strong fit",
+                    strengths=[],
+                    gaps=[],
+                    is_match=True,
+                    status="review",
+                    error_message="",
+                    scored_at="2026-01-01T00:00:00+00:00",
+                )
+                out = Path(tmp) / "output"
+                out.mkdir(parents=True, exist_ok=True)
+                resume_pdf = out / "resume.pdf"
+                cover = out / "cover_letter.pdf"
+                resume_pdf.write_text("pdf", encoding="utf-8")
+                cover.write_text("pdf", encoding="utf-8")
+                database.record_generated_documents(
+                    "approve-email-fail-1",
+                    output_dir=str(out),
+                    resume_docx_path="",
+                    resume_pdf_path=str(resume_pdf),
+                    cover_letter_pdf_path=str(cover),
+                    cover_letter_path="",
+                    status="generated",
+                    error_message="",
+                    generated_at="2026-01-01T00:00:00+00:00",
+                )
+                pipeline.gmail_client.deliver_match = lambda *args, **kwargs: DeliveryResult(
+                    "gmail_employer",
+                    "failed",
+                    "",
+                    "Google OAuth blocked access; app is still in testing and this account must be added as a test user.",
+                )
+                result = pipeline.approve_and_send("approve-email-fail-1")
+                self.assertEqual(result.status, "failed")
+                self.assertEqual(result.method, "gmail_employer")
+                row = database.get_review_row("approve-email-fail-1")
+                self.assertEqual(row["delivery_status"], "failed")
+                self.assertEqual(row["delivery_method"], "gmail_employer")
+                self.assertIn("Route: email", row["approval_log"])
+                self.assertIn("Google OAuth blocked access", row["approval_log"])
+
+    def test_approve_and_send_email_without_employer_email_records_failure(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                config.automation_mode = "semi_auto"
+                config.skip_ai_scoring_in_semi_auto = True
+                resume_path = Path(tmp) / "resume.txt"
+                resume_path.write_text(
+                    "Jane Candidate\njane@example.com\n555-123-4567\nSummary: Marketing leader\nSkills: Marketing\nBuilt APIs\n",
+                    encoding="utf-8",
+                )
+                config.resume_source_path = str(resume_path)
+                database = Database(paths.database_file)
+                database.initialize()
+                pipeline = JobBotPipeline(config, paths, database)
+                database.upsert_job(
+                    Job(
+                        id="approve-email-fail-2",
+                        title="VP Communications",
+                        employer="Acme",
+                        location="Remote",
+                        salary_range="",
+                        description_full="Apply by email.",
+                        apply_method="email",
+                        apply_url="https://example.com",
+                        hiring_manager_email="",
+                        source="jobspy",
+                        posted_at="2026-01-01T00:00:00+00:00",
+                        scraped_at="2026-01-01T00:00:00+00:00",
+                    ),
+                    {},
+                )
+                database.record_match_result(
+                    "approve-email-fail-2",
+                    score=82,
+                    rationale="Strong fit",
+                    strengths=[],
+                    gaps=[],
+                    is_match=True,
+                    status="review",
+                    error_message="",
+                    scored_at="2026-01-01T00:00:00+00:00",
+                )
+                out = Path(tmp) / "output"
+                out.mkdir(parents=True, exist_ok=True)
+                resume_pdf = out / "resume.pdf"
+                cover = out / "cover_letter.pdf"
+                resume_pdf.write_text("pdf", encoding="utf-8")
+                cover.write_text("pdf", encoding="utf-8")
+                database.record_generated_documents(
+                    "approve-email-fail-2",
+                    output_dir=str(out),
+                    resume_docx_path="",
+                    resume_pdf_path=str(resume_pdf),
+                    cover_letter_pdf_path=str(cover),
+                    cover_letter_path="",
+                    status="generated",
+                    error_message="",
+                    generated_at="2026-01-01T00:00:00+00:00",
+                )
+                result = pipeline.approve_and_send("approve-email-fail-2")
+                self.assertEqual(result.status, "blocked_hr_email")
+                self.assertEqual(result.method, "manual")
+                self.assertIn("No validated HR/application email was found", result.error_message)
+                row = database.get_review_row("approve-email-fail-2")
+                self.assertIn("HR email: not present", row["approval_log"])
+                self.assertIn("No validated HR/application email was found", row["approval_log"])
+
+    def test_approve_and_send_blocks_legacy_email_row_with_compliance_recipient(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                config.automation_mode = "semi_auto"
+                config.skip_ai_scoring_in_semi_auto = True
+                config.gmail.enabled = True
+                config.gmail.sender_email = "robert@example.com"
+                config.gmail.client_secrets_file = str(Path(tmp) / "client_secret.json")
+                Path(config.gmail.client_secrets_file).write_text("{}", encoding="utf-8")
+                resume_path = Path(tmp) / "resume.txt"
+                resume_path.write_text(
+                    "Jane Candidate\njane@example.com\n555-123-4567\nSummary: Marketing leader\nSkills: Marketing\nBuilt APIs\n",
+                    encoding="utf-8",
+                )
+                config.resume_source_path = str(resume_path)
+                database = Database(paths.database_file)
+                database.initialize()
+                pipeline = JobBotPipeline(config, paths, database)
+                database.upsert_job(
+                    Job(
+                        id="approve-email-block-1",
+                        title="VP Communications",
+                        employer="Acme",
+                        location="Remote",
+                        salary_range="",
+                        description_full=(
+                            "For questions about privacy, contact compliance@acme.com.\n"
+                            "This inbox is not monitored for application status updates."
+                        ),
+                        apply_method="email",
+                        apply_url="https://example.com",
+                        hiring_manager_email="compliance@acme.com",
+                        source="jobspy",
+                        posted_at="2026-01-01T00:00:00+00:00",
+                        scraped_at="2026-01-01T00:00:00+00:00",
+                    ),
+                    {},
+                )
+                database.record_match_result(
+                    "approve-email-block-1",
+                    score=82,
+                    rationale="Strong fit",
+                    strengths=[],
+                    gaps=[],
+                    is_match=True,
+                    status="review",
+                    error_message="",
+                    scored_at="2026-01-01T00:00:00+00:00",
+                )
+                out = Path(tmp) / "output"
+                out.mkdir(parents=True, exist_ok=True)
+                resume_pdf = out / "resume.pdf"
+                cover = out / "cover_letter.pdf"
+                resume_pdf.write_text("pdf", encoding="utf-8")
+                cover.write_text("pdf", encoding="utf-8")
+                database.record_generated_documents(
+                    "approve-email-block-1",
+                    output_dir=str(out),
+                    resume_docx_path="",
+                    resume_pdf_path=str(resume_pdf),
+                    cover_letter_pdf_path=str(cover),
+                    cover_letter_path="",
+                    status="generated",
+                    error_message="",
+                    generated_at="2026-01-01T00:00:00+00:00",
+                )
+                pipeline.gmail_client.deliver_match = lambda *args, **kwargs: (_ for _ in ()).throw(
+                    AssertionError("gmail should not send blocked recipients")
+                )
+                result = pipeline.approve_and_send("approve-email-block-1")
+                self.assertEqual(result.status, "blocked_hr_email")
+                self.assertEqual(result.method, "manual")
+                self.assertIn("validated hr/application email", result.error_message.lower())
+                row = database.get_review_row("approve-email-block-1")
+                self.assertEqual(row["delivery_status"], "blocked_hr_email")
+                self.assertEqual(row["delivery_method"], "manual")
+                self.assertIn("HR email: not present", row["approval_log"])
+                self.assertIn("Validated HR recipient: Not present", row["approval_log"])
 
     def test_approve_and_send_supported_portal_submits_without_gmail(self) -> None:
         with workspace_temp_dir() as tmp:
@@ -488,15 +766,16 @@ class PipelineTests(unittest.TestCase):
                 out = Path(tmp) / "output"
                 out.mkdir(parents=True, exist_ok=True)
                 resume_pdf = out / "resume.pdf"
-                cover = out / "cover_letter.txt"
+                cover = out / "cover_letter.pdf"
                 resume_pdf.write_text("pdf", encoding="utf-8")
-                cover.write_text("cover", encoding="utf-8")
+                cover.write_text("pdf", encoding="utf-8")
                 database.record_generated_documents(
                     "approve-portal-1",
                     output_dir=str(out),
                     resume_docx_path="",
                     resume_pdf_path=str(resume_pdf),
-                    cover_letter_path=str(cover),
+                    cover_letter_pdf_path=str(cover),
+                    cover_letter_path="",
                     status="generated",
                     error_message="",
                     generated_at="2026-01-01T00:00:00+00:00",
@@ -560,15 +839,16 @@ class PipelineTests(unittest.TestCase):
                 out = Path(tmp) / "output"
                 out.mkdir(parents=True, exist_ok=True)
                 resume_pdf = out / "resume.pdf"
-                cover = out / "cover_letter.txt"
+                cover = out / "cover_letter.pdf"
                 resume_pdf.write_text("pdf", encoding="utf-8")
-                cover.write_text("cover", encoding="utf-8")
+                cover.write_text("pdf", encoding="utf-8")
                 database.record_generated_documents(
                     "approve-portal-2",
                     output_dir=str(out),
                     resume_docx_path="",
                     resume_pdf_path=str(resume_pdf),
-                    cover_letter_path=str(cover),
+                    cover_letter_pdf_path=str(cover),
+                    cover_letter_path="",
                     status="generated",
                     error_message="",
                     generated_at="2026-01-01T00:00:00+00:00",
@@ -634,15 +914,16 @@ class PipelineTests(unittest.TestCase):
                 out = Path(tmp) / "output"
                 out.mkdir(parents=True, exist_ok=True)
                 resume_pdf = out / "resume.pdf"
-                cover = out / "cover_letter.txt"
+                cover = out / "cover_letter.pdf"
                 resume_pdf.write_text("pdf", encoding="utf-8")
-                cover.write_text("cover", encoding="utf-8")
+                cover.write_text("pdf", encoding="utf-8")
                 database.record_generated_documents(
                     "approve-indeed-1",
                     output_dir=str(out),
                     resume_docx_path="",
                     resume_pdf_path=str(resume_pdf),
-                    cover_letter_path=str(cover),
+                    cover_letter_pdf_path=str(cover),
+                    cover_letter_path="",
                     status="generated",
                     error_message="",
                     generated_at="2026-01-01T00:00:00+00:00",
@@ -712,15 +993,16 @@ class PipelineTests(unittest.TestCase):
                 out = Path(tmp) / "output"
                 out.mkdir(parents=True, exist_ok=True)
                 resume_pdf = out / "resume.pdf"
-                cover = out / "cover_letter.txt"
+                cover = out / "cover_letter.pdf"
                 resume_pdf.write_text("pdf", encoding="utf-8")
-                cover.write_text("cover", encoding="utf-8")
+                cover.write_text("pdf", encoding="utf-8")
                 database.record_generated_documents(
                     "approve-indeed-2",
                     output_dir=str(out),
                     resume_docx_path="",
                     resume_pdf_path=str(resume_pdf),
-                    cover_letter_path=str(cover),
+                    cover_letter_pdf_path=str(cover),
+                    cover_letter_path="",
                     status="generated",
                     error_message="",
                     generated_at="2026-01-01T00:00:00+00:00",
@@ -792,15 +1074,16 @@ class PipelineTests(unittest.TestCase):
                 out = Path(tmp) / "output"
                 out.mkdir(parents=True, exist_ok=True)
                 resume_pdf = out / "resume.pdf"
-                cover = out / "cover_letter.txt"
+                cover = out / "cover_letter.pdf"
                 resume_pdf.write_text("pdf", encoding="utf-8")
-                cover.write_text("cover", encoding="utf-8")
+                cover.write_text("pdf", encoding="utf-8")
                 database.record_generated_documents(
                     "approve-portal-3",
                     output_dir=str(out),
                     resume_docx_path="",
                     resume_pdf_path=str(resume_pdf),
-                    cover_letter_path=str(cover),
+                    cover_letter_pdf_path=str(cover),
+                    cover_letter_path="",
                     status="generated",
                     error_message="",
                     generated_at="2026-01-01T00:00:00+00:00",
@@ -955,7 +1238,8 @@ class PipelineTests(unittest.TestCase):
                 docs = pipeline.generate_documents_for_job("7")
                 self.assertTrue(docs.output_dir.exists())
                 self.assertTrue(docs.resume_pdf_path.exists())
-                self.assertTrue(docs.cover_letter_path.exists())
+                self.assertTrue(docs.cover_letter_pdf_path.exists())
+                self.assertTrue(docs.cover_letter_docx_path.exists())
                 row = database.get_review_row("7")
                 self.assertEqual(row["document_status"], "generated")
                 self.assertTrue(row["generated_at"])
@@ -1002,11 +1286,21 @@ class PipelineTests(unittest.TestCase):
                     target_dir = output_dir / "Acme_2026-01-01_deadbeef"
                     target_dir.mkdir(parents=True, exist_ok=True)
                     resume_pdf = target_dir / "resume.pdf"
-                    cover = target_dir / "cover_letter.txt"
+                    cover_txt = target_dir / "cover_letter.txt"
+                    cover_docx = target_dir / "cover_letter.docx"
+                    cover_pdf = target_dir / "cover_letter.pdf"
                     resume_pdf.write_text("pdf", encoding="utf-8")
-                    cover.write_text("cover", encoding="utf-8")
+                    cover_txt.write_text("cover", encoding="utf-8")
+                    cover_docx.write_text("docx", encoding="utf-8")
+                    cover_pdf.write_text("pdf", encoding="utf-8")
                     from doc_generator import GeneratedDocs
-                    return GeneratedDocs(output_dir=target_dir, resume_pdf_path=resume_pdf, cover_letter_path=cover)
+                    return GeneratedDocs(
+                        output_dir=target_dir,
+                        resume_pdf_path=resume_pdf,
+                        cover_letter_pdf_path=cover_pdf,
+                        cover_letter_docx_path=cover_docx,
+                        cover_letter_txt_path=cover_txt,
+                    )
 
                 pipeline.doc_generator.generate = fake_generate
                 events: list[tuple[str, str, int]] = []
@@ -1059,8 +1353,10 @@ class PipelineTests(unittest.TestCase):
                     return GeneratedDocs(
                         output_dir=output_dir,
                         resume_pdf_path=Path(),
-                        cover_letter_path=Path(),
+                        cover_letter_pdf_path=Path(),
                         resume_docx_path=Path(),
+                        cover_letter_docx_path=Path(),
+                        cover_letter_txt_path=Path(),
                         status="failed",
                         error_message="JobBot could not compress the tailored resume to 2 pages.",
                     )

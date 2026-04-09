@@ -41,6 +41,10 @@ class DocumentGeneratorTests(unittest.TestCase):
     def test_generate_creates_files(self) -> None:
         with workspace_temp_dir() as tmp:
             generator = DocumentGenerator()
+            def _fake_export(docx_path, pdf_path):
+                pdf_path.write_bytes(b"pdf")
+                return "word_com"
+            generator._export_docx_to_pdf = _fake_export
             docs = generator.generate(
                 Path(tmp),
                 Job("1", "Engineer", "Acme", "Remote", "", "Role", "board", "https://example.com", "", "usajobs", "", ""),
@@ -49,11 +53,17 @@ class DocumentGeneratorTests(unittest.TestCase):
                 ai_notes="Strong API background and automation experience.",
             )
             self.assertTrue(docs.resume_pdf_path.exists())
-            self.assertTrue(docs.cover_letter_path.exists())
+            self.assertTrue(docs.cover_letter_txt_path.exists())
+            self.assertTrue(docs.cover_letter_docx_path.exists())
+            self.assertTrue(docs.cover_letter_pdf_path.exists())
 
     def test_generate_cover_letter_avoids_nan_employer_and_placeholder_rationale(self) -> None:
         with workspace_temp_dir() as tmp:
             generator = DocumentGenerator()
+            def _fake_export(docx_path, pdf_path):
+                pdf_path.write_bytes(b"pdf")
+                return "word_com"
+            generator._export_docx_to_pdf = _fake_export
             docs = generator.generate(
                 Path(tmp),
                 Job("1", "Marketing Director", "nan", "New York, NY", "", "Role", "board", "https://example.com", "", "jobspy", "", ""),
@@ -61,7 +71,7 @@ class DocumentGeneratorTests(unittest.TestCase):
                 MatchScore(0, "AI scoring skipped in semi_auto for faster review queueing.", [], [], False, "review", "", "2026-01-01T00:00:00+00:00"),
                 ai_notes="",
             )
-            text = docs.cover_letter_path.read_text(encoding="utf-8")
+            text = docs.cover_letter_txt_path.read_text(encoding="utf-8")
             self.assertNotIn("nan", text.lower())
             self.assertNotIn("AI scoring skipped", text)
             self.assertNotIn("Selected experience highlights:", text)
@@ -166,7 +176,7 @@ class DocumentGeneratorTests(unittest.TestCase):
                 MatchScore(0, "", [], [], False, "review", "", "2026-01-01T00:00:00+00:00"),
                 ai_notes="",
             )
-            text = docs.cover_letter_path.read_text(encoding="utf-8")
+            text = docs.cover_letter_txt_path.read_text(encoding="utf-8")
             self.assertIn("Director of Ecommerce", text)
             self.assertIn("MILK BAR", text)
             self.assertIn("analytics and reporting", text.lower())
@@ -260,6 +270,10 @@ class DocumentGeneratorTests(unittest.TestCase):
             ],
         )
         with workspace_temp_dir() as tmp:
+            def _fake_export(docx_path, pdf_path):
+                pdf_path.write_bytes(b"pdf")
+                return "word_com"
+            generator._export_docx_to_pdf = _fake_export
             docs = generator.generate(
                 Path(tmp),
                 Job("1", "Director", "Acme", "Remote", "", "Lead analytics and reporting.", "board", "https://example.com", "", "jobspy", "", ""),
@@ -267,9 +281,31 @@ class DocumentGeneratorTests(unittest.TestCase):
                 MatchScore(0, "", [], [], False, "review", "", "2026-01-01T00:00:00+00:00"),
                 ai_notes="",
             )
-            text = docs.cover_letter_path.read_text(encoding="utf-8")
+            text = docs.cover_letter_txt_path.read_text(encoding="utf-8")
             self.assertIn("Sincerely,\nRobert Thom", text)
             self.assertNotIn("Sincerely,\nWORK EXPERIENCE", text)
+
+    def test_generate_cover_letter_outputs_docx_and_pdf(self) -> None:
+        with workspace_temp_dir() as tmp:
+            source_docx = Path(tmp) / "source_resume.docx"
+            _build_source_resume_docx(source_docx)
+            generator = DocumentGenerator()
+            def _fake_export(docx_path, pdf_path):
+                pdf_path.write_bytes(b"pdf")
+                return "word_com"
+            generator._export_docx_to_pdf = _fake_export
+            generator._count_pdf_pages = lambda pdf_path: 2
+            resume = parse_resume(source_docx, Path(tmp) / "resume_cache.json")
+            docs = generator.generate(
+                Path(tmp),
+                Job("1", "Director of Ecommerce", "MILK BAR", "New York, NY", "", "Lead ecommerce growth.", "board", "https://example.com", "", "jobspy", "", ""),
+                resume,
+                MatchScore(0, "", [], [], False, "review", "", "2026-01-01T00:00:00+00:00"),
+                ai_notes="",
+            )
+            self.assertTrue(docs.cover_letter_txt_path.exists())
+            self.assertTrue(docs.cover_letter_docx_path.exists())
+            self.assertTrue(docs.cover_letter_pdf_path.exists())
 
     def test_inferred_skills_are_added_when_supported(self) -> None:
         generator = DocumentGenerator()

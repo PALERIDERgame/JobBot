@@ -118,6 +118,8 @@ class Database:
                     resume_docx_path TEXT NOT NULL DEFAULT '',
                     resume_pdf_path TEXT NOT NULL DEFAULT '',
                     cover_letter_path TEXT NOT NULL DEFAULT '',
+                    cover_letter_docx_path TEXT NOT NULL DEFAULT '',
+                    cover_letter_pdf_path TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'pending',
                     error_message TEXT NOT NULL DEFAULT '',
                     generated_at TEXT NOT NULL DEFAULT '',
@@ -163,6 +165,8 @@ class Database:
             """
         )
         self._ensure_column("generated_documents", "resume_docx_path", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("generated_documents", "cover_letter_docx_path", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("generated_documents", "cover_letter_pdf_path", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("generated_documents", "tailoring_route", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("generated_documents", "tailoring_provider", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("generated_documents", "tailoring_model", "TEXT NOT NULL DEFAULT ''")
@@ -334,6 +338,8 @@ class Database:
         resume_docx_path: str,
         resume_pdf_path: str,
         cover_letter_path: str,
+        cover_letter_docx_path: str = "",
+        cover_letter_pdf_path: str = "",
         status: str,
         error_message: str,
         generated_at: str,
@@ -357,19 +363,21 @@ class Database:
         connection.execute(
             """
                 INSERT INTO generated_documents (
-                    job_id, output_dir, resume_docx_path, resume_pdf_path, cover_letter_path,
+                    job_id, output_dir, resume_docx_path, resume_pdf_path, cover_letter_path, cover_letter_docx_path, cover_letter_pdf_path,
                     status, error_message, generated_at,
                     tailoring_route, tailoring_provider, tailoring_model,
                     tailoring_fallback_reason, tailoring_retry_count,
                     resume_ai_status, cover_letter_ai_status, rejected_bullets_repaired, cover_letter_fallback,
                     ai_validation_attempts, resume_retry_performed, cover_letter_retry_performed, ai_repair_applied,
                     pdf_exporter_used, page_fit_attempts
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_id) DO UPDATE SET
                     output_dir=excluded.output_dir,
                     resume_docx_path=excluded.resume_docx_path,
                     resume_pdf_path=excluded.resume_pdf_path,
                     cover_letter_path=excluded.cover_letter_path,
+                    cover_letter_docx_path=excluded.cover_letter_docx_path,
+                    cover_letter_pdf_path=excluded.cover_letter_pdf_path,
                     status=excluded.status,
                     error_message=excluded.error_message,
                     generated_at=excluded.generated_at,
@@ -390,7 +398,7 @@ class Database:
                     page_fit_attempts=excluded.page_fit_attempts
             """,
             (
-                job_id, output_dir, resume_docx_path, resume_pdf_path, cover_letter_path,
+                job_id, output_dir, resume_docx_path, resume_pdf_path, cover_letter_path, cover_letter_docx_path, cover_letter_pdf_path,
                 status, error_message, generated_at,
                 tailoring_route, tailoring_provider, tailoring_model,
                 tailoring_fallback_reason, tailoring_retry_count,
@@ -569,6 +577,8 @@ class Database:
             COALESCE(generated_documents.resume_docx_path, '') AS resume_docx_path,
             COALESCE(generated_documents.resume_pdf_path, '') AS resume_pdf_path,
             COALESCE(generated_documents.cover_letter_path, '') AS cover_letter_path,
+            COALESCE(generated_documents.cover_letter_docx_path, '') AS cover_letter_docx_path,
+            COALESCE(generated_documents.cover_letter_pdf_path, '') AS cover_letter_pdf_path,
             COALESCE(generated_documents.status, 'pending') AS document_status,
             COALESCE(generated_documents.error_message, '') AS document_error,
             COALESCE(generated_documents.generated_at, '') AS generated_at,
@@ -611,6 +621,8 @@ class Database:
                 COALESCE(generated_documents.resume_docx_path, '') AS resume_docx_path,
                 COALESCE(generated_documents.resume_pdf_path, '') AS resume_pdf_path,
                 COALESCE(generated_documents.cover_letter_path, '') AS cover_letter_path,
+                COALESCE(generated_documents.cover_letter_docx_path, '') AS cover_letter_docx_path,
+                COALESCE(generated_documents.cover_letter_pdf_path, '') AS cover_letter_pdf_path,
                 COALESCE(generated_documents.status, 'pending') AS document_status,
                 COALESCE(generated_documents.error_message, '') AS document_error,
                 COALESCE(generated_documents.generated_at, '') AS generated_at,

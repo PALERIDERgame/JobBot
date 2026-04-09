@@ -156,6 +156,16 @@ def _best_resume_file(docs: GeneratedDocs) -> str | None:
     return None
 
 
+def _best_cover_letter_file(docs: GeneratedDocs) -> str | None:
+    if docs.cover_letter_pdf_path and docs.cover_letter_pdf_path != Path() and docs.cover_letter_pdf_path.exists():
+        return str(docs.cover_letter_pdf_path)
+    if docs.cover_letter_docx_path and docs.cover_letter_docx_path != Path() and docs.cover_letter_docx_path.exists():
+        return str(docs.cover_letter_docx_path)
+    if docs.cover_letter_txt_path and docs.cover_letter_txt_path != Path() and docs.cover_letter_txt_path.exists():
+        return str(docs.cover_letter_txt_path)
+    return None
+
+
 def _output_dir(docs: GeneratedDocs) -> Path | None:
     if docs.output_dir and docs.output_dir != Path():
         return docs.output_dir
@@ -349,10 +359,11 @@ class GreenhouseHandler(_BaseHandler):
                 ["input#resume", "input[name='job_application[resume]']", "input[type='file'][id*='resume']", "input[type='file']"],
                 resume_file,
             )
-        if self.docs.cover_letter_path and self.docs.cover_letter_path.exists():
+        cover_letter_file = _best_cover_letter_file(self.docs)
+        if cover_letter_file:
             self._upload_file(
                 ["input#cover_letter", "input[name='job_application[cover_letter]']", "input[type='file'][id*='cover']"],
-                str(self.docs.cover_letter_path),
+                cover_letter_file,
             )
 
         self._try_fill(["input#job_application_linkedin_url", "input[name*='linkedin']", "input[placeholder*='LinkedIn']"], _extract_linkedin(self.resume.header_lines or []))
@@ -518,10 +529,11 @@ class IndeedHandler(_BaseHandler):
                 ["input[type='file'][name*='resume']", "input[type='file'][id*='resume']", "input[type='file']"],
                 resume_file,
             )
-        if self.docs.cover_letter_path and self.docs.cover_letter_path.exists():
+        cover_letter_file = _best_cover_letter_file(self.docs)
+        if cover_letter_file:
             self._upload_file(
                 ["input[type='file'][name*='cover']", "input[type='file'][id*='cover']"],
-                str(self.docs.cover_letter_path),
+                cover_letter_file,
             )
         if self._has_screening_questions():
             return PortalResult("screening_questions", "Indeed apply flow surfaced screening questions after basic fields.", "indeed")
