@@ -23,7 +23,7 @@ from resume_parser import parse_resume
 MODEL_OPTIONS = {
     "ollama_local": ("qwen2.5:7b",),
     "openai": ("gpt-5-mini", "gpt-5-nano"),
-    "anthropic": ("claude-sonnet-4-20250514", "claude-3-5-haiku-latest"),
+    "anthropic": ("claude-sonnet-4-20250514", "claude-haiku-4-5-20251001"),
 }
 
 FIELD_TOOLTIPS = {
@@ -155,6 +155,7 @@ class JobBotDashboard:
         self.cost_text: tk.Text | None = None
         self.last_run_label: ttk.Label | None = None
         self.details_text: tk.Text | None = None
+        self.cheap_stage_model_combo: ttk.Combobox | None = None
         self.strong_stage_model_combo: ttk.Combobox | None = None
         self.doc_stage_model_combo: ttk.Combobox | None = None
         self.setup_canvas: tk.Canvas | None = None
@@ -260,7 +261,7 @@ class JobBotDashboard:
             "Automation mode": ("semi_auto", "auto"),
             "Cheap stage provider": ("ollama_local", "openai", "anthropic"),
             "Strong stage provider": ("anthropic", "openai"),
-            "Doc stage provider": ("openai", "anthropic", "cheap_stage"),
+            "Doc stage provider": ("openai", "anthropic", "ollama_local"),
         }
         for idx, (label, var) in enumerate(labels):
             label_widget = ttk.Label(frame, text=label)
@@ -305,6 +306,8 @@ class JobBotDashboard:
                 combo.grid(row=idx, column=1, columnspan=2, sticky="ew", pady=6)
                 if label == "Source provider":
                     combo.bind("<<ComboboxSelected>>", self._on_source_provider_changed, add="+")
+                if label == "Cheap stage provider":
+                    combo.bind("<<ComboboxSelected>>", self._on_cheap_provider_changed, add="+")
                 if label == "Strong stage provider":
                     combo.bind("<<ComboboxSelected>>", self._on_strong_provider_changed, add="+")
                 if label == "Doc stage provider":
@@ -313,11 +316,13 @@ class JobBotDashboard:
                     combo.bind("<<ComboboxSelected>>", self._on_automation_mode_changed, add="+")
                 combo.bind("<<ComboboxSelected>>", self._autosave_setup, add="+")
                 self._add_tooltip(combo, FIELD_TOOLTIPS[label])
-            elif label in {"Strong stage model", "Doc stage model"}:
+            elif label in {"Cheap stage model", "Strong stage model", "Doc stage model"}:
                 combo = ttk.Combobox(frame, textvariable=var, state="readonly", width=67)
                 combo.grid(row=idx, column=1, columnspan=2, sticky="ew", pady=6)
                 combo.bind("<<ComboboxSelected>>", self._autosave_setup, add="+")
-                if label == "Strong stage model":
+                if label == "Cheap stage model":
+                    self.cheap_stage_model_combo = combo
+                elif label == "Strong stage model":
                     self.strong_stage_model_combo = combo
                 else:
                     self.doc_stage_model_combo = combo
@@ -329,6 +334,7 @@ class JobBotDashboard:
                 self._bind_entry_autosave(entry)
                 self._add_tooltip(entry, FIELD_TOOLTIPS[label])
 
+        self._sync_cheap_model_dropdown()
         self._sync_strong_model_dropdown()
         self._sync_doc_model_dropdown()
 
@@ -543,6 +549,9 @@ class JobBotDashboard:
     def _on_strong_provider_changed(self, _event: object | None = None) -> None:
         self._sync_strong_model_dropdown()
 
+    def _on_cheap_provider_changed(self, _event: object | None = None) -> None:
+        self._sync_cheap_model_dropdown()
+
     def _on_doc_provider_changed(self, _event: object | None = None) -> None:
         self._sync_doc_model_dropdown()
 
@@ -558,6 +567,16 @@ class JobBotDashboard:
         if mode == "auto" and not self.location_var.get().strip():
             self.location_var.set("New York, NY")
 
+    def _sync_cheap_model_dropdown(self) -> None:
+        if not self.cheap_stage_model_combo:
+            return
+        provider = self.cheap_stage_provider_var.get().strip() or "openai"
+        models = MODEL_OPTIONS.get(provider, ())
+        self.cheap_stage_model_combo.configure(values=models)
+        current = self.cheap_stage_model_var.get().strip()
+        if current not in models and models:
+            self.cheap_stage_model_var.set(models[0])
+
     def _sync_strong_model_dropdown(self) -> None:
         if not self.strong_stage_model_combo:
             return
@@ -572,8 +591,7 @@ class JobBotDashboard:
         if not self.doc_stage_model_combo:
             return
         provider = self.doc_stage_provider_var.get().strip() or "openai"
-        resolved_provider = self.cheap_stage_provider_var.get().strip() if provider == "cheap_stage" else provider
-        models = MODEL_OPTIONS.get(resolved_provider, ())
+        models = MODEL_OPTIONS.get(provider, ())
         self.doc_stage_model_combo.configure(values=models)
         current = self.doc_stage_model_var.get().strip()
         if current not in models and models:

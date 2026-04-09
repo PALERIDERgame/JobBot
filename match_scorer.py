@@ -26,7 +26,7 @@ OPENAI_PRICE_PER_MTOKEN = {
 }
 ANTHROPIC_PRICE_PER_MTOKEN = {
     "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
-    "claude-3-5-haiku-latest": {"input": 0.80, "output": 4.00},
+    "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00},
 }
 
 
@@ -487,7 +487,7 @@ class MatchScorer:
         if self.config.openai_api_key:
             return ("openai", "gpt-5-nano")
         if self.config.anthropic_api_key:
-            return ("anthropic", "claude-3-5-haiku-latest")
+            return ("anthropic", "claude-haiku-4-5-20251001")
         return None
 
     def _build_cheap_prompt(self, job: Job, resume_data: ResumeData, *, force_escalate: bool) -> dict[str, object]:
@@ -835,6 +835,6 @@ class MatchScorer:
         return 0.0
 
     def _resolve_doc_provider_model(self) -> tuple[str, str]:
-        if self.config.doc_stage_provider == "cheap_stage":
-            return self.config.cheap_stage_provider, self.config.cheap_stage_model
+        if self.config.doc_stage_provider == "ollama_local":
+            return "ollama_local", self.config.cheap_stage_model
         return self.config.doc_stage_provider, self.config.doc_stage_model

@@ -210,8 +210,8 @@ def validate_config(config: JobBotConfig) -> None:
         raise ValueError("cheap_stage_provider must be 'ollama_local', 'openai', or 'anthropic'")
     if config.strong_stage_provider not in {"openai", "anthropic"}:
         raise ValueError("strong_stage_provider must be 'openai' or 'anthropic'")
-    if config.doc_stage_provider not in {"openai", "anthropic", "cheap_stage"}:
-        raise ValueError("doc_stage_provider must be 'openai', 'anthropic', or 'cheap_stage'")
+    if config.doc_stage_provider not in {"openai", "anthropic", "ollama_local"}:
+        raise ValueError("doc_stage_provider must be 'openai', 'anthropic', or 'ollama_local'")
     if not 0 <= config.cheap_reject_threshold <= 100:
         raise ValueError("cheap_reject_threshold must be between 0 and 100")
     if not 0 <= config.cheap_escalate_threshold <= 100:
