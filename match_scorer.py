@@ -624,16 +624,19 @@ class MatchScorer:
             usage = getattr(response, "usage", None)
             return text, int(getattr(usage, "input_tokens", 0) or 0), int(getattr(usage, "output_tokens", 0) or 0)
 
-        response = client.responses.create(
+        response = client.chat.completions.create(
             model=model,
-            input=[
+            messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(prompt)},
             ],
-            max_output_tokens=1000,
+            max_tokens=1000,
+            temperature=0,
+            response_format={"type": "json_object"},
         )
+        text = (response.choices[0].message.content or "").strip()
         usage = getattr(response, "usage", None)
-        return self._extract_openai_response_text(response), int(getattr(usage, "input_tokens", 0) or 0), int(getattr(usage, "output_tokens", 0) or 0)
+        return text, int(getattr(usage, "prompt_tokens", 0) or 0), int(getattr(usage, "completion_tokens", 0) or 0)
 
     def _create_completion(self, provider: str, model: str, prompt: dict[str, object], *, system_prompt: str) -> str:
         if provider == "ollama_local":
@@ -649,15 +652,17 @@ class MatchScorer:
                 messages=[{"role": "user", "content": json.dumps(prompt)}],
             )
             return "".join(block.text for block in response.content if getattr(block, "type", "") == "text").strip()
-        response = client.responses.create(
+        response = client.chat.completions.create(
             model=model,
-            input=[
+            messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(prompt)},
             ],
-            max_output_tokens=1000,
+            max_tokens=1000,
+            temperature=0,
+            response_format={"type": "json_object"},
         )
-        return self._extract_openai_response_text(response)
+        return (response.choices[0].message.content or "").strip()
 
     def _create_ollama_completion(self, model: str, prompt: dict[str, object], *, system_prompt: str) -> tuple[str, int, int]:
         body = json.dumps(
