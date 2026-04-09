@@ -81,7 +81,7 @@ class JobBotConfig:
     doc_stage_model: str = "gpt-5-mini"
     ollama_base_url: str = "http://localhost:11434"
     proxy_list: list[str] = field(default_factory=list)
-    scoring_threshold: int = 70
+    scoring_threshold: int = 30
     rate_limit_min_seconds: int = 3
     rate_limit_max_seconds: int = 5
     resume_source_path: str = ""
@@ -91,8 +91,8 @@ class JobBotConfig:
     exclude_titles: list[str] = field(default_factory=lambda: ["principal", "sales", "designer"])
     force_escalate_keywords: list[str] = field(default_factory=lambda: ["python", "automation", "llm", "agent"])
     salary_floor: int = 0
-    cheap_reject_threshold: int = 55
-    cheap_escalate_threshold: int = 75
+    cheap_reject_threshold: int = 25
+    cheap_escalate_threshold: int = 35
     final_apply_threshold: int = 80
     skip_ai_scoring_in_semi_auto: bool = True
     enable_cost_tracking: bool = True

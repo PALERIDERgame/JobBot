@@ -15,7 +15,7 @@ from resume_parser import ResumeData, ResumeWorkEntry
 
 
 LOGGER = logging.getLogger(__name__)
-PROMPT_VERSION = "cost_funnel_v1"
+PROMPT_VERSION = "cost_funnel_v2"
 
 OPENAI_PRICE_PER_MTOKEN = {
     "gpt-5-nano": {"input": 0.20, "output": 1.25},
@@ -511,9 +511,9 @@ class MatchScorer:
                 "return_json": True,
                 "fields": ["score", "confidence", "rationale", "strengths", "gaps"],
                 "goal": (
-                    "Fast screening. Apply screening_constraints first - if the job clearly fails "
-                    "location or salary constraints score it below 20. "
-                    "Otherwise reject obvious resume mismatches but be recall-friendly."
+                    "Fast screening pass using the rubric above. Apply screening_constraints first — "
+                    "if the job clearly fails location or salary constraints, score below 25. "
+                    "Use the rubric to score resume fit. Be consistent; return a confident score when the match is obvious."
                 ),
             },
         }
@@ -525,7 +525,7 @@ class MatchScorer:
             "instructions": {
                 "return_json": True,
                 "fields": ["score", "confidence", "rationale", "strengths", "gaps"],
-                "goal": "Deeper semantic fit review. Decide if the job is a strong application candidate.",
+                "goal": "Deeper fit review using the rubric above. Score the resume against core job requirements precisely.",
             },
         }
 
@@ -587,7 +587,14 @@ class MatchScorer:
     def _create_completion_with_usage(self, provider: str, model: str, prompt: dict[str, object]) -> tuple[str, int, int]:
         system_prompt = (
             "You are a recruiting evaluator. Do not invent qualifications. "
-            "Return only valid JSON with keys score, confidence, rationale, strengths, and gaps."
+            "Return only valid JSON with keys score (int 0-100), confidence (float 0.0-1.0), "
+            "rationale (string), strengths (list), and gaps (list).\n\n"
+            "Scoring rubric:\n"
+            "  0-24:  Clear mismatch — wrong field, wrong seniority, or clearly unqualified\n"
+            "  25-39: Marginal — some relevance but missing most key requirements\n"
+            "  40-59: Partial fit — meets some requirements, notable gaps in core skills\n"
+            "  60-79: Good fit — meets most requirements with minor gaps\n"
+            "  80-100: Strong fit — meets all or nearly all core requirements"
         )
         return self._create_completion_with_usage_for_system(provider, model, prompt, system_prompt=system_prompt)
 
