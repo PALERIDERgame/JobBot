@@ -1,6 +1,0 @@
-Jane Candidate
-jane@example.com
-555-123-4567
-Summary: Python engineer
-Skills: Python, SQL
-Built APIs

@@ -63,6 +63,20 @@ class MatchScorerTests(unittest.TestCase):
         result = scorer.cheap_evaluate(job, resume)
         self.assertEqual(result.decision, "reject")
 
+    def test_build_cheap_prompt_includes_location_and_salary_screening_constraints(self) -> None:
+        config = JobBotConfig()
+        config.source.location = "New York, NY"
+        config.salary_floor = 90000
+        scorer = MatchScorer(config)
+        job = Job("1", "Python Developer", "Acme", "Remote", "$85,000 - $95,000", "Python role", "board", "https://example.com", "", "usajobs", "", "")
+        resume = ResumeData("", "", "Jane", "jane@example.com", "", "Python engineer", ["Python"], ["Built APIs"])
+        prompt = scorer._build_cheap_prompt(job, resume, force_escalate=False)
+        screening = prompt["screening_constraints"]
+        self.assertEqual(screening["target_location"], "New York, NY")
+        self.assertEqual(screening["salary_floor_usd"], 90000)
+        self.assertIn("same metro area", screening["location_note"])
+        self.assertIn("annualised", screening["salary_note"])
+
     def test_confidence_label_is_coerced_to_numeric(self) -> None:
         config = JobBotConfig(strong_stage_provider="openai", strong_stage_model="gpt-5-mini", openai_api_key="openai-test")
         scorer = MatchScorer(config)

@@ -488,14 +488,33 @@ class MatchScorer:
         return None
 
     def _build_cheap_prompt(self, job: Job, resume_data: ResumeData, *, force_escalate: bool) -> dict[str, object]:
+        screening: dict[str, object] = {}
+        if self.config.source.location and self.config.source.location.strip():
+            screening["target_location"] = self.config.source.location.strip()
+            screening["location_note"] = (
+                "Accept remote jobs regardless of location. "
+                "Accept jobs whose location is in the same metro area as target_location. "
+                "Reject jobs clearly in a different city or state."
+            )
+        if self.config.salary_floor > 0:
+            screening["salary_floor_usd"] = self.config.salary_floor
+            screening["salary_note"] = (
+                "If the job lists a salary or range, reject if the lower bound annualised "
+                "is clearly below salary_floor_usd. If salary is unlisted or ambiguous, do not reject."
+            )
         return {
             "resume_summary": self._resume_summary(resume_data),
             "job": self._job_summary(job),
             "force_escalate": force_escalate,
+            "screening_constraints": screening,
             "instructions": {
                 "return_json": True,
                 "fields": ["score", "confidence", "rationale", "strengths", "gaps"],
-                "goal": "Fast screening. Reject obvious mismatches but be recall-friendly.",
+                "goal": (
+                    "Fast screening. Apply screening_constraints first - if the job clearly fails "
+                    "location or salary constraints score it below 20. "
+                    "Otherwise reject obvious resume mismatches but be recall-friendly."
+                ),
             },
         }
 
