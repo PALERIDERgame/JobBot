@@ -1,5 +1,6 @@
 ﻿__pycache__/
 .pycache_temp/
+.venv312/
 tests/_tmp/
 *.pyc
 gmail_client_secret.json
