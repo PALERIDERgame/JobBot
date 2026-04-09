@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import webbrowser
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +13,7 @@ from doc_generator import DocumentGenerator, GeneratedDocs
 from document_tailoring import DocumentTailoringPayload
 from gmail_client import DeliveryResult, GmailClient
 from match_scorer import MatchScore, MatchScorer, StageEvaluation
+from portal_filler import PortalAutofillReadiness, PortalFiller
 from resume_parser import ResumeData, load_cached_resume, parse_resume
 from scrapers.scraper_router import ScraperRouter
 
@@ -29,6 +31,15 @@ class PipelineResult:
     estimated_cost_usd: float = 0.0
 
 
+@dataclass(slots=True)
+class ApprovalResult:
+    delivery: DeliveryResult
+    approval_log: str
+    approval_route: str
+    docs_action: str
+    portal_platform: str
+
+
 class JobBotPipeline:
     def __init__(self, config: JobBotConfig, paths: AppPaths, database: Database) -> None:
         self.config = config
@@ -38,6 +49,19 @@ class JobBotPipeline:
         self.scorer = MatchScorer(config, database)
         self.doc_generator = DocumentGenerator()
         self.gmail_client = GmailClient(config.gmail, paths.token_file)
+        self.portal_filler = PortalFiller(headless=True)
+        self.portal_readiness = self.portal_filler.check_readiness()
+        self._log_portal_readiness("startup", self.portal_readiness)
+
+    @staticmethod
+    def _log_portal_readiness(context: str, readiness: PortalAutofillReadiness) -> None:
+        LOGGER.info(
+            "Portal autofill readiness [%s]: %s (%s) detail=%s",
+            context,
+            readiness.summary,
+            readiness.reason_code,
+            readiness.technical_detail or "none",
+        )
 
     @staticmethod
     def _emit_progress(progress_callback, stage: str, message: str, progress: int) -> None:
@@ -519,7 +543,7 @@ class JobBotPipeline:
         return "parsed as json" in lowered or "payload structure" in lowered
 
     def _deliver(self, job: Job, score: MatchScore, docs: GeneratedDocs) -> DeliveryResult:
-        return self.gmail_client.deliver_match(job, score, docs)
+        return self.gmail_client.deliver_match(job, score, docs, allow_fallback=False)
 
     def generate_documents_for_job(self, job_id: str, *, progress_callback=None) -> GeneratedDocs:
         LOGGER.info("Manual document generation started for %s", job_id)
@@ -567,10 +591,11 @@ class JobBotPipeline:
             LOGGER.exception("Manual document generation failed for %s", job_id)
             raise
 
-    def approve_and_send(self, job_id: str) -> DeliveryResult:
+    def approve_and_send(self, job_id: str, *, progress_callback=None) -> DeliveryResult:
         row = self.database.get_review_row(job_id)
         if not row:
             raise ValueError("Selected job could not be found")
+        self._emit_progress(progress_callback, "loading_job", f"Loading {row['title']} at {row['employer']}...", 1)
         resume = self._load_resume()
         job = Job(
             id=row["id"],
@@ -596,6 +621,10 @@ class JobBotPipeline:
             error_message="",
             scored_at="",
         )
+        self._emit_progress(progress_callback, "checking_documents", "Checking generated application documents...", 2)
+        approval_notes = [
+            f"Route selected: {'email' if row['apply_method'] == 'email' else 'portal/manual'}",
+        ]
         docs = GeneratedDocs(
             output_dir=Path(row["output_dir"]) if row["output_dir"] else Path(),
             resume_pdf_path=Path(row["resume_pdf_path"]) if row["resume_pdf_path"] else Path(),
@@ -616,17 +645,196 @@ class JobBotPipeline:
         )
         if self.config.automation_mode == "semi_auto" and docs_missing:
             raise ValueError("Generate documents first before approving and sending in semi_auto.")
+        docs_action = "reused"
         if docs_missing:
             output_dir = resolve_output_dir(self.config, self.paths)
             output_dir.mkdir(parents=True, exist_ok=True)
-            docs = self._generate_documents(job, resume, score, output_dir, ai_notes=row["rationale"])
-        delivery = self._deliver(job, score, docs)
+            self._emit_progress(progress_callback, "generating_documents", "Generating missing application documents...", 3)
+            docs = self._generate_documents(job, resume, score, output_dir, ai_notes=row["rationale"], progress_callback=progress_callback)
+            docs_action = "generated_missing"
+            approval_notes.append("Documents generated during approval flow.")
+        else:
+            approval_notes.append("Existing generated documents reused.")
+        approval = self._deliver_for_approval(job, resume, score, docs, docs_action=docs_action, progress_callback=progress_callback)
         self.database.record_delivery(
             job.id,
-            method=delivery.method,
-            status=delivery.status,
-            message_id=delivery.message_id,
-            error_message=delivery.error_message,
+            method=approval.delivery.method,
+            status=approval.delivery.status,
+            message_id=approval.delivery.message_id,
+            error_message=approval.delivery.error_message,
             delivered_at=datetime.now(timezone.utc).isoformat(),
+            approval_log=approval.approval_log,
+            approval_route=approval.approval_route,
+            approval_docs_action=approval.docs_action,
+            approval_portal_platform=approval.portal_platform,
         )
-        return delivery
+        return approval.delivery
+
+    def verify_portal_autofill_runtime(self, *, progress_callback=None) -> PortalAutofillReadiness:
+        self._emit_progress(progress_callback, "starting", "Testing portal autofill runtime...", 0)
+        self._emit_progress(progress_callback, "checking_runtime", "Importing Playwright and launching headless Chromium...", 4)
+        readiness = self.portal_filler.check_readiness()
+        self.portal_readiness = readiness
+        self._log_portal_readiness("runtime_test", readiness)
+        final_message = readiness.summary if readiness.ready else f"{readiness.summary} - {readiness.technical_detail or readiness.reason_code}"
+        self._emit_progress(progress_callback, "runtime_checked", final_message, 7)
+        return readiness
+
+    def _deliver_for_approval(
+        self,
+        job: Job,
+        resume: ResumeData,
+        score: MatchScore,
+        docs: GeneratedDocs,
+        *,
+        docs_action: str,
+        progress_callback=None,
+    ) -> ApprovalResult:
+        if job.apply_method == "email":
+            self._emit_progress(progress_callback, "sending_email", "Sending employer email application...", 6)
+            result = self.gmail_client.deliver_match(job, score, docs, allow_fallback=False)
+            if result.status == "failed" and not job.hiring_manager_email:
+                result.error_message = "Employer email not detected for this job."
+            log = "\n".join(
+                [
+                    "Route: email",
+                    f"Documents: {docs_action}",
+                    f"Final status: {result.status} via {result.method}",
+                    f"Message: {result.error_message or 'Application email sent.'}",
+                ]
+            )
+            return ApprovalResult(result, log, "email", docs_action, "")
+        if not job.apply_url:
+            result = DeliveryResult("manual", "failed", "", "No application URL available for manual or portal apply.")
+            log = "\n".join(
+                [
+                    "Route: manual",
+                    f"Documents: {docs_action}",
+                    "Final status: failed via manual",
+                    f"Message: {result.error_message}",
+                ]
+            )
+            return ApprovalResult(result, log, "manual", docs_action, "")
+        if not self.portal_readiness.ready:
+            self._emit_progress(progress_callback, "opening_manual_apply", "Portal autofill unavailable; opening apply page...", 6)
+            opened = self._open_apply_url(job.apply_url)
+            result = DeliveryResult(
+                "portal",
+                "opened_manual" if opened else "failed",
+                "",
+                "Portal autofill unavailable; opened apply page for manual completion." if opened else self.portal_readiness.summary,
+            )
+            log = "\n".join(
+                [
+                    "Route: manual_open",
+                    f"Documents: {docs_action}",
+                    f"Portal readiness: {self.portal_readiness.reason_code}",
+                    f"Portal readiness detail: {self.portal_readiness.technical_detail or 'None'}",
+                    f"Final status: {result.status} via {result.method}",
+                    f"Message: {result.error_message}",
+                ]
+            )
+            return ApprovalResult(result, log, "manual_open", docs_action, "")
+
+        self._emit_progress(progress_callback, "attempting_portal", "Attempting portal autofill...", 6)
+        portal_result = self.portal_filler.fill(job, resume, docs, progress_callback=progress_callback)
+        method = portal_result.platform if portal_result.platform != "unknown" else "portal"
+        if portal_result.status == "submitted":
+            self._emit_progress(progress_callback, "completed", "Application submitted.", 8)
+            result = DeliveryResult(method, "submitted", "", portal_result.message)
+            log = "\n".join(
+                [
+                    "Route: portal",
+                    f"Documents: {docs_action}",
+                    f"Portal platform: {method}",
+                    f"Final status: {result.status} via {result.method}",
+                    f"Message: {portal_result.message}",
+                ]
+            )
+            return ApprovalResult(result, log, "portal", docs_action, method)
+        self._emit_progress(progress_callback, "opening_manual_apply", "Opening application page...", 7)
+        opened = self._open_apply_url(job.apply_url)
+        if portal_result.status == "login_required":
+            result = DeliveryResult(
+                method,
+                "blocked_login",
+                "",
+                "Login wall blocked autofill; opened apply page for manual completion." if opened else "Login wall blocked autofill.",
+            )
+            log = "\n".join(
+                [
+                    "Route: portal",
+                    f"Documents: {docs_action}",
+                    f"Portal platform: {method}",
+                    "Fallback: login wall",
+                    f"Final status: {result.status} via {result.method}",
+                    f"Message: {result.error_message}",
+                ]
+            )
+            return ApprovalResult(result, log, "portal", docs_action, method)
+        if portal_result.status == "captcha":
+            result = DeliveryResult(
+                method,
+                "blocked_captcha",
+                "",
+                "CAPTCHA blocked autofill; opened apply page for manual completion." if opened else "CAPTCHA blocked autofill.",
+            )
+            log = "\n".join(
+                [
+                    "Route: portal",
+                    f"Documents: {docs_action}",
+                    f"Portal platform: {method}",
+                    "Fallback: captcha",
+                    f"Final status: {result.status} via {result.method}",
+                    f"Message: {result.error_message}",
+                ]
+            )
+            return ApprovalResult(result, log, "portal", docs_action, method)
+        if portal_result.status == "unsupported":
+            result = DeliveryResult(
+                method,
+                "unsupported_portal",
+                "",
+                "Portal not supported for autofill; opened apply page for manual completion." if opened else "Portal not supported for autofill.",
+            )
+            log = "\n".join(
+                [
+                    "Route: portal",
+                    f"Documents: {docs_action}",
+                    f"Portal platform: {method}",
+                    "Fallback: unsupported portal",
+                    f"Final status: {result.status} via {result.method}",
+                    f"Message: {result.error_message}",
+                ]
+            )
+            return ApprovalResult(result, log, "portal", docs_action, method)
+        result = DeliveryResult(
+            method,
+            "opened_manual" if opened else "failed",
+            "",
+            "Portal autofill could not complete; opened apply page for manual completion." if opened else portal_result.message,
+        )
+        log = "\n".join(
+            [
+                "Route: portal",
+                f"Documents: {docs_action}",
+                f"Portal platform: {method}",
+                "Fallback: generic portal failure",
+                f"Final status: {result.status} via {result.method}",
+                f"Message: {result.error_message}",
+            ]
+        )
+        return ApprovalResult(result, log, "portal", docs_action, method)
+
+    def portal_autofill_readiness(self) -> PortalAutofillReadiness:
+        self.portal_readiness = self.portal_filler.check_readiness()
+        self._log_portal_readiness("refresh", self.portal_readiness)
+        return self.portal_readiness
+
+    @staticmethod
+    def _open_apply_url(apply_url: str) -> bool:
+        try:
+            return bool(webbrowser.open(apply_url))
+        except Exception:
+            LOGGER.exception("Failed to open apply URL: %s", apply_url)
+            return False

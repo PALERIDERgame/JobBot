@@ -15,6 +15,7 @@ from config import AppPaths, JobBotConfig, load_or_create_config, save_config
 from database import Database
 from match_scorer import MatchScorer
 from pipeline import JobBotPipeline
+from portal_filler import PortalAutofillReadiness
 from resume_parser import parse_resume
 
 
@@ -100,6 +101,8 @@ class Tooltip:
 
 
 class JobBotDashboard:
+    PORTAL_TEST_ACTION_ID = "__portal_runtime__"
+
     def __init__(self, root: tk.Tk, config: JobBotConfig, paths: AppPaths, database: Database) -> None:
         self.root = root
         self.config = config
@@ -107,6 +110,7 @@ class JobBotDashboard:
         self.database = database
         self.pipeline = JobBotPipeline(config, paths, database)
         self.status_var = tk.StringVar(value="Ready")
+        self.portal_readiness_var = tk.StringVar(value="Portal autofill: checking...")
 
         self.resume_var = tk.StringVar(value=config.resume_source_path)
         self.threshold_var = tk.StringVar(value=str(config.scoring_threshold))
@@ -157,19 +161,24 @@ class JobBotDashboard:
         self._run_in_progress = False
         self.fit_resume_button: ttk.Button | None = None
         self.generate_button: ttk.Button | None = None
+        self.approve_button: ttk.Button | None = None
+        self.portal_test_buttons: list[ttk.Button] = []
         self.generate_progress_var = tk.DoubleVar(value=0.0)
         self.generate_status_var = tk.StringVar(value="Idle")
-        self.generate_context_var = tk.StringVar(value="No generation in progress.")
+        self.generate_context_var = tk.StringVar(value="No review queue action in progress.")
         self.generate_progressbar: ttk.Progressbar | None = None
+        self._review_action_in_progress = False
         self._generate_in_progress = False
-        self._generate_job_id: str | None = None
-        self._generate_event_queue: queue.Queue[tuple[str, str, int, str | None]] = queue.Queue()
-        self._generate_poll_after_id: str | None = None
+        self._review_action_job_id: str | None = None
+        self._review_action_mode: str | None = None
+        self._review_action_event_queue: queue.Queue[tuple[str, str, int, str | None, str | None]] = queue.Queue()
+        self._review_action_poll_after_id: str | None = None
         self._review_rows: list[dict[str, object]] = []
         self._review_sort_column = "score"
         self._review_sort_desc = True
         self._source_provider_user_set = False
         self._build_ui()
+        self._refresh_portal_readiness()
         self.refresh_view()
 
     def _build_ui(self) -> None:
@@ -326,6 +335,16 @@ class JobBotDashboard:
         skip_ai_check = ttk.Checkbutton(frame, text="Skip AI scoring in semi_auto", variable=self.skip_ai_scoring_var, command=self._autosave_setup)
         skip_ai_check.grid(row=len(labels) + 1, column=1, columnspan=2, sticky="w", pady=6)
         self._add_tooltip(skip_ai_check, FIELD_TOOLTIPS["Skip AI scoring in semi_auto"])
+        portal_row = ttk.Frame(frame)
+        portal_row.grid(row=len(labels) + 2, column=1, columnspan=2, sticky="ew", pady=(6, 0))
+        portal_row.columnconfigure(0, weight=1)
+        portal_status = ttk.Label(portal_row, textvariable=self.portal_readiness_var)
+        portal_status.grid(row=0, column=0, sticky="w")
+        self._add_tooltip(portal_status, "Shows whether browser-based portal autofill is available on this machine.")
+        portal_test_button = ttk.Button(portal_row, text="Test Portal Runtime", command=self._test_portal_autofill_runtime)
+        portal_test_button.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        self.portal_test_buttons.append(portal_test_button)
+        self._add_tooltip(portal_test_button, "Run an in-app headless Chromium launch check and report the exact portal runtime readiness.")
 
     def _build_run_tab(self, frame: ttk.Frame) -> None:
         top = ttk.Frame(frame)
@@ -355,7 +374,7 @@ class JobBotDashboard:
         self._add_tooltip(self.cost_text, "Tracked estimated API costs by stage.")
 
     def _build_review_tab(self, frame: ttk.Frame) -> None:
-        columns = ("title", "employer", "posted_at", "score", "source", "document_status", "delivery_status")
+        columns = ("title", "employer", "posted_at", "score", "source", "email", "document_status", "delivery_status")
         tree_container = ttk.Frame(frame)
         tree_container.pack(fill="both", expand=True)
         tree_container.columnconfigure(0, weight=1)
@@ -368,6 +387,7 @@ class JobBotDashboard:
         tree.column("title", width=250)
         tree.column("employer", width=180)
         tree.column("posted_at", width=150)
+        tree.column("email", width=90, anchor="center")
         review_scrollbar = ttk.Scrollbar(tree_container, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=review_scrollbar.set)
         tree.grid(row=0, column=0, sticky="nsew")
@@ -397,6 +417,14 @@ class JobBotDashboard:
         approve_button = ttk.Button(buttons, text="Approve and Send", command=self._approve_and_send)
         approve_button.pack(side="left", padx=8)
         self._add_tooltip(approve_button, "Send the selected job through the configured delivery path.")
+        self.approve_button = approve_button
+        review_portal_test_button = ttk.Button(buttons, text="Test Portal Runtime", command=self._test_portal_autofill_runtime)
+        review_portal_test_button.pack(side="left")
+        self.portal_test_buttons.append(review_portal_test_button)
+        self._add_tooltip(review_portal_test_button, "Run a portal runtime verification using the current desktop app session.")
+        portal_status = ttk.Label(buttons, textvariable=self.portal_readiness_var)
+        portal_status.pack(side="left", padx=(12, 0))
+        self._add_tooltip(portal_status, "Shows whether browser-based portal autofill is available on this machine.")
 
         progress_frame = ttk.Frame(frame)
         progress_frame.pack(fill="x", pady=(8, 0))
@@ -404,7 +432,7 @@ class JobBotDashboard:
         progress_bar = ttk.Progressbar(progress_frame, maximum=8, variable=self.generate_progress_var)
         progress_bar.grid(row=0, column=0, sticky="ew")
         self.generate_progressbar = progress_bar
-        self._add_tooltip(progress_bar, "Shows progress for the selected Generate action.")
+        self._add_tooltip(progress_bar, "Shows progress for the current Review Queue action, including Generate and Approve and Send.")
         ttk.Label(progress_frame, textvariable=self.generate_status_var).grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Label(progress_frame, textvariable=self.generate_context_var).grid(row=2, column=0, sticky="w")
 
@@ -550,6 +578,7 @@ class JobBotDashboard:
             save_config(updated_config, self.paths.config_file)
             self.config = updated_config
             self.pipeline = JobBotPipeline(self.config, self.paths, self.database)
+            self._refresh_portal_readiness()
             if show_status_only:
                 self.status_var.set("Settings saved.")
             return True
@@ -646,6 +675,59 @@ class JobBotDashboard:
         self.root.wait_window(dialog)
         return confirmed["value"]
 
+    def _confirm_approve_and_send(self, row: dict[str, object]) -> bool:
+        heading, detail, action_label = self._approve_and_send_confirmation_copy(row)
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Confirm Approve and Send")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        confirmed = {"value": False}
+        container = ttk.Frame(dialog, padding=16)
+        container.pack(fill="both", expand=True)
+
+        ttk.Label(container, text=heading, wraplength=420, justify="left").pack(anchor="w")
+        ttk.Label(container, text=detail, wraplength=420, justify="left").pack(anchor="w", pady=(8, 0))
+
+        buttons = ttk.Frame(container)
+        buttons.pack(anchor="e", pady=(16, 0))
+
+        def close_with(value: bool) -> None:
+            confirmed["value"] = value
+            dialog.destroy()
+
+        ttk.Button(buttons, text="Cancel", command=lambda: close_with(False)).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text=action_label, command=lambda: close_with(True)).pack(side="left")
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: close_with(False))
+        self.root.wait_window(dialog)
+        return confirmed["value"]
+
+    def _approve_and_send_confirmation_copy(self, row: dict[str, object]) -> tuple[str, str, str]:
+        title = str(row.get("title") or "this role")
+        employer = str(row.get("employer") or "this employer")
+        apply_method = str(row.get("apply_method") or "")
+        if apply_method == "email":
+            destination = str(row.get("hiring_manager_email") or "the detected employer email")
+            return (
+                f"You are about to send an application email for {title} at {employer}.",
+                f"This will send the generated resume and cover letter to {destination}. Make sure the documents look right before continuing.",
+                "Send application",
+            )
+        readiness = self._portal_readiness_for_row(row)
+        if readiness.lower() == "ready":
+            return (
+                f"You are about to start the assisted apply flow for {title} at {employer}.",
+                "JobBot will attempt supported portal autofill first. If the portal is blocked by login, CAPTCHA, or an unsupported flow, it will open the apply page for you to finish manually.",
+                "Attempt apply",
+            )
+        return (
+            f"You are about to open the apply page for {title} at {employer}.",
+            f"Portal autofill is not currently available ({readiness}). JobBot will open the application page for manual completion and leave your generated documents ready on disk.",
+            "Open apply page",
+        )
+
     def _run_pipeline_background(self) -> None:
         result = self.pipeline.run()
         self.root.after(
@@ -685,6 +767,7 @@ class JobBotDashboard:
             self._run_poll_after_id = None
 
     def refresh_view(self) -> None:
+        self._refresh_portal_readiness()
         self._refresh_logs()
         self._refresh_costs()
         self._refresh_runs()
@@ -754,6 +837,7 @@ class JobBotDashboard:
                     self._format_posted_at(str(row.get("posted_at") or "")),
                     row["score"],
                     row["source"],
+                    self._email_status(row),
                     row["document_status"],
                     row["delivery_status"],
                 ),
@@ -766,6 +850,8 @@ class JobBotDashboard:
             value = row.get(self._review_sort_column)
             if self._review_sort_column == "score":
                 return int(value or 0)
+            if self._review_sort_column == "email":
+                return self._email_status(row)
             return str(value or "").lower()
 
         return sorted(self._review_rows, key=sort_value, reverse=self._review_sort_desc)
@@ -812,11 +898,12 @@ class JobBotDashboard:
                 f"Score: {row['score']}",
                 f"Match status: {row['match_status']}",
                 f"Apply method: {row['apply_method']}",
+                f"Portal autofill readiness: {self._portal_readiness_for_row(row)}",
                 f"Destination email: {row['hiring_manager_email'] or 'Not detected'}",
                 f"Delivery status: {row['delivery_status']}",
                 f"Delivery method: {row['delivery_method']}",
                 f"Apply URL: {row['apply_url']}",
-                f"Delivery error: {row['delivery_error'] or 'None'}",
+                f"Delivery detail: {row['delivery_error'] or 'None'}",
                 "",
                 "Match rationale:",
                 row["rationale"] or "No rationale available.",
@@ -852,6 +939,9 @@ class JobBotDashboard:
                 f"Page-fit attempts:  {row.get('page_fit_attempts', 0)}",
                 f"PDF exporter:       {row.get('pdf_exporter_used') or 'N/A'}",
                 "",
+                "--- Approval log ---",
+                row.get("approval_log") or "No approval attempt recorded yet.",
+                "",
                 "Job description:",
                 row["description_full"] or "No description captured.",
             ]
@@ -877,6 +967,10 @@ class JobBotDashboard:
         if row.get("tailoring_provider") or row.get("tailoring_model") or row.get("tailoring_fallback_reason"):
             return True
         return int(row.get("tailoring_retry_count") or 0) > 0
+
+    @staticmethod
+    def _email_status(row: dict[str, object]) -> str:
+        return "present" if str(row.get("hiring_manager_email") or "").strip() else "not present"
 
     @staticmethod
     def _doc_section_status(value: str) -> str:
@@ -916,22 +1010,23 @@ class JobBotDashboard:
         os.startfile(cover_letter_path)
 
     def _generate_documents_for_selected(self) -> None:
-        if self._generate_in_progress:
-            self.status_var.set("Document generation is already in progress.")
+        if self._review_action_in_progress:
+            self.status_var.set("A review queue action is already in progress.")
             return
         row = self._selected_row()
         if not row:
             return
         LOGGER.info("Review queue generation requested for %s", row["id"])
-        self._set_generate_state(
+        self._set_review_action_state(
             True,
+            mode="generate",
             job_id=str(row["id"]),
             status="Starting document generation...",
             context=f"{row['title']} at {row['employer']}",
             progress=0,
         )
         self.status_var.set("Generating documents...")
-        self._start_generate_polling()
+        self._start_review_action_polling()
         thread = threading.Thread(target=self._generate_documents_background, args=(row["id"],), daemon=True)
         thread.start()
 
@@ -941,81 +1036,139 @@ class JobBotDashboard:
             row = self.database.get_review_row(job_id)
             generated_at = self._format_generated_at(str(row.get("generated_at") or "")) if row else ""
             status = f"Documents generated{f' at {generated_at}' if generated_at else '.'}"
-            self._generate_event_queue.put(("completed", status, 8, job_id))
+            self._review_action_event_queue.put(("completed", status, 8, job_id, "generate"))
         except Exception as exc:
             LOGGER.exception("Review queue generation failed for %s", job_id)
             status = f"Document generation failed: {exc}"
-            self._generate_event_queue.put(("failed", status, 0, job_id))
+            self._review_action_event_queue.put(("failed", status, 0, job_id, "generate"))
 
     def _report_generate_progress(self, job_id: str, stage: str, message: str, progress: int) -> None:
-        self._generate_event_queue.put((stage, message, progress, job_id))
+        self._review_action_event_queue.put((stage, message, progress, job_id, "generate"))
 
-    def _apply_generate_progress(self, job_id: str, stage: str, message: str, progress: int) -> None:
-        if self._generate_job_id != job_id:
+    def _report_approval_progress(self, job_id: str, stage: str, message: str, progress: int) -> None:
+        self._review_action_event_queue.put((stage, message, progress, job_id, "approve"))
+
+    def _apply_review_action_progress(self, job_id: str, stage: str, message: str, progress: int, mode: str | None) -> None:
+        if str(self._review_action_job_id or "") != str(job_id or ""):
+            return
+        if self._review_action_mode and mode and self._review_action_mode != mode:
             return
         self.generate_progress_var.set(progress)
         self.generate_status_var.set(message)
 
-    def _start_generate_polling(self) -> None:
-        self._stop_generate_polling()
-        self._drain_generate_events()
+    def _start_review_action_polling(self) -> None:
+        self._stop_review_action_polling()
+        self._drain_review_action_events()
 
-    def _stop_generate_polling(self) -> None:
-        if self._generate_poll_after_id:
-            self.root.after_cancel(self._generate_poll_after_id)
-            self._generate_poll_after_id = None
+    def _stop_review_action_polling(self) -> None:
+        if self._review_action_poll_after_id:
+            self.root.after_cancel(self._review_action_poll_after_id)
+            self._review_action_poll_after_id = None
 
-    def _drain_generate_events(self) -> None:
-        keep_polling = self._generate_in_progress
+    def _drain_review_action_events(self) -> None:
+        keep_polling = self._review_action_in_progress
         while True:
             try:
-                stage, message, progress, job_id = self._generate_event_queue.get_nowait()
+                stage, message, progress, job_id, mode = self._review_action_event_queue.get_nowait()
             except queue.Empty:
                 break
             if stage in {"completed", "failed"}:
-                self._set_generate_state(False, job_id=job_id, status=message, context=self.generate_context_var.get(), progress=progress)
+                if mode == "portal_test":
+                    self.portal_readiness_var.set(getattr(self.pipeline, "portal_readiness", PortalAutofillReadiness(False, "Portal autofill: unavailable", "unknown", "")).summary)
+                self._set_review_action_state(False, mode=mode, job_id=job_id, status=message, context=self.generate_context_var.get(), progress=progress)
                 self.status_var.set(message)
                 self.refresh_view()
                 keep_polling = False
             else:
-                self._apply_generate_progress(str(job_id), stage, message, progress)
+                self._apply_review_action_progress(str(job_id), stage, message, progress, mode)
         if keep_polling:
-            self._generate_poll_after_id = self.root.after(100, self._drain_generate_events)
+            self._review_action_poll_after_id = self.root.after(100, self._drain_review_action_events)
         else:
-            self._generate_poll_after_id = None
+            self._review_action_poll_after_id = None
 
-    def _set_generate_state(self, in_progress: bool, *, job_id: str | None, status: str, context: str, progress: float) -> None:
+    def _set_review_action_state(self, in_progress: bool, *, mode: str | None, job_id: str | None, status: str, context: str, progress: float) -> None:
+        self._review_action_in_progress = in_progress
         self._generate_in_progress = in_progress
-        self._generate_job_id = job_id if in_progress else None
+        self._review_action_job_id = job_id if in_progress else None
+        self._review_action_mode = mode if in_progress else None
         self.generate_status_var.set(status)
-        self.generate_context_var.set(context if context else "No generation in progress.")
+        self.generate_context_var.set(context if context else "No review queue action in progress.")
         self.generate_progress_var.set(progress)
         if self.generate_button:
             self.generate_button.configure(state="disabled" if in_progress else "normal")
+        if self.approve_button:
+            self.approve_button.configure(state="disabled" if in_progress else "normal")
+        for button in self.portal_test_buttons:
+            button.configure(state="disabled" if in_progress else "normal")
 
     def _approve_and_send(self) -> None:
+        if self._review_action_in_progress:
+            self.status_var.set("A review queue action is already in progress.")
+            return
         row = self._selected_row()
         if not row:
             return
-        self.status_var.set("Sending approved match...")
+        if not self._confirm_approve_and_send(row):
+            self.status_var.set("Approve and Send canceled.")
+            return
+        self._set_review_action_state(
+            True,
+            mode="approve",
+            job_id=str(row["id"]),
+            status="Starting approved application flow...",
+            context=f"{row['title']} at {row['employer']}",
+            progress=0,
+        )
+        self.status_var.set("Starting approved application flow...")
+        self._start_review_action_polling()
         thread = threading.Thread(target=self._approve_and_send_background, args=(row["id"],), daemon=True)
+        thread.start()
+
+    def _test_portal_autofill_runtime(self) -> None:
+        if self._review_action_in_progress:
+            self.status_var.set("A review queue action is already in progress.")
+            return
+        self._set_review_action_state(
+            True,
+            mode="portal_test",
+            job_id=self.PORTAL_TEST_ACTION_ID,
+            status="Testing portal autofill runtime...",
+            context="Portal autofill runtime verification",
+            progress=0,
+        )
+        self.status_var.set("Testing portal autofill runtime...")
+        self._start_review_action_polling()
+        thread = threading.Thread(target=self._test_portal_autofill_runtime_background, daemon=True)
         thread.start()
 
     def _approve_and_send_background(self, job_id: str) -> None:
         try:
-            result = self.pipeline.approve_and_send(job_id)
+            result = self.pipeline.approve_and_send(
+                job_id,
+                progress_callback=lambda stage, message, progress: self._report_approval_progress(job_id, stage, message, progress),
+            )
             status = f"{result.status} via {result.method}"
             if result.error_message:
                 status = f"{status} - {result.error_message}"
         except Exception as exc:
             status = f"send_failed - {exc}"
-        self.root.after(
-            0,
-            lambda: (
-                self.status_var.set(status),
-                self.refresh_view(),
-            ),
-        )
+        self._review_action_event_queue.put(("completed" if not status.startswith("send_failed") else "failed", status, 8 if not status.startswith("send_failed") else 0, job_id, "approve"))
+        self.root.after(0, self._drain_review_action_events)
+
+    def _test_portal_autofill_runtime_background(self) -> None:
+        try:
+            readiness = self.pipeline.verify_portal_autofill_runtime(
+                progress_callback=lambda stage, message, progress: self._review_action_event_queue.put(
+                    (stage, message, progress, self.PORTAL_TEST_ACTION_ID, "portal_test")
+                )
+            )
+            status = readiness.summary if readiness.ready else f"{readiness.summary} - {readiness.technical_detail or readiness.reason_code}"
+            event = ("completed", status, 8, self.PORTAL_TEST_ACTION_ID, "portal_test")
+        except Exception as exc:
+            status = f"Portal runtime test failed: {exc}"
+            event = ("failed", status, 0, self.PORTAL_TEST_ACTION_ID, "portal_test")
+        self._review_action_event_queue.put(event)
+        self.root.after(0, self._drain_review_action_events)
 
     def _add_tooltip(self, widget: tk.Widget, text: str) -> None:
         self._tooltips.append(Tooltip(widget, text))
@@ -1023,6 +1176,17 @@ class JobBotDashboard:
     @staticmethod
     def _parse_csv(value: str) -> list[str]:
         return [item.strip() for item in value.split(",") if item.strip()]
+
+    def _refresh_portal_readiness(self) -> None:
+        readiness_fn = getattr(self.pipeline, "portal_autofill_readiness", None)
+        if callable(readiness_fn):
+            readiness = readiness_fn()
+            self.portal_readiness_var.set(readiness.summary)
+
+    def _portal_readiness_for_row(self, row: dict[str, object]) -> str:
+        if str(row.get("apply_method") or "") == "email":
+            return "Not needed for email apply"
+        return self.portal_readiness_var.get().replace("Portal autofill: ", "", 1)
 
     @staticmethod
     def _document_status_text(path_value: str) -> str:

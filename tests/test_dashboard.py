@@ -12,6 +12,7 @@ from database import Database
 from dashboard import JobBotDashboard
 from doc_generator import GeneratedDocs
 from database import Job
+from gmail_client import DeliveryResult
 from test_support import workspace_temp_dir
 
 
@@ -300,6 +301,54 @@ class DashboardSmokeTests(unittest.TestCase):
                     database.close()
 
     @unittest.skipIf(os.environ.get("CI") == "true", "Skipping Tk smoke test in CI")
+    def test_review_queue_shows_email_presence_column(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                database = Database(paths.database_file)
+                database.initialize()
+                try:
+                    database.upsert_job(
+                        Job(
+                            id="email-present-row",
+                            title="Head of Marketing",
+                            employer="Acme",
+                            location="New York, NY, US",
+                            salary_range="",
+                            description_full="Lead marketing.",
+                            apply_method="email",
+                            apply_url="https://example.com",
+                            hiring_manager_email="talent@example.com",
+                            source="indeed",
+                            posted_at="2026-04-08",
+                            scraped_at="2026-04-08T00:00:00+00:00",
+                        ),
+                        {},
+                    )
+                    database.record_match_result(
+                        "email-present-row",
+                        score=0,
+                        rationale="Queued",
+                        strengths=[],
+                        gaps=[],
+                        is_match=False,
+                        status="review",
+                        error_message="",
+                        scored_at="2026-04-08T00:00:00+00:00",
+                    )
+                    root = tk.Tk()
+                    root.withdraw()
+                    try:
+                        dashboard = JobBotDashboard(root, config, paths, database)
+                        values = dashboard.review_tree.item("email-present-row", "values")
+                        self.assertEqual(values[5], "present")
+                    finally:
+                        root.destroy()
+                finally:
+                    database.close()
+
+    @unittest.skipIf(os.environ.get("CI") == "true", "Skipping Tk smoke test in CI")
     def test_doc_provider_change_syncs_doc_model_options(self) -> None:
         with workspace_temp_dir() as tmp:
             with patch.dict(os.environ, {"APPDATA": str(tmp)}):
@@ -315,5 +364,214 @@ class DashboardSmokeTests(unittest.TestCase):
                     dashboard.doc_stage_provider_var.set("openai")
                     dashboard._on_doc_provider_changed()
                     self.assertEqual(dashboard.doc_stage_model_var.get(), "gpt-5-mini")
+                finally:
+                    root.destroy()
+
+    @unittest.skipIf(os.environ.get("CI") == "true", "Skipping Tk smoke test in CI")
+    def test_dashboard_shows_portal_readiness_on_init(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                database = Database(paths.database_file)
+                database.initialize()
+                root = tk.Tk()
+                root.withdraw()
+                try:
+                    dashboard = JobBotDashboard(root, config, paths, database)
+                    dashboard.pipeline.portal_autofill_readiness = lambda: type(
+                        "Readiness",
+                        (),
+                        {"ready": False, "summary": "Portal autofill: unavailable (Playwright not installed)", "reason_code": "missing_playwright"},
+                    )()
+                    dashboard._refresh_portal_readiness()
+                    self.assertEqual(dashboard.portal_readiness_var.get(), "Portal autofill: unavailable (Playwright not installed)")
+                finally:
+                    root.destroy()
+
+    @unittest.skipIf(os.environ.get("CI") == "true", "Skipping Tk smoke test in CI")
+    def test_dashboard_refresh_updates_portal_readiness(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                database = Database(paths.database_file)
+                database.initialize()
+                root = tk.Tk()
+                root.withdraw()
+                try:
+                    dashboard = JobBotDashboard(root, config, paths, database)
+                    dashboard.pipeline.portal_autofill_readiness = lambda: type(
+                        "Readiness",
+                        (),
+                        {"ready": True, "summary": "Portal autofill: ready", "reason_code": "ready"},
+                    )()
+                    dashboard.refresh_view()
+                    self.assertEqual(dashboard.portal_readiness_var.get(), "Portal autofill: ready")
+                finally:
+                    root.destroy()
+
+    @unittest.skipIf(os.environ.get("CI") == "true", "Skipping Tk smoke test in CI")
+    def test_approve_and_send_confirmation_copy_for_email_job(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                database = Database(paths.database_file)
+                database.initialize()
+                root = tk.Tk()
+                root.withdraw()
+                try:
+                    dashboard = JobBotDashboard(root, config, paths, database)
+                    heading, detail, action = dashboard._approve_and_send_confirmation_copy(
+                        {
+                            "title": "Head of Marketing",
+                            "employer": "Acme",
+                            "apply_method": "email",
+                            "hiring_manager_email": "talent@example.com",
+                        }
+                    )
+                    self.assertIn("send an application email", heading.lower())
+                    self.assertIn("talent@example.com", detail)
+                    self.assertEqual(action, "Send application")
+                finally:
+                    root.destroy()
+
+    @unittest.skipIf(os.environ.get("CI") == "true", "Skipping Tk smoke test in CI")
+    def test_approve_and_send_cancel_sets_status_and_does_not_start_thread(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                database = Database(paths.database_file)
+                database.initialize()
+                database.upsert_job(
+                    Job(
+                        id="approve-confirm-row",
+                        title="Head of Marketing",
+                        employer="Acme",
+                        location="New York, NY, US",
+                        salary_range="",
+                        description_full="Lead marketing.",
+                        apply_method="board",
+                        apply_url="https://example.com",
+                        hiring_manager_email="",
+                        source="indeed",
+                        posted_at="2026-04-08",
+                        scraped_at="2026-04-08T00:00:00+00:00",
+                    ),
+                    {},
+                )
+                database.record_match_result(
+                    "approve-confirm-row",
+                    score=0,
+                    rationale="Queued",
+                    strengths=[],
+                    gaps=[],
+                    is_match=False,
+                    status="review",
+                    error_message="",
+                    scored_at="2026-04-08T00:00:00+00:00",
+                )
+                root = tk.Tk()
+                root.withdraw()
+                try:
+                    dashboard = JobBotDashboard(root, config, paths, database)
+                    dashboard.review_tree.selection_set("approve-confirm-row")
+                    with patch.object(dashboard, "_confirm_approve_and_send", return_value=False):
+                        with patch("dashboard.threading.Thread") as thread_mock:
+                            dashboard._approve_and_send()
+                    self.assertEqual(dashboard.status_var.get(), "Approve and Send canceled.")
+                    thread_mock.assert_not_called()
+                finally:
+                    root.destroy()
+
+    @unittest.skipIf(os.environ.get("CI") == "true", "Skipping Tk smoke test in CI")
+    def test_approve_and_send_background_reports_manual_apply_status(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                database = Database(paths.database_file)
+                database.initialize()
+                root = tk.Tk()
+                root.withdraw()
+                try:
+                    dashboard = JobBotDashboard(root, config, paths, database)
+
+                    class FakePipeline:
+                        def approve_and_send(self, job_id: str, *, progress_callback=None):
+                            if progress_callback:
+                                progress_callback("attempting_portal", "Attempting portal autofill...", 6)
+                            return DeliveryResult(
+                                "greenhouse",
+                                "blocked_login",
+                                "",
+                                "Login wall blocked autofill; apply page opened for manual completion.",
+                            )
+
+                    dashboard.pipeline = FakePipeline()
+                    dashboard._approve_and_send_background("job-1")
+                    root.update()
+                    self.assertIn("blocked_login via greenhouse", dashboard.status_var.get())
+                    self.assertIn("opened for manual completion", dashboard.status_var.get())
+                finally:
+                    root.destroy()
+
+    @unittest.skipIf(os.environ.get("CI") == "true", "Skipping Tk smoke test in CI")
+    def test_test_portal_runtime_uses_shared_progress_ui(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                database = Database(paths.database_file)
+                database.initialize()
+                root = tk.Tk()
+                root.withdraw()
+                try:
+                    dashboard = JobBotDashboard(root, config, paths, database)
+
+                    class FakePipeline:
+                        def __init__(self) -> None:
+                            self.portal_readiness = type(
+                                "Readiness",
+                                (),
+                                {
+                                    "ready": False,
+                                    "summary": "Portal autofill: unavailable (Chromium launch failed)",
+                                    "reason_code": "browser_launch_failed",
+                                    "technical_detail": "winerror_5_access_denied: PermissionError: [WinError 5] Access is denied",
+                                },
+                            )()
+
+                        def verify_portal_autofill_runtime(self, *, progress_callback=None):
+                            if progress_callback:
+                                progress_callback("starting", "Testing portal autofill runtime...", 0)
+                                progress_callback("checking_runtime", "Importing Playwright and launching headless Chromium...", 4)
+                                progress_callback(
+                                    "runtime_checked",
+                                    "Portal autofill: unavailable (Chromium launch failed) - winerror_5_access_denied: PermissionError: [WinError 5] Access is denied",
+                                    7,
+                                )
+                            return self.portal_readiness
+
+                    dashboard.pipeline = FakePipeline()
+                    dashboard._test_portal_autofill_runtime()
+                    for _ in range(40):
+                        root.update()
+                        if not dashboard._generate_in_progress:
+                            break
+                        time.sleep(0.02)
+                    self.assertFalse(dashboard._generate_in_progress)
+                    self.assertEqual(dashboard.generate_progress_var.get(), 8)
+                    self.assertEqual(
+                        dashboard.generate_context_var.get(),
+                        "Portal autofill runtime verification",
+                    )
+                    self.assertIn("Chromium launch failed", dashboard.status_var.get())
+                    self.assertEqual(
+                        dashboard.portal_readiness_var.get(),
+                        "Portal autofill: unavailable (Chromium launch failed)",
+                    )
                 finally:
                     root.destroy()

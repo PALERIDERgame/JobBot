@@ -131,6 +131,10 @@ class Database:
                     message_id TEXT NOT NULL DEFAULT '',
                     error_message TEXT NOT NULL DEFAULT '',
                     delivered_at TEXT NOT NULL DEFAULT '',
+                    approval_log TEXT NOT NULL DEFAULT '',
+                    approval_route TEXT NOT NULL DEFAULT '',
+                    approval_docs_action TEXT NOT NULL DEFAULT '',
+                    approval_portal_platform TEXT NOT NULL DEFAULT '',
                     FOREIGN KEY(job_id) REFERENCES jobs(id)
                 );
 
@@ -174,6 +178,10 @@ class Database:
         self._ensure_column("generated_documents", "ai_repair_applied", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("generated_documents", "pdf_exporter_used", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("generated_documents", "page_fit_attempts", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("deliveries", "approval_log", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("deliveries", "approval_route", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("deliveries", "approval_docs_action", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("deliveries", "approval_portal_platform", "TEXT NOT NULL DEFAULT ''")
         connection.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -402,20 +410,42 @@ class Database:
         message_id: str,
         error_message: str,
         delivered_at: str,
+        approval_log: str = "",
+        approval_route: str = "",
+        approval_docs_action: str = "",
+        approval_portal_platform: str = "",
     ) -> None:
         connection = self.connect()
         connection.execute(
             """
-                INSERT INTO deliveries (job_id, method, status, message_id, error_message, delivered_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO deliveries (
+                    job_id, method, status, message_id, error_message, delivered_at,
+                    approval_log, approval_route, approval_docs_action, approval_portal_platform
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_id) DO UPDATE SET
                     method=excluded.method,
                     status=excluded.status,
                     message_id=excluded.message_id,
                     error_message=excluded.error_message,
-                    delivered_at=excluded.delivered_at
+                    delivered_at=excluded.delivered_at,
+                    approval_log=excluded.approval_log,
+                    approval_route=excluded.approval_route,
+                    approval_docs_action=excluded.approval_docs_action,
+                    approval_portal_platform=excluded.approval_portal_platform
             """,
-            (job_id, method, status, message_id, error_message, delivered_at),
+            (
+                job_id,
+                method,
+                status,
+                message_id,
+                error_message,
+                delivered_at,
+                approval_log,
+                approval_route,
+                approval_docs_action,
+                approval_portal_platform,
+            ),
         )
         connection.commit()
 
@@ -543,6 +573,7 @@ class Database:
             COALESCE(generated_documents.error_message, '') AS document_error,
             COALESCE(generated_documents.generated_at, '') AS generated_at,
             COALESCE(deliveries.status, 'pending') AS delivery_status
+            ,COALESCE(deliveries.approval_log, '') AS approval_log
         FROM jobs
         LEFT JOIN match_results ON match_results.job_id = jobs.id
         LEFT JOIN generated_documents ON generated_documents.job_id = jobs.id
@@ -601,7 +632,11 @@ class Database:
                 COALESCE(deliveries.method, 'local') AS delivery_method,
                 COALESCE(deliveries.status, 'pending') AS delivery_status,
                 COALESCE(deliveries.message_id, '') AS message_id,
-                COALESCE(deliveries.error_message, '') AS delivery_error
+                COALESCE(deliveries.error_message, '') AS delivery_error,
+                COALESCE(deliveries.approval_log, '') AS approval_log,
+                COALESCE(deliveries.approval_route, '') AS approval_route,
+                COALESCE(deliveries.approval_docs_action, '') AS approval_docs_action,
+                COALESCE(deliveries.approval_portal_platform, '') AS approval_portal_platform
             FROM jobs
             LEFT JOIN match_results ON match_results.job_id = jobs.id
             LEFT JOIN generated_documents ON generated_documents.job_id = jobs.id

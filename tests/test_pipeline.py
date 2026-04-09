@@ -9,8 +9,10 @@ from unittest.mock import patch
 from config import build_app_paths, load_or_create_config
 from database import Database, Job
 from document_tailoring import DocumentTailoringAttempt, DocumentTailoringPayload
+from gmail_client import DeliveryResult
 from match_scorer import StageEvaluation
 from pipeline import JobBotPipeline
+from portal_filler import PortalResult
 from resume_parser import ResumeData, ResumeWorkEntry
 from test_support import workspace_temp_dir
 
@@ -252,7 +254,7 @@ class PipelineTests(unittest.TestCase):
                     "strong", "openai", "gpt-5-mini", "scored", "apply_candidate", 91, 0.9, "Great fit", ["Python"], ["AWS"], 200, 20, 0.0002, "", "2026-01-01T00:00:00+00:00"
                 )
                 pipeline.scorer.document_generation_notes = lambda job, resume, strong_eval: "Tailored note"
-                pipeline.gmail_client.deliver_match = lambda job, score, docs: type(
+                pipeline.gmail_client.deliver_match = lambda job, score, docs, **kwargs: type(
                     "Delivery",
                     (),
                     {"method": "local", "status": "skipped", "message_id": "", "error_message": ""},
@@ -303,7 +305,7 @@ class PipelineTests(unittest.TestCase):
                     "strong", "openai", "gpt-5-mini", "scored", "apply_candidate", 91, 0.9, "Great fit", ["Python"], ["AWS"], 200, 20, 0.0002, "", "2026-01-01T00:00:00+00:00"
                 )
                 pipeline.scorer.document_generation_notes = lambda job, resume, strong_eval: "Tailored note"
-                pipeline.gmail_client.deliver_match = lambda job, score, docs: type(
+                pipeline.gmail_client.deliver_match = lambda job, score, docs, **kwargs: type(
                     "Delivery",
                     (),
                     {"method": "gmail_employer", "status": "sent", "message_id": "abc123", "error_message": ""},
@@ -354,7 +356,7 @@ class PipelineTests(unittest.TestCase):
                     "strong", "openai", "gpt-5-mini", "scored", "apply_candidate", 91, 0.9, "Great fit", ["Python"], ["AWS"], 200, 20, 0.0002, "", "2026-01-01T00:00:00+00:00"
                 )
                 pipeline.scorer.document_generation_notes = lambda job, resume, strong_eval: "Tailored note"
-                pipeline.gmail_client.deliver_match = lambda job, score, docs: type(
+                pipeline.gmail_client.deliver_match = lambda job, score, docs, **kwargs: type(
                     "Delivery",
                     (),
                     {"method": "gmail", "status": "sent", "message_id": "abc123", "error_message": ""},
@@ -363,6 +365,330 @@ class PipelineTests(unittest.TestCase):
                 row = database.get_review_row("3")
                 self.assertEqual(row["delivery_status"], "pending_approval")
                 self.assertEqual(row["apply_method"], "board")
+
+    def test_approve_and_send_employer_email_uses_gmail_without_fallback(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                config.automation_mode = "semi_auto"
+                config.skip_ai_scoring_in_semi_auto = True
+                resume_path = Path(tmp) / "resume.txt"
+                resume_path.write_text(
+                    "Jane Candidate\njane@example.com\n555-123-4567\nSummary: Marketing leader\nSkills: Marketing\nBuilt APIs\n",
+                    encoding="utf-8",
+                )
+                config.resume_source_path = str(resume_path)
+                database = Database(paths.database_file)
+                database.initialize()
+                pipeline = JobBotPipeline(config, paths, database)
+                database.upsert_job(
+                    Job(
+                        id="approve-email-1",
+                        title="Head of Marketing",
+                        employer="Acme",
+                        location="Remote",
+                        salary_range="",
+                        description_full="Email your resume to hiring@example.com",
+                        apply_method="email",
+                        apply_url="https://example.com",
+                        hiring_manager_email="hiring@example.com",
+                        source="jobspy",
+                        posted_at="2026-01-01T00:00:00+00:00",
+                        scraped_at="2026-01-01T00:00:00+00:00",
+                    ),
+                    {},
+                )
+                database.record_match_result(
+                    "approve-email-1",
+                    score=82,
+                    rationale="Strong fit",
+                    strengths=[],
+                    gaps=[],
+                    is_match=True,
+                    status="review",
+                    error_message="",
+                    scored_at="2026-01-01T00:00:00+00:00",
+                )
+                out = Path(tmp) / "output"
+                out.mkdir(parents=True, exist_ok=True)
+                resume_pdf = out / "resume.pdf"
+                cover = out / "cover_letter.txt"
+                resume_pdf.write_text("pdf", encoding="utf-8")
+                cover.write_text("cover", encoding="utf-8")
+                database.record_generated_documents(
+                    "approve-email-1",
+                    output_dir=str(out),
+                    resume_docx_path="",
+                    resume_pdf_path=str(resume_pdf),
+                    cover_letter_path=str(cover),
+                    status="generated",
+                    error_message="",
+                    generated_at="2026-01-01T00:00:00+00:00",
+                )
+                captured: dict[str, object] = {}
+
+                def fake_deliver(job, score, docs, **kwargs):
+                    captured["allow_fallback"] = kwargs.get("allow_fallback")
+                    return DeliveryResult("gmail_employer", "sent", "abc123", "")
+
+                pipeline.gmail_client.deliver_match = fake_deliver
+                result = pipeline.approve_and_send("approve-email-1")
+                self.assertEqual(result.status, "sent")
+                self.assertEqual(result.method, "gmail_employer")
+                self.assertFalse(captured["allow_fallback"])
+                row = database.get_review_row("approve-email-1")
+                self.assertEqual(row["delivery_status"], "sent")
+                self.assertEqual(row["delivery_method"], "gmail_employer")
+
+    def test_approve_and_send_supported_portal_submits_without_gmail(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                config.automation_mode = "semi_auto"
+                config.skip_ai_scoring_in_semi_auto = True
+                resume_path = Path(tmp) / "resume.txt"
+                resume_path.write_text(
+                    "Jane Candidate\njane@example.com\n555-123-4567\nSummary: Marketing leader\nSkills: Marketing\nBuilt APIs\n",
+                    encoding="utf-8",
+                )
+                config.resume_source_path = str(resume_path)
+                database = Database(paths.database_file)
+                database.initialize()
+                pipeline = JobBotPipeline(config, paths, database)
+                database.upsert_job(
+                    Job(
+                        id="approve-portal-1",
+                        title="Head of Marketing",
+                        employer="Acme",
+                        location="Remote",
+                        salary_range="",
+                        description_full="Apply on company site.",
+                        apply_method="board",
+                        apply_url="https://boards.greenhouse.io/acme/jobs/123",
+                        hiring_manager_email="",
+                        source="jobspy",
+                        posted_at="2026-01-01T00:00:00+00:00",
+                        scraped_at="2026-01-01T00:00:00+00:00",
+                    ),
+                    {},
+                )
+                database.record_match_result(
+                    "approve-portal-1",
+                    score=82,
+                    rationale="Strong fit",
+                    strengths=[],
+                    gaps=[],
+                    is_match=True,
+                    status="review",
+                    error_message="",
+                    scored_at="2026-01-01T00:00:00+00:00",
+                )
+                out = Path(tmp) / "output"
+                out.mkdir(parents=True, exist_ok=True)
+                resume_pdf = out / "resume.pdf"
+                cover = out / "cover_letter.txt"
+                resume_pdf.write_text("pdf", encoding="utf-8")
+                cover.write_text("cover", encoding="utf-8")
+                database.record_generated_documents(
+                    "approve-portal-1",
+                    output_dir=str(out),
+                    resume_docx_path="",
+                    resume_pdf_path=str(resume_pdf),
+                    cover_letter_path=str(cover),
+                    status="generated",
+                    error_message="",
+                    generated_at="2026-01-01T00:00:00+00:00",
+                )
+                pipeline.gmail_client.deliver_match = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("gmail should not be used for board jobs"))
+                pipeline.portal_readiness.ready = True
+                pipeline.portal_readiness.summary = "Portal autofill: ready"
+                pipeline.portal_readiness.reason_code = "ready"
+                pipeline.portal_filler.fill = lambda *args, **kwargs: PortalResult("submitted", "Submitted via Greenhouse.", "greenhouse")
+                result = pipeline.approve_and_send("approve-portal-1")
+                self.assertEqual(result.status, "submitted")
+                self.assertEqual(result.method, "greenhouse")
+                row = database.get_review_row("approve-portal-1")
+                self.assertEqual(row["delivery_status"], "submitted")
+                self.assertEqual(row["delivery_method"], "greenhouse")
+
+    def test_approve_and_send_unsupported_portal_opens_manual_page(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                config.automation_mode = "semi_auto"
+                config.skip_ai_scoring_in_semi_auto = True
+                resume_path = Path(tmp) / "resume.txt"
+                resume_path.write_text(
+                    "Jane Candidate\njane@example.com\n555-123-4567\nSummary: Marketing leader\nSkills: Marketing\nBuilt APIs\n",
+                    encoding="utf-8",
+                )
+                config.resume_source_path = str(resume_path)
+                database = Database(paths.database_file)
+                database.initialize()
+                pipeline = JobBotPipeline(config, paths, database)
+                database.upsert_job(
+                    Job(
+                        id="approve-portal-2",
+                        title="Head of Marketing",
+                        employer="Acme",
+                        location="Remote",
+                        salary_range="",
+                        description_full="Apply on company site.",
+                        apply_method="board",
+                        apply_url="https://careers.example.com/jobs/123",
+                        hiring_manager_email="",
+                        source="jobspy",
+                        posted_at="2026-01-01T00:00:00+00:00",
+                        scraped_at="2026-01-01T00:00:00+00:00",
+                    ),
+                    {},
+                )
+                database.record_match_result(
+                    "approve-portal-2",
+                    score=82,
+                    rationale="Strong fit",
+                    strengths=[],
+                    gaps=[],
+                    is_match=True,
+                    status="review",
+                    error_message="",
+                    scored_at="2026-01-01T00:00:00+00:00",
+                )
+                out = Path(tmp) / "output"
+                out.mkdir(parents=True, exist_ok=True)
+                resume_pdf = out / "resume.pdf"
+                cover = out / "cover_letter.txt"
+                resume_pdf.write_text("pdf", encoding="utf-8")
+                cover.write_text("cover", encoding="utf-8")
+                database.record_generated_documents(
+                    "approve-portal-2",
+                    output_dir=str(out),
+                    resume_docx_path="",
+                    resume_pdf_path=str(resume_pdf),
+                    cover_letter_path=str(cover),
+                    status="generated",
+                    error_message="",
+                    generated_at="2026-01-01T00:00:00+00:00",
+                )
+                pipeline.portal_readiness.ready = True
+                pipeline.portal_readiness.summary = "Portal autofill: ready"
+                pipeline.portal_readiness.reason_code = "ready"
+                pipeline.portal_filler.fill = lambda *args, **kwargs: PortalResult("unsupported", "Unsupported portal.", "unknown")
+                with patch("pipeline.webbrowser.open", return_value=True) as open_mock:
+                    result = pipeline.approve_and_send("approve-portal-2")
+                self.assertEqual(result.status, "unsupported_portal")
+                self.assertEqual(result.method, "portal")
+                self.assertIn("opened apply page", result.error_message.lower())
+                open_mock.assert_called_once()
+                row = database.get_review_row("approve-portal-2")
+                self.assertEqual(row["delivery_status"], "unsupported_portal")
+                self.assertEqual(row["delivery_method"], "portal")
+
+    def test_approve_and_send_skips_portal_when_readiness_unavailable(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                config.automation_mode = "semi_auto"
+                config.skip_ai_scoring_in_semi_auto = True
+                resume_path = Path(tmp) / "resume.txt"
+                resume_path.write_text(
+                    "Jane Candidate\njane@example.com\n555-123-4567\nSummary: Marketing leader\nSkills: Marketing\nBuilt APIs\n",
+                    encoding="utf-8",
+                )
+                config.resume_source_path = str(resume_path)
+                database = Database(paths.database_file)
+                database.initialize()
+                pipeline = JobBotPipeline(config, paths, database)
+                pipeline.portal_readiness.ready = False
+                pipeline.portal_readiness.summary = "Portal autofill: unavailable (Playwright not installed)"
+                pipeline.portal_readiness.reason_code = "missing_playwright"
+                pipeline.portal_readiness.technical_detail = "ImportError: No module named 'playwright'"
+                database.upsert_job(
+                    Job(
+                        id="approve-portal-3",
+                        title="Head of Marketing",
+                        employer="Acme",
+                        location="Remote",
+                        salary_range="",
+                        description_full="Apply on company site.",
+                        apply_method="board",
+                        apply_url="https://careers.example.com/jobs/456",
+                        hiring_manager_email="",
+                        source="jobspy",
+                        posted_at="2026-01-01T00:00:00+00:00",
+                        scraped_at="2026-01-01T00:00:00+00:00",
+                    ),
+                    {},
+                )
+                database.record_match_result(
+                    "approve-portal-3",
+                    score=82,
+                    rationale="Strong fit",
+                    strengths=[],
+                    gaps=[],
+                    is_match=True,
+                    status="review",
+                    error_message="",
+                    scored_at="2026-01-01T00:00:00+00:00",
+                )
+                out = Path(tmp) / "output"
+                out.mkdir(parents=True, exist_ok=True)
+                resume_pdf = out / "resume.pdf"
+                cover = out / "cover_letter.txt"
+                resume_pdf.write_text("pdf", encoding="utf-8")
+                cover.write_text("cover", encoding="utf-8")
+                database.record_generated_documents(
+                    "approve-portal-3",
+                    output_dir=str(out),
+                    resume_docx_path="",
+                    resume_pdf_path=str(resume_pdf),
+                    cover_letter_path=str(cover),
+                    status="generated",
+                    error_message="",
+                    generated_at="2026-01-01T00:00:00+00:00",
+                )
+                pipeline.portal_filler.fill = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("portal filler should not run"))
+                with patch("pipeline.webbrowser.open", return_value=True) as open_mock:
+                    result = pipeline.approve_and_send("approve-portal-3")
+                self.assertEqual(result.status, "opened_manual")
+                self.assertEqual(result.method, "portal")
+                self.assertIn("portal autofill unavailable", result.error_message.lower())
+                open_mock.assert_called_once()
+                row = database.get_review_row("approve-portal-3")
+                self.assertIn("Portal readiness detail: ImportError", row["approval_log"])
+
+    def test_verify_portal_autofill_runtime_returns_readiness_and_emits_progress(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                database = Database(paths.database_file)
+                database.initialize()
+                pipeline = JobBotPipeline(config, paths, database)
+                pipeline.portal_filler.check_readiness = lambda: type(
+                    "Readiness",
+                    (),
+                    {
+                        "ready": False,
+                        "summary": "Portal autofill: unavailable (Chromium launch failed)",
+                        "reason_code": "browser_launch_failed",
+                        "technical_detail": "winerror_5_access_denied: PermissionError: [WinError 5] Access is denied",
+                    },
+                )()
+                events: list[tuple[str, str, int]] = []
+                readiness = pipeline.verify_portal_autofill_runtime(
+                    progress_callback=lambda stage, message, progress: events.append((stage, message, progress))
+                )
+                self.assertFalse(readiness.ready)
+                self.assertEqual(readiness.reason_code, "browser_launch_failed")
+                self.assertEqual(events[0], ("starting", "Testing portal autofill runtime...", 0))
+                self.assertEqual(events[1], ("checking_runtime", "Importing Playwright and launching headless Chromium...", 4))
+                self.assertEqual(events[2][0], "runtime_checked")
+                self.assertIn("winerror_5_access_denied", events[2][1])
 
     def test_semi_auto_can_skip_ai_scoring_and_queue_fast(self) -> None:
         with workspace_temp_dir() as tmp:

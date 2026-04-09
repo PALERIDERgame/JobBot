@@ -30,7 +30,7 @@ class GmailClient:
         self.config = config
         self.token_path = token_path
 
-    def deliver_match(self, job: Job, score: MatchScore, docs: GeneratedDocs) -> DeliveryResult:
+    def deliver_match(self, job: Job, score: MatchScore, docs: GeneratedDocs, *, allow_fallback: bool = True) -> DeliveryResult:
         if not self.config.enabled:
             return DeliveryResult("local", "skipped", "", "Gmail delivery disabled")
         if not self.config.sender_email:
@@ -38,7 +38,7 @@ class GmailClient:
         if not self.config.client_secrets_file:
             return DeliveryResult("gmail", "failed", "", "Gmail client secrets file missing")
 
-        recipient, method = self._resolve_recipient(job)
+        recipient, method = self._resolve_recipient(job, allow_fallback=allow_fallback)
         if not recipient:
             return DeliveryResult(method, "failed", "", "No delivery recipient available")
 
@@ -77,10 +77,10 @@ class GmailClient:
             LOGGER.exception("Failed to send Gmail delivery for %s", job.id)
             return DeliveryResult(method, "failed", "", str(exc))
 
-    def _resolve_recipient(self, job: Job) -> tuple[str, str]:
+    def _resolve_recipient(self, job: Job, *, allow_fallback: bool = True) -> tuple[str, str]:
         if job.apply_method == "email" and job.hiring_manager_email:
             return job.hiring_manager_email, "gmail_employer"
-        if self.config.recipient_email:
+        if allow_fallback and self.config.recipient_email:
             return self.config.recipient_email, "gmail"
         return "", "gmail"
 
