@@ -4,7 +4,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-from portal_filler import PortalFiller
+from portal_filler import IndeedHandler, PortalFiller, detect_platform
 
 
 class PortalFillerReadinessTests(unittest.TestCase):
@@ -68,3 +68,57 @@ class PortalFillerReadinessTests(unittest.TestCase):
         self.assertTrue(readiness.ready)
         self.assertEqual(readiness.reason_code, "ready")
         self.assertIn("launch succeeded", readiness.technical_detail.lower())
+
+
+class PortalDetectionTests(unittest.TestCase):
+    def test_detect_platform_returns_indeed_for_viewjob(self) -> None:
+        self.assertEqual(detect_platform("https://www.indeed.com/viewjob?jk=123"), "indeed")
+
+    def test_detect_platform_returns_indeed_for_apply_domain(self) -> None:
+        self.assertEqual(detect_platform("https://apply.indeed.com/indeedapply/form/abc"), "indeed")
+
+
+class IndeedHandlerTests(unittest.TestCase):
+    def _build_handler(self, *, url: str, content: str = "", selectors: set[str] | None = None) -> IndeedHandler:
+        selectors = selectors or set()
+
+        class FakePage:
+            def __init__(self) -> None:
+                self.url = url
+
+            def wait_for_load_state(self, *_args, **_kwargs):
+                return None
+
+            def content(self):
+                return content
+
+            def query_selector(self, selector):
+                return object() if selector in selectors else None
+
+        resume = types.SimpleNamespace(name="Jane Candidate", email="jane@example.com", phone="555-123-4567", header_lines=[])
+        docs = types.SimpleNamespace(resume_pdf_path=None, resume_docx_path=None, cover_letter_path=None, output_dir=None)
+        job = types.SimpleNamespace(title="Role", employer="Acme", apply_url=url)
+        return IndeedHandler(FakePage(), resume, docs, job, None)
+
+    def test_indeed_handler_marks_plain_viewjob_as_unsupported(self) -> None:
+        handler = self._build_handler(url="https://www.indeed.com/viewjob?jk=123", content="job details")
+        result = handler.fill()
+        self.assertEqual(result.status, "unsupported")
+        self.assertEqual(result.platform, "indeed")
+        self.assertIn("posting page", result.message.lower())
+
+    def test_indeed_handler_marks_screening_questions_for_manual_review(self) -> None:
+        handler = self._build_handler(
+            url="https://apply.indeed.com/indeedapply/form/abc",
+            content="screening questions resume",
+            selectors={"input[type='file']", "input[type='email']"},
+        )
+        result = handler.fill()
+        self.assertEqual(result.status, "screening_questions")
+        self.assertEqual(result.platform, "indeed")
+
+    def test_indeed_handler_reports_login_wall(self) -> None:
+        handler = self._build_handler(url="https://apply.indeed.com/indeedapply/form/abc", content="please sign in to apply")
+        result = handler.fill()
+        self.assertEqual(result.status, "login_required")
+        self.assertEqual(result.platform, "indeed")

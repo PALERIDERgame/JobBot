@@ -587,6 +587,160 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(row["delivery_status"], "unsupported_portal")
                 self.assertEqual(row["delivery_method"], "portal")
 
+    def test_approve_and_send_indeed_posting_page_preserves_indeed_platform_in_log(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                config.automation_mode = "semi_auto"
+                config.skip_ai_scoring_in_semi_auto = True
+                resume_path = Path(tmp) / "resume.txt"
+                resume_path.write_text(
+                    "Jane Candidate\njane@example.com\n555-123-4567\nSummary: Marketing leader\nSkills: Marketing\nBuilt APIs\n",
+                    encoding="utf-8",
+                )
+                config.resume_source_path = str(resume_path)
+                database = Database(paths.database_file)
+                database.initialize()
+                pipeline = JobBotPipeline(config, paths, database)
+                database.upsert_job(
+                    Job(
+                        id="approve-indeed-1",
+                        title="Head of Marketing",
+                        employer="Acme",
+                        location="Remote",
+                        salary_range="",
+                        description_full="Apply on Indeed.",
+                        apply_method="board",
+                        apply_url="https://www.indeed.com/viewjob?jk=123",
+                        hiring_manager_email="",
+                        source="jobspy",
+                        posted_at="2026-01-01T00:00:00+00:00",
+                        scraped_at="2026-01-01T00:00:00+00:00",
+                    ),
+                    {},
+                )
+                database.record_match_result(
+                    "approve-indeed-1",
+                    score=82,
+                    rationale="Strong fit",
+                    strengths=[],
+                    gaps=[],
+                    is_match=True,
+                    status="review",
+                    error_message="",
+                    scored_at="2026-01-01T00:00:00+00:00",
+                )
+                out = Path(tmp) / "output"
+                out.mkdir(parents=True, exist_ok=True)
+                resume_pdf = out / "resume.pdf"
+                cover = out / "cover_letter.txt"
+                resume_pdf.write_text("pdf", encoding="utf-8")
+                cover.write_text("cover", encoding="utf-8")
+                database.record_generated_documents(
+                    "approve-indeed-1",
+                    output_dir=str(out),
+                    resume_docx_path="",
+                    resume_pdf_path=str(resume_pdf),
+                    cover_letter_path=str(cover),
+                    status="generated",
+                    error_message="",
+                    generated_at="2026-01-01T00:00:00+00:00",
+                )
+                pipeline.portal_readiness.ready = True
+                pipeline.portal_readiness.summary = "Portal autofill: ready"
+                pipeline.portal_readiness.reason_code = "ready"
+                pipeline.portal_filler.fill = lambda *args, **kwargs: PortalResult(
+                    "unsupported",
+                    "Indeed posting page is not an automatable Indeed apply form.",
+                    "indeed",
+                )
+                with patch("pipeline.webbrowser.open", return_value=True):
+                    result = pipeline.approve_and_send("approve-indeed-1")
+                self.assertEqual(result.status, "unsupported_portal")
+                self.assertEqual(result.method, "indeed")
+                self.assertIn("indeed posting page", result.error_message.lower())
+                row = database.get_review_row("approve-indeed-1")
+                self.assertEqual(row["delivery_method"], "indeed")
+                self.assertIn("Portal platform: indeed", row["approval_log"])
+                self.assertIn("Fallback: indeed posting page", row["approval_log"])
+
+    def test_approve_and_send_screening_questions_open_manual_review(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                config.automation_mode = "semi_auto"
+                config.skip_ai_scoring_in_semi_auto = True
+                resume_path = Path(tmp) / "resume.txt"
+                resume_path.write_text(
+                    "Jane Candidate\njane@example.com\n555-123-4567\nSummary: Marketing leader\nSkills: Marketing\nBuilt APIs\n",
+                    encoding="utf-8",
+                )
+                config.resume_source_path = str(resume_path)
+                database = Database(paths.database_file)
+                database.initialize()
+                pipeline = JobBotPipeline(config, paths, database)
+                database.upsert_job(
+                    Job(
+                        id="approve-indeed-2",
+                        title="Head of Marketing",
+                        employer="Acme",
+                        location="Remote",
+                        salary_range="",
+                        description_full="Apply on Indeed.",
+                        apply_method="board",
+                        apply_url="https://apply.indeed.com/indeedapply/form/abc",
+                        hiring_manager_email="",
+                        source="jobspy",
+                        posted_at="2026-01-01T00:00:00+00:00",
+                        scraped_at="2026-01-01T00:00:00+00:00",
+                    ),
+                    {},
+                )
+                database.record_match_result(
+                    "approve-indeed-2",
+                    score=82,
+                    rationale="Strong fit",
+                    strengths=[],
+                    gaps=[],
+                    is_match=True,
+                    status="review",
+                    error_message="",
+                    scored_at="2026-01-01T00:00:00+00:00",
+                )
+                out = Path(tmp) / "output"
+                out.mkdir(parents=True, exist_ok=True)
+                resume_pdf = out / "resume.pdf"
+                cover = out / "cover_letter.txt"
+                resume_pdf.write_text("pdf", encoding="utf-8")
+                cover.write_text("cover", encoding="utf-8")
+                database.record_generated_documents(
+                    "approve-indeed-2",
+                    output_dir=str(out),
+                    resume_docx_path="",
+                    resume_pdf_path=str(resume_pdf),
+                    cover_letter_path=str(cover),
+                    status="generated",
+                    error_message="",
+                    generated_at="2026-01-01T00:00:00+00:00",
+                )
+                pipeline.portal_readiness.ready = True
+                pipeline.portal_readiness.summary = "Portal autofill: ready"
+                pipeline.portal_readiness.reason_code = "ready"
+                pipeline.portal_filler.fill = lambda *args, **kwargs: PortalResult(
+                    "screening_questions",
+                    "Indeed apply flow includes screening questions that require manual review.",
+                    "indeed",
+                )
+                with patch("pipeline.webbrowser.open", return_value=True):
+                    result = pipeline.approve_and_send("approve-indeed-2")
+                self.assertEqual(result.status, "opened_manual")
+                self.assertEqual(result.method, "indeed")
+                self.assertIn("screening questions", result.error_message.lower())
+                row = database.get_review_row("approve-indeed-2")
+                self.assertIn("Fallback: screening questions", row["approval_log"])
+
     def test_approve_and_send_skips_portal_when_readiness_unavailable(self) -> None:
         with workspace_temp_dir() as tmp:
             with patch.dict(os.environ, {"APPDATA": str(tmp)}):

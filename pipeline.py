@@ -791,18 +791,50 @@ class JobBotPipeline:
             )
             return ApprovalResult(result, log, "portal", docs_action, method)
         if portal_result.status == "unsupported":
+            if method == "indeed" and "posting page" in portal_result.message.lower():
+                detail = (
+                    "Indeed posting page is not an automatable apply form; opened apply page for manual completion."
+                    if opened
+                    else "Indeed posting page is not an automatable apply form."
+                )
+                fallback_label = "indeed posting page"
+            else:
+                detail = (
+                    "Portal not supported for autofill; opened apply page for manual completion."
+                    if opened
+                    else "Portal not supported for autofill."
+                )
+                fallback_label = "unsupported portal"
             result = DeliveryResult(
                 method,
                 "unsupported_portal",
                 "",
-                "Portal not supported for autofill; opened apply page for manual completion." if opened else "Portal not supported for autofill.",
+                detail,
             )
             log = "\n".join(
                 [
                     "Route: portal",
                     f"Documents: {docs_action}",
                     f"Portal platform: {method}",
-                    "Fallback: unsupported portal",
+                    f"Fallback: {fallback_label}",
+                    f"Final status: {result.status} via {result.method}",
+                    f"Message: {result.error_message}",
+                ]
+            )
+            return ApprovalResult(result, log, "portal", docs_action, method)
+        if portal_result.status == "screening_questions":
+            result = DeliveryResult(
+                method,
+                "opened_manual" if opened else "failed",
+                "",
+                "Screening questions require manual completion; opened apply page for review." if opened else "Screening questions require manual completion.",
+            )
+            log = "\n".join(
+                [
+                    "Route: portal",
+                    f"Documents: {docs_action}",
+                    f"Portal platform: {method}",
+                    "Fallback: screening questions",
                     f"Final status: {result.status} via {result.method}",
                     f"Message: {result.error_message}",
                 ]

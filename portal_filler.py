@@ -21,6 +21,7 @@ LOGGER = logging.getLogger(__name__)
 ProgressCallback = Callable[[str, str, int], None] | None
 
 PORTAL_PATTERNS: dict[str, re.Pattern[str]] = {
+    "indeed": re.compile(r"(?:^|//)(?:www\.)?indeed\.com/(?:viewjob|jobs)|(?:^|//)apply\.indeed\.com", re.IGNORECASE),
     "greenhouse": re.compile(r"boards\.greenhouse\.io|app\.greenhouse\.io", re.IGNORECASE),
     "lever": re.compile(r"jobs\.lever\.co", re.IGNORECASE),
     "workday": re.compile(r"myworkdayjobs\.com|wd\d+\.myworkdayjobs\.com", re.IGNORECASE),
@@ -190,6 +191,13 @@ class _BaseHandler:
         "thanks for applying",
         "you've applied",
     ]
+    SCREENING_PHRASES = [
+        "screening questions",
+        "additional questions",
+        "assessment",
+        "work authorization",
+        "years of experience",
+    ]
 
     def __init__(self, page, resume: ResumeData, docs: GeneratedDocs, job: Job, cb: ProgressCallback) -> None:
         self.page = page
@@ -231,6 +239,12 @@ class _BaseHandler:
             return any(phrase in content for phrase in self.SUCCESS_PHRASES)
         except Exception:
             return False
+
+    def _page_content_lower(self) -> str:
+        try:
+            return self.page.content().lower()
+        except Exception:
+            return ""
 
     def _fill_field(self, selector: str, value: str) -> bool:
         try:
@@ -276,6 +290,28 @@ class _BaseHandler:
         output_dir = _output_dir(self.docs)
         if not output_dir:
             return None
+
+    def _has_screening_questions(self) -> bool:
+        content = self._page_content_lower()
+        if any(phrase in content for phrase in self.SCREENING_PHRASES):
+            return True
+        selectors = [
+            "select",
+            "textarea",
+            "input[type='radio']",
+            "input[type='checkbox']",
+            "[data-testid*='question']",
+            "[class*='question']",
+        ]
+        found_complex_question = False
+        for selector in selectors:
+            try:
+                if self.page.query_selector(selector):
+                    found_complex_question = True
+                    break
+            except Exception:
+                continue
+        return found_complex_question and ("resume" not in content or "cover letter" not in content)
         try:
             path = output_dir / f"portal_{label}.png"
             self.page.screenshot(path=str(path))
@@ -403,7 +439,116 @@ class GenericHandler(_BaseHandler):
         return PortalResult("unsupported", f"Portal not supported for autofill: {self.job.apply_url}", "unknown")
 
 
+class IndeedHandler(_BaseHandler):
+    HOSTED_FORM_SELECTORS = [
+        "input[type='file']",
+        "input[name*='resume']",
+        "input[placeholder*='Full name']",
+        "input[placeholder*='Phone']",
+        "input[type='email']",
+        "button[type='submit']",
+        "[data-testid*='apply']",
+    ]
+
+    def _current_url(self) -> str:
+        return str(getattr(self.page, "url", "") or self.job.apply_url or "")
+
+    def _is_indeed_domain(self) -> bool:
+        return "indeed.com" in self._current_url().lower()
+
+    def _looks_like_posting_page(self) -> bool:
+        url = self._current_url().lower()
+        if "/viewjob" in url and "apply.indeed.com" not in url:
+            return True
+        content = self._page_content_lower()
+        return "job details" in content and "apply now" not in content and "continue to application" not in content
+
+    def _looks_like_hosted_form(self) -> bool:
+        url = self._current_url().lower()
+        if "apply.indeed.com" in url:
+            return True
+        content = self._page_content_lower()
+        if "indeed apply" in content or "apply with your indeed resume" in content:
+            return True
+        for selector in self.HOSTED_FORM_SELECTORS:
+            try:
+                if self.page.query_selector(selector):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def fill(self) -> PortalResult:
+        _emit(self.cb, "portal_fill", "Loading Indeed application form...", 2)
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=self.PAGE_TIMEOUT)
+        except Exception:
+            pass
+        if self._has_captcha():
+            return PortalResult("captcha", "CAPTCHA detected on Indeed.", "indeed")
+        if self._has_login_wall():
+            return PortalResult("login_required", "Login wall detected on Indeed.", "indeed")
+        if not self._is_indeed_domain():
+            return PortalResult("unsupported", "Indeed redirected to an external employer application page.", "indeed")
+        if self._looks_like_posting_page():
+            return PortalResult("unsupported", "Indeed posting page is not an automatable Indeed apply form.", "indeed")
+        if not self._looks_like_hosted_form():
+            return PortalResult("unsupported", "Indeed page shape is not recognized as a hosted apply form.", "indeed")
+        if self._has_screening_questions():
+            return PortalResult("screening_questions", "Indeed apply flow includes screening questions that require manual review.", "indeed")
+
+        _emit(self.cb, "portal_fill", "Filling Indeed contact fields...", 3)
+        self._try_fill(
+            ["input[name*='name']", "input[id*='name']", "input[placeholder*='Full name']", "input[autocomplete='name']"],
+            self.resume.name or "",
+        )
+        self._try_fill(
+            ["input[name*='email']", "input[id*='email']", "input[type='email']", "input[autocomplete='email']"],
+            self.resume.email or "",
+        )
+        self._try_fill(
+            ["input[name*='phone']", "input[id*='phone']", "input[type='tel']", "input[autocomplete='tel']"],
+            self.resume.phone or "",
+        )
+
+        _emit(self.cb, "portal_fill", "Uploading resume...", 4)
+        resume_file = _best_resume_file(self.docs)
+        if resume_file:
+            self._upload_file(
+                ["input[type='file'][name*='resume']", "input[type='file'][id*='resume']", "input[type='file']"],
+                resume_file,
+            )
+        if self.docs.cover_letter_path and self.docs.cover_letter_path.exists():
+            self._upload_file(
+                ["input[type='file'][name*='cover']", "input[type='file'][id*='cover']"],
+                str(self.docs.cover_letter_path),
+            )
+        if self._has_screening_questions():
+            return PortalResult("screening_questions", "Indeed apply flow surfaced screening questions after basic fields.", "indeed")
+        if self._has_captcha():
+            return PortalResult("captcha", "CAPTCHA appeared before submit on Indeed.", "indeed")
+
+        _emit(self.cb, "portal_fill", "Submitting Indeed application...", 5)
+        submitted = self._click_submit(
+            [
+                "button[type='submit']",
+                "input[type='submit']",
+                "button:has-text('Submit application')",
+                "button:has-text('Apply now')",
+                "button:has-text('Continue')",
+            ]
+        )
+        if not submitted:
+            return PortalResult("unsupported", "Indeed apply form did not expose a safe final submit action.", "indeed", self._screenshot("indeed_submit_missing"))
+
+        _emit(self.cb, "portal_fill", "Confirming Indeed submission...", 6)
+        if not self._confirm_success():
+            return PortalResult("unsupported", "Indeed submit clicked but confirmation was not detected safely.", "indeed", self._screenshot("indeed_confirm_fail"))
+        return PortalResult("submitted", f"Submitted via Indeed for {self.job.title} at {self.job.employer}.", "indeed")
+
+
 _HANDLER_MAP: dict[str, type[_BaseHandler]] = {
+    "indeed": IndeedHandler,
     "greenhouse": GreenhouseHandler,
     "lever": LeverHandler,
 }
