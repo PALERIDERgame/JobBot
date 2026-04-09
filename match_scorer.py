@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -572,18 +573,22 @@ class MatchScorer:
                     return {"base_url": self.config.ollama_base_url.rstrip("/")}
             except Exception:  # pragma: no cover
                 return None
-        if provider == "anthropic" and self.config.anthropic_api_key:
-            try:
-                from anthropic import Anthropic
-            except ImportError:  # pragma: no cover
-                return None
-            return Anthropic(api_key=self.config.anthropic_api_key)
-        if provider == "openai" and self.config.openai_api_key:
-            try:
-                from openai import OpenAI
-            except ImportError:  # pragma: no cover
-                return None
-            return OpenAI(api_key=self.config.openai_api_key)
+        if provider == "anthropic":
+            api_key = self.config.anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+            if api_key:
+                try:
+                    from anthropic import Anthropic
+                except ImportError:  # pragma: no cover
+                    return None
+                return Anthropic(api_key=api_key)
+        if provider == "openai":
+            api_key = self.config.openai_api_key or os.environ.get("OPENAI_API_KEY", "")
+            if api_key:
+                try:
+                    from openai import OpenAI
+                except ImportError:  # pragma: no cover
+                    return None
+                return OpenAI(api_key=api_key)
         return None
 
     def _create_completion_with_usage(self, provider: str, model: str, prompt: dict[str, object]) -> tuple[str, int, int]:
