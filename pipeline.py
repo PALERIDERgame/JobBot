@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -89,6 +90,8 @@ class JobBotPipeline:
             seen_job_ids: set[str] = set()
             recent_job_ids = self.database.recent_job_ids(hours=24)
 
+            # Phase 1: deterministic filter (sequential — maintains seen_job_ids correctly)
+            candidates: list[tuple] = []
             for idx, (job, _raw_payload) in enumerate(fetched, start=1):
                 self.database.update_run(
                     run_id,
@@ -125,55 +128,33 @@ class JobBotPipeline:
                     jobs_matched += 1
                     continue
 
-                self.database.update_run(
-                    run_id,
-                    stage="cheap_scoring",
-                    message=f"Cheap scoring {idx}/{jobs_seen}: {job.title} at {job.employer}",
-                    jobs_seen=jobs_seen,
-                    jobs_matched=jobs_matched,
-                )
-                resume = resume or self._load_resume()
-                cheap_eval = self.scorer.cheap_evaluate(job, resume, force_escalate=filter_result.force_escalate)
-                run_cost += cheap_eval.estimated_cost_usd
-                if cheap_eval.status != "scored":
-                    self._record_evaluation_result(job, cheap_eval)
-                    continue
+                candidates.append((job, filter_result))
 
-                if cheap_eval.decision == "reject":
-                    self._record_evaluation_result(job, cheap_eval)
-                    continue
+            # Phase 2: score candidates (parallel for semi_auto, sequential otherwise)
+            if candidates:
+                resume = self._load_resume()
+                self.database.update_run(run_id, stage="cheap_scoring", message=f"Scoring {len(candidates)} candidates...", jobs_seen=jobs_seen)
 
-                strong_eval: StageEvaluation
-                if cheap_eval.decision == "pass_direct":
-                    strong_eval = StageEvaluation(
-                        stage_name="strong",
-                        provider=cheap_eval.provider,
-                        model=cheap_eval.model,
-                        status=cheap_eval.status,
-                        decision="apply_candidate" if (cheap_eval.score or 0) >= self.config.final_apply_threshold else "review",
-                        score=cheap_eval.score,
-                        confidence=cheap_eval.confidence,
-                        rationale=cheap_eval.rationale,
-                        strengths=cheap_eval.strengths,
-                        gaps=cheap_eval.gaps,
-                        input_tokens=cheap_eval.input_tokens,
-                        output_tokens=cheap_eval.output_tokens,
-                        estimated_cost_usd=0.0,
-                        error_message=cheap_eval.error_message,
-                        evaluated_at=cheap_eval.evaluated_at,
-                        cached=True,
-                    )
+                def _score(args: tuple) -> tuple:
+                    job, filter_result = args
+                    return (job, filter_result) + self._score_candidate(job, resume, filter_result.force_escalate)
+
+                if self.config.automation_mode == "semi_auto":
+                    with ThreadPoolExecutor(max_workers=10) as executor:
+                        scored = list(executor.map(_score, candidates))
                 else:
-                    self.database.update_run(
-                        run_id,
-                        stage="strong_scoring",
-                        message=f"Strong scoring {idx}/{jobs_seen}: {job.title} at {job.employer}",
-                        jobs_seen=jobs_seen,
-                        jobs_matched=jobs_matched,
-                    )
-                    resume = resume or self._load_resume()
-                    strong_eval = self.scorer.strong_evaluate(job, resume)
-                    run_cost += strong_eval.estimated_cost_usd
+                    scored = [_score(c) for c in candidates]
+            else:
+                scored = []
+
+            # Phase 3: record results and handle delivery (sequential)
+            for job, filter_result, cheap_eval, strong_eval, cost_delta in scored:
+                run_cost += cost_delta
+                if cheap_eval.status != "scored" or cheap_eval.decision == "reject":
+                    self._record_evaluation_result(job, cheap_eval)
+                    continue
+                if strong_eval is None:
+                    continue
                 self._record_evaluation_result(job, strong_eval)
                 if strong_eval.status != "scored" or strong_eval.decision not in {"apply_candidate", "review"}:
                     continue
@@ -207,7 +188,6 @@ class JobBotPipeline:
                     jobs_seen=jobs_seen,
                     jobs_matched=jobs_matched,
                 )
-                resume = resume or self._load_resume()
                 docs = self._generate_documents(
                     job,
                     resume,
@@ -307,6 +287,38 @@ class JobBotPipeline:
         if path.is_absolute():
             return path
         return (self.paths.root / path).resolve()
+
+    def _score_candidate(
+        self, job: "Job", resume: "ResumeData", force_escalate: bool
+    ) -> "tuple[StageEvaluation, StageEvaluation | None, float]":
+        """Thread-safe. Returns (cheap_eval, strong_eval_or_none, cost_delta)."""
+        cheap_eval = self.scorer.cheap_evaluate(job, resume, force_escalate=force_escalate)
+        cost = cheap_eval.estimated_cost_usd
+        if cheap_eval.status != "scored" or cheap_eval.decision == "reject":
+            return cheap_eval, None, cost
+        if cheap_eval.decision == "pass_direct":
+            strong_eval = StageEvaluation(
+                stage_name="strong",
+                provider=cheap_eval.provider,
+                model=cheap_eval.model,
+                status=cheap_eval.status,
+                decision="apply_candidate" if (cheap_eval.score or 0) >= self.config.final_apply_threshold else "review",
+                score=cheap_eval.score,
+                confidence=cheap_eval.confidence,
+                rationale=cheap_eval.rationale,
+                strengths=cheap_eval.strengths,
+                gaps=cheap_eval.gaps,
+                input_tokens=cheap_eval.input_tokens,
+                output_tokens=cheap_eval.output_tokens,
+                estimated_cost_usd=0.0,
+                error_message=cheap_eval.error_message,
+                evaluated_at=cheap_eval.evaluated_at,
+                cached=True,
+            )
+            return cheap_eval, strong_eval, cost
+        strong_eval = self.scorer.strong_evaluate(job, resume)
+        cost += strong_eval.estimated_cost_usd
+        return cheap_eval, strong_eval, cost
 
     def _record_skipped_match(self, job: Job, reason: str) -> None:
         self.database.record_match_result(

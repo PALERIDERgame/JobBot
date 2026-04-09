@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,13 +57,14 @@ class Database:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self._connection: sqlite3.Connection | None = None
+        self._lock = threading.Lock()
 
     def connect(self) -> sqlite3.Connection:
         if self._connection is None:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             self._connection = sqlite3.connect(self.db_path, check_same_thread=False)
             self._connection.row_factory = sqlite3.Row
-            self._connection.execute("PRAGMA journal_mode=MEMORY;")
+            self._connection.execute("PRAGMA journal_mode=WAL;")
             self._connection.execute("PRAGMA synchronous=NORMAL;")
             self._connection.execute("PRAGMA temp_store=MEMORY;")
         return self._connection
@@ -200,16 +202,17 @@ class Database:
 
     def create_run(self, started_at: str, stage: str, status: str = "running", message: str = "") -> int:
         connection = self.connect()
-        cursor = connection.cursor()
-        cursor.execute(
-            """
-                INSERT INTO run_history (started_at, stage, status, message)
-                VALUES (?, ?, ?, ?)
-            """,
-            (started_at, stage, status, message),
-        )
-        connection.commit()
-        return int(cursor.lastrowid)
+        with self._lock:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                    INSERT INTO run_history (started_at, stage, status, message)
+                    VALUES (?, ?, ?, ?)
+                """,
+                (started_at, stage, status, message),
+            )
+            connection.commit()
+            return int(cursor.lastrowid)
 
     def update_run(
         self,
@@ -239,53 +242,55 @@ class Database:
             return
         params.append(run_id)
         connection = self.connect()
-        connection.execute(
-            f"UPDATE run_history SET {', '.join(assignments)} WHERE id = ?",
-            params,
-        )
-        connection.commit()
+        with self._lock:
+            connection.execute(
+                f"UPDATE run_history SET {', '.join(assignments)} WHERE id = ?",
+                params,
+            )
+            connection.commit()
 
     def upsert_job(self, job: Job, raw_payload: dict[str, Any] | None = None) -> None:
         payload = json.dumps(raw_payload or {}, ensure_ascii=True, default=str)
         connection = self.connect()
-        connection.execute(
-            """
-                INSERT INTO jobs (
-                    id, title, employer, location, salary_range, description_full,
-                    apply_method, apply_url, hiring_manager_email, source, posted_at,
-                    scraped_at, raw_payload
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    title=excluded.title,
-                    employer=excluded.employer,
-                    location=excluded.location,
-                    salary_range=excluded.salary_range,
-                    description_full=excluded.description_full,
-                    apply_method=excluded.apply_method,
-                    apply_url=excluded.apply_url,
-                    hiring_manager_email=excluded.hiring_manager_email,
-                    source=excluded.source,
-                    posted_at=excluded.posted_at,
-                    scraped_at=excluded.scraped_at,
-                    raw_payload=excluded.raw_payload
-            """,
-            (
-                job.id,
-                job.title,
-                job.employer,
-                job.location,
-                job.salary_range,
-                job.description_full,
-                job.apply_method,
-                job.apply_url,
-                job.hiring_manager_email,
-                job.source,
-                job.posted_at,
-                job.scraped_at,
-                payload,
-            ),
-        )
-        connection.commit()
+        with self._lock:
+            connection.execute(
+                """
+                    INSERT INTO jobs (
+                        id, title, employer, location, salary_range, description_full,
+                        apply_method, apply_url, hiring_manager_email, source, posted_at,
+                        scraped_at, raw_payload
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        title=excluded.title,
+                        employer=excluded.employer,
+                        location=excluded.location,
+                        salary_range=excluded.salary_range,
+                        description_full=excluded.description_full,
+                        apply_method=excluded.apply_method,
+                        apply_url=excluded.apply_url,
+                        hiring_manager_email=excluded.hiring_manager_email,
+                        source=excluded.source,
+                        posted_at=excluded.posted_at,
+                        scraped_at=excluded.scraped_at,
+                        raw_payload=excluded.raw_payload
+                """,
+                (
+                    job.id,
+                    job.title,
+                    job.employer,
+                    job.location,
+                    job.salary_range,
+                    job.description_full,
+                    job.apply_method,
+                    job.apply_url,
+                    job.hiring_manager_email,
+                    job.source,
+                    job.posted_at,
+                    job.scraped_at,
+                    payload,
+                ),
+            )
+            connection.commit()
 
     def record_match_result(
         self,
@@ -301,34 +306,35 @@ class Database:
         scored_at: str,
     ) -> None:
         connection = self.connect()
-        connection.execute(
-            """
-                INSERT INTO match_results (
-                    job_id, score, rationale, strengths, gaps, is_match, status, error_message, scored_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(job_id) DO UPDATE SET
-                    score=excluded.score,
-                    rationale=excluded.rationale,
-                    strengths=excluded.strengths,
-                    gaps=excluded.gaps,
-                    is_match=excluded.is_match,
-                    status=excluded.status,
-                    error_message=excluded.error_message,
-                    scored_at=excluded.scored_at
-            """,
-            (
-                job_id,
-                score,
-                rationale,
-                json.dumps(strengths, ensure_ascii=True),
-                json.dumps(gaps, ensure_ascii=True),
-                int(is_match),
-                status,
-                error_message,
-                scored_at,
-            ),
-        )
-        connection.commit()
+        with self._lock:
+            connection.execute(
+                """
+                    INSERT INTO match_results (
+                        job_id, score, rationale, strengths, gaps, is_match, status, error_message, scored_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(job_id) DO UPDATE SET
+                        score=excluded.score,
+                        rationale=excluded.rationale,
+                        strengths=excluded.strengths,
+                        gaps=excluded.gaps,
+                        is_match=excluded.is_match,
+                        status=excluded.status,
+                        error_message=excluded.error_message,
+                        scored_at=excluded.scored_at
+                """,
+                (
+                    job_id,
+                    score,
+                    rationale,
+                    json.dumps(strengths, ensure_ascii=True),
+                    json.dumps(gaps, ensure_ascii=True),
+                    int(is_match),
+                    status,
+                    error_message,
+                    scored_at,
+                ),
+            )
+            connection.commit()
 
     def record_generated_documents(
         self,
@@ -360,54 +366,55 @@ class Database:
         page_fit_attempts: int = 0,
     ) -> None:
         connection = self.connect()
-        connection.execute(
-            """
-                INSERT INTO generated_documents (
+        with self._lock:
+            connection.execute(
+                """
+                    INSERT INTO generated_documents (
+                        job_id, output_dir, resume_docx_path, resume_pdf_path, cover_letter_path, cover_letter_docx_path, cover_letter_pdf_path,
+                        status, error_message, generated_at,
+                        tailoring_route, tailoring_provider, tailoring_model,
+                        tailoring_fallback_reason, tailoring_retry_count,
+                        resume_ai_status, cover_letter_ai_status, rejected_bullets_repaired, cover_letter_fallback,
+                        ai_validation_attempts, resume_retry_performed, cover_letter_retry_performed, ai_repair_applied,
+                        pdf_exporter_used, page_fit_attempts
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(job_id) DO UPDATE SET
+                        output_dir=excluded.output_dir,
+                        resume_docx_path=excluded.resume_docx_path,
+                        resume_pdf_path=excluded.resume_pdf_path,
+                        cover_letter_path=excluded.cover_letter_path,
+                        cover_letter_docx_path=excluded.cover_letter_docx_path,
+                        cover_letter_pdf_path=excluded.cover_letter_pdf_path,
+                        status=excluded.status,
+                        error_message=excluded.error_message,
+                        generated_at=excluded.generated_at,
+                        tailoring_route=excluded.tailoring_route,
+                        tailoring_provider=excluded.tailoring_provider,
+                        tailoring_model=excluded.tailoring_model,
+                        tailoring_fallback_reason=excluded.tailoring_fallback_reason,
+                        tailoring_retry_count=excluded.tailoring_retry_count,
+                        resume_ai_status=excluded.resume_ai_status,
+                        cover_letter_ai_status=excluded.cover_letter_ai_status,
+                        rejected_bullets_repaired=excluded.rejected_bullets_repaired,
+                        cover_letter_fallback=excluded.cover_letter_fallback,
+                        ai_validation_attempts=excluded.ai_validation_attempts,
+                        resume_retry_performed=excluded.resume_retry_performed,
+                        cover_letter_retry_performed=excluded.cover_letter_retry_performed,
+                        ai_repair_applied=excluded.ai_repair_applied,
+                        pdf_exporter_used=excluded.pdf_exporter_used,
+                        page_fit_attempts=excluded.page_fit_attempts
+                """,
+                (
                     job_id, output_dir, resume_docx_path, resume_pdf_path, cover_letter_path, cover_letter_docx_path, cover_letter_pdf_path,
                     status, error_message, generated_at,
                     tailoring_route, tailoring_provider, tailoring_model,
                     tailoring_fallback_reason, tailoring_retry_count,
                     resume_ai_status, cover_letter_ai_status, rejected_bullets_repaired, cover_letter_fallback,
-                    ai_validation_attempts, resume_retry_performed, cover_letter_retry_performed, ai_repair_applied,
-                    pdf_exporter_used, page_fit_attempts
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(job_id) DO UPDATE SET
-                    output_dir=excluded.output_dir,
-                    resume_docx_path=excluded.resume_docx_path,
-                    resume_pdf_path=excluded.resume_pdf_path,
-                    cover_letter_path=excluded.cover_letter_path,
-                    cover_letter_docx_path=excluded.cover_letter_docx_path,
-                    cover_letter_pdf_path=excluded.cover_letter_pdf_path,
-                    status=excluded.status,
-                    error_message=excluded.error_message,
-                    generated_at=excluded.generated_at,
-                    tailoring_route=excluded.tailoring_route,
-                    tailoring_provider=excluded.tailoring_provider,
-                    tailoring_model=excluded.tailoring_model,
-                    tailoring_fallback_reason=excluded.tailoring_fallback_reason,
-                    tailoring_retry_count=excluded.tailoring_retry_count,
-                    resume_ai_status=excluded.resume_ai_status,
-                    cover_letter_ai_status=excluded.cover_letter_ai_status,
-                    rejected_bullets_repaired=excluded.rejected_bullets_repaired,
-                    cover_letter_fallback=excluded.cover_letter_fallback,
-                    ai_validation_attempts=excluded.ai_validation_attempts,
-                    resume_retry_performed=excluded.resume_retry_performed,
-                    cover_letter_retry_performed=excluded.cover_letter_retry_performed,
-                    ai_repair_applied=excluded.ai_repair_applied,
-                    pdf_exporter_used=excluded.pdf_exporter_used,
-                    page_fit_attempts=excluded.page_fit_attempts
-            """,
-            (
-                job_id, output_dir, resume_docx_path, resume_pdf_path, cover_letter_path, cover_letter_docx_path, cover_letter_pdf_path,
-                status, error_message, generated_at,
-                tailoring_route, tailoring_provider, tailoring_model,
-                tailoring_fallback_reason, tailoring_retry_count,
-                resume_ai_status, cover_letter_ai_status, rejected_bullets_repaired, cover_letter_fallback,
-                ai_validation_attempts, int(resume_retry_performed), int(cover_letter_retry_performed), int(ai_repair_applied),
-                pdf_exporter_used, page_fit_attempts,
-            ),
-        )
-        connection.commit()
+                    ai_validation_attempts, int(resume_retry_performed), int(cover_letter_retry_performed), int(ai_repair_applied),
+                    pdf_exporter_used, page_fit_attempts,
+                ),
+            )
+            connection.commit()
 
     def record_delivery(
         self,
@@ -424,84 +431,86 @@ class Database:
         approval_portal_platform: str = "",
     ) -> None:
         connection = self.connect()
-        connection.execute(
-            """
-                INSERT INTO deliveries (
-                    job_id, method, status, message_id, error_message, delivered_at,
-                    approval_log, approval_route, approval_docs_action, approval_portal_platform
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(job_id) DO UPDATE SET
-                    method=excluded.method,
-                    status=excluded.status,
-                    message_id=excluded.message_id,
-                    error_message=excluded.error_message,
-                    delivered_at=excluded.delivered_at,
-                    approval_log=excluded.approval_log,
-                    approval_route=excluded.approval_route,
-                    approval_docs_action=excluded.approval_docs_action,
-                    approval_portal_platform=excluded.approval_portal_platform
-            """,
-            (
-                job_id,
-                method,
-                status,
-                message_id,
-                error_message,
-                delivered_at,
-                approval_log,
-                approval_route,
-                approval_docs_action,
-                approval_portal_platform,
-            ),
-        )
-        connection.commit()
+        with self._lock:
+            connection.execute(
+                """
+                    INSERT INTO deliveries (
+                        job_id, method, status, message_id, error_message, delivered_at,
+                        approval_log, approval_route, approval_docs_action, approval_portal_platform
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(job_id) DO UPDATE SET
+                        method=excluded.method,
+                        status=excluded.status,
+                        message_id=excluded.message_id,
+                        error_message=excluded.error_message,
+                        delivered_at=excluded.delivered_at,
+                        approval_log=excluded.approval_log,
+                        approval_route=excluded.approval_route,
+                        approval_docs_action=excluded.approval_docs_action,
+                        approval_portal_platform=excluded.approval_portal_platform
+                """,
+                (
+                    job_id,
+                    method,
+                    status,
+                    message_id,
+                    error_message,
+                    delivered_at,
+                    approval_log,
+                    approval_route,
+                    approval_docs_action,
+                    approval_portal_platform,
+                ),
+            )
+            connection.commit()
 
     def upsert_ai_evaluation(self, record: StageEvaluationRecord) -> None:
         connection = self.connect()
-        connection.execute(
-            """
-                INSERT INTO ai_evaluations (
-                    job_id, stage_name, resume_hash, provider, model, prompt_version,
-                    status, decision, score, confidence, rationale, strengths, gaps,
-                    input_tokens, output_tokens, estimated_cost_usd, cached, evaluated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(job_id, stage_name, resume_hash, provider, model, prompt_version) DO UPDATE SET
-                    status=excluded.status,
-                    decision=excluded.decision,
-                    score=excluded.score,
-                    confidence=excluded.confidence,
-                    rationale=excluded.rationale,
-                    strengths=excluded.strengths,
-                    gaps=excluded.gaps,
-                    input_tokens=excluded.input_tokens,
-                    output_tokens=excluded.output_tokens,
-                    estimated_cost_usd=excluded.estimated_cost_usd,
-                    cached=excluded.cached,
-                    evaluated_at=excluded.evaluated_at
-            """,
-            (
-                record.job_id,
-                record.stage_name,
-                record.resume_hash,
-                record.provider,
-                record.model,
-                record.prompt_version,
-                record.status,
-                record.decision,
-                record.score,
-                record.confidence,
-                record.rationale,
-                json.dumps(record.strengths, ensure_ascii=True),
-                json.dumps(record.gaps, ensure_ascii=True),
-                record.input_tokens,
-                record.output_tokens,
-                record.estimated_cost_usd,
-                int(record.cached),
-                record.evaluated_at,
-            ),
-        )
-        connection.commit()
+        with self._lock:
+            connection.execute(
+                """
+                    INSERT INTO ai_evaluations (
+                        job_id, stage_name, resume_hash, provider, model, prompt_version,
+                        status, decision, score, confidence, rationale, strengths, gaps,
+                        input_tokens, output_tokens, estimated_cost_usd, cached, evaluated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(job_id, stage_name, resume_hash, provider, model, prompt_version) DO UPDATE SET
+                        status=excluded.status,
+                        decision=excluded.decision,
+                        score=excluded.score,
+                        confidence=excluded.confidence,
+                        rationale=excluded.rationale,
+                        strengths=excluded.strengths,
+                        gaps=excluded.gaps,
+                        input_tokens=excluded.input_tokens,
+                        output_tokens=excluded.output_tokens,
+                        estimated_cost_usd=excluded.estimated_cost_usd,
+                        cached=excluded.cached,
+                        evaluated_at=excluded.evaluated_at
+                """,
+                (
+                    record.job_id,
+                    record.stage_name,
+                    record.resume_hash,
+                    record.provider,
+                    record.model,
+                    record.prompt_version,
+                    record.status,
+                    record.decision,
+                    record.score,
+                    record.confidence,
+                    record.rationale,
+                    json.dumps(record.strengths, ensure_ascii=True),
+                    json.dumps(record.gaps, ensure_ascii=True),
+                    record.input_tokens,
+                    record.output_tokens,
+                    record.estimated_cost_usd,
+                    int(record.cached),
+                    record.evaluated_at,
+                ),
+            )
+            connection.commit()
 
     def get_ai_evaluation(
         self,
