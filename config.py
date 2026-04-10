@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -145,6 +146,20 @@ def _merge_dataclass(dc_type: type[Any], incoming: dict[str, Any] | None) -> Any
     return dc_type(**defaults)
 
 
+def _normalize_stage_provider(value: Any, *, fallback: str, cheap_stage_provider: str, strong_stage_provider: str) -> str:
+    normalized = str(value or fallback).strip().lower()
+    aliases = {
+        "cheap_stage": cheap_stage_provider,
+        "strong_stage": strong_stage_provider,
+        "doc_stage": fallback,
+        "local": "ollama_local",
+        "ollama": "ollama_local",
+        "claude": "anthropic",
+        "gpt": "openai",
+    }
+    return aliases.get(normalized, normalized)
+
+
 def load_or_create_config(paths: AppPaths) -> JobBotConfig:
     ensure_app_dirs(paths)
     if not paths.config_file.exists():
@@ -155,17 +170,36 @@ def load_or_create_config(paths: AppPaths) -> JobBotConfig:
     with paths.config_file.open("r", encoding="utf-8") as handle:
         raw = _load_serialized_config(handle.read())
 
+    cheap_stage_provider = _normalize_stage_provider(
+        raw.get("cheap_stage_provider", "ollama_local"),
+        fallback="ollama_local",
+        cheap_stage_provider="ollama_local",
+        strong_stage_provider=str(raw.get("strong_stage_provider", "anthropic")),
+    )
+    strong_stage_provider = _normalize_stage_provider(
+        raw.get("strong_stage_provider", "anthropic"),
+        fallback="anthropic",
+        cheap_stage_provider=cheap_stage_provider,
+        strong_stage_provider="anthropic",
+    )
+    doc_stage_provider = _normalize_stage_provider(
+        raw.get("doc_stage_provider", "openai"),
+        fallback="openai",
+        cheap_stage_provider=cheap_stage_provider,
+        strong_stage_provider=strong_stage_provider,
+    )
+
     config = JobBotConfig(
         source=_merge_dataclass(SourceConfig, raw.get("source")),
         gmail=_merge_dataclass(GmailConfig, raw.get("gmail")),
         schedule=_merge_dataclass(ScheduleConfig, raw.get("schedule")),
         automation_mode=str(raw.get("automation_mode", "semi_auto")),
         llm_provider=str(raw.get("llm_provider", "anthropic")),
-        cheap_stage_provider=str(raw.get("cheap_stage_provider", "ollama_local")),
+        cheap_stage_provider=cheap_stage_provider,
         cheap_stage_model=str(raw.get("cheap_stage_model", "qwen2.5:7b")),
-        strong_stage_provider=str(raw.get("strong_stage_provider", "anthropic")),
+        strong_stage_provider=strong_stage_provider,
         strong_stage_model=str(raw.get("strong_stage_model", "claude-sonnet-4-20250514")),
-        doc_stage_provider=str(raw.get("doc_stage_provider", "openai")),
+        doc_stage_provider=doc_stage_provider,
         doc_stage_model=str(raw.get("doc_stage_model", "gpt-5-mini")),
         ollama_base_url=str(raw.get("ollama_base_url", "http://localhost:11434")),
         proxy_list=list(raw.get("proxy_list", [])),
@@ -188,6 +222,12 @@ def load_or_create_config(paths: AppPaths) -> JobBotConfig:
         openai_api_key=str(raw.get("openai_api_key", "")),
     )
     validate_config(config)
+    normalized_payload = asdict(config)
+    if normalized_payload != raw:
+        try:
+            save_config(config, paths.config_file)
+        except PermissionError:
+            LOGGER.warning("Config normalization could not be saved because the config file was unavailable.")
     return config
 
 
@@ -246,15 +286,28 @@ def configure_logging(log_file: Path) -> None:
         return
 
     log_file.parent.mkdir(parents=True, exist_ok=True)
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    active_log_path = log_file
+    try:
+        handlers.insert(0, logging.FileHandler(log_file, encoding="utf-8"))
+    except PermissionError:
+        fallback_name = f"{log_file.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{log_file.suffix}"
+        fallback_path = log_file.with_name(fallback_name)
+        try:
+            handlers.insert(0, logging.FileHandler(fallback_path, encoding="utf-8"))
+            active_log_path = fallback_path
+        except PermissionError:
+            active_log_path = None
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
+        handlers=handlers,
     )
-    LOGGER.info("Logging configured at %s", log_file)
+    if active_log_path is None:
+        LOGGER.warning("Logging configured without file output because the log file was unavailable.")
+    else:
+        LOGGER.info("Logging configured at %s", active_log_path)
 
 
 def _load_serialized_config(text: str) -> dict[str, Any]:

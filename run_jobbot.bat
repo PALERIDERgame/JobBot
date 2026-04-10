@@ -12,6 +12,6 @@ if not exist "%VENV_PYTHON%" (
     exit /b 1
 )
 
-start "" "%VENV_PYTHON%" "%~dp0main.py"
+start "" "%VENV_PYTHON%" "%~dp0launcher.pyw"
 
 endlocal
