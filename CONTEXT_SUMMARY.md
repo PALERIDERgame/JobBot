@@ -1,9 +1,10 @@
-# JobBot Session Summary
+﻿# JobBot Session Summary
 
 ## Current State
 - Workspace is [C:\Projects\JobBot](C:\Projects\JobBot).
-- Main branch is clean after repo cleanup and branch/worktree pruning.
+- Main branch is currently clean.
 - Main entrypoint is [C:\Projects\JobBot\main.py](C:\Projects\JobBot\main.py).
+- Windows launcher entrypoint is [C:\Projects\JobBot\launcher.pyw](C:\Projects\JobBot\launcher.pyw), called by [C:\Projects\JobBot\run_jobbot.bat](C:\Projects\JobBot\run_jobbot.bat).
 - Desktop UI is Tkinter in [C:\Projects\JobBot\dashboard.py](C:\Projects\JobBot\dashboard.py).
 - Persistence is SQLite in [C:\Projects\JobBot\database.py](C:\Projects\JobBot\database.py).
 - Runtime user data lives under `%APPDATA%\JobBot\`.
@@ -11,6 +12,7 @@
 ## Recent Repo Cleanup
 - Preserved current in-progress product work in commit `2f2cb862`.
 - Cleaned repo dirt and ported the only useful remaining unmerged branch logic in commit `70cb054b`.
+- Hardened startup and surfaced launcher errors in commit `1d3e2d08`.
 - All extra worktrees were pruned.
 - No local branches remain unmerged into `main`.
 - `gmail_client_secret.json` is intentionally kept local and ignored.
@@ -41,7 +43,7 @@
 - Per-job approval logs are shown in the details pane.
 
 ## Email Apply Behavior
-- Email apply now uses `HR Email` semantics rather than “any email found in the posting.”
+- Email apply now uses `HR Email` semantics rather than "any email found in the posting."
 - A posting is email-apply only when it explicitly instructs the candidate to send materials and the detected address looks like a real HR/recruiting/application inbox.
 - Unsafe or ambiguous addresses are blocked from sending even if a stale row was previously marked as `email`.
 - Outbound employer email now:
@@ -68,6 +70,15 @@
 - Default automated tests stub Playwright readiness because this shell environment produces noisy `WinError 5` subprocess failures that do not reflect the real desktop app.
 - Dedicated opt-in smoke test lives at [C:\Projects\JobBot\tests\test_playwright_smoke.py](C:\Projects\JobBot\tests\test_playwright_smoke.py).
 
+## Startup / Launcher Behavior
+- `run_jobbot.bat` now launches [C:\Projects\JobBot\launcher.pyw](C:\Projects\JobBot\launcher.pyw) instead of starting [C:\Projects\JobBot\main.py](C:\Projects\JobBot\main.py) directly with `pythonw`.
+- The launcher catches startup exceptions, shows a Windows error dialog, and writes a startup error log in `%APPDATA%\JobBot\logs`.
+- [C:\Projects\JobBot\config.py](C:\Projects\JobBot\config.py) now hardens startup by:
+  - falling back when the main log file is unavailable
+  - tolerating stale provider aliases such as `cheap_stage`
+  - treating config-normalization save failures as warnings instead of fatal startup errors
+- This was added because `pythonw` was previously hiding startup crashes completely.
+
 ## Testing Status
 - Recent targeted verification passed for the imported screening change:
   - `python -m unittest discover -s tests -p "test_deterministic_filter.py"`
@@ -87,5 +98,5 @@
 
 ## Immediate Follow-Up Ideas
 - Tighten or expand real portal support based on the most common sites encountered.
-- Improve the user-facing distinction between “manual fallback” and “supported autofill submitted.”
+- Improve the user-facing distinction between "manual fallback" and "supported autofill submitted."
 - Consider adding a `Reset Gmail Login` control and live Gmail readiness refresh when Gmail settings change.
