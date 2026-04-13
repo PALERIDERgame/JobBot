@@ -276,6 +276,7 @@ class PipelineTests(unittest.TestCase):
                 config.resume_source_path = str(resume_path)
                 config.cheap_stage_provider = "openai"
                 config.strong_stage_provider = "openai"
+                config.openai_api_key = "test-key"
                 database = Database(paths.database_file)
                 database.initialize()
                 pipeline = JobBotPipeline(config, paths, database)
@@ -321,6 +322,7 @@ class PipelineTests(unittest.TestCase):
                 config.automation_mode = "auto"
                 config.cheap_stage_provider = "openai"
                 config.strong_stage_provider = "openai"
+                config.openai_api_key = "test-key"
                 resume_path = Path(tmp) / "resume.txt"
                 resume_path.write_text(
                     "Jane Candidate\njane@example.com\n555-123-4567\nSummary: Python engineer\nSkills: Python, SQL\nBuilt APIs\n",
@@ -372,6 +374,7 @@ class PipelineTests(unittest.TestCase):
                 config.automation_mode = "auto"
                 config.cheap_stage_provider = "openai"
                 config.strong_stage_provider = "openai"
+                config.openai_api_key = "test-key"
                 resume_path = Path(tmp) / "resume.txt"
                 resume_path.write_text(
                     "Jane Candidate\njane@example.com\n555-123-4567\nSummary: Python engineer\nSkills: Python, SQL\nBuilt APIs\n",

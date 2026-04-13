@@ -55,8 +55,10 @@ FIELD_TOOLTIPS = {
     "Final apply threshold": "Score at or above this value becomes an apply candidate.",
     "Cheap reject threshold": "Cheap-stage score at or below this value gets rejected early.",
     "Cheap escalate threshold": "Cheap-stage score at or above this value moves to the strong stage.",
+    "Pre-cheap reject threshold": "TF-IDF/keyword gate score below this value is rejected before any AI calls.",
     "Automation mode": "Semi-auto queues jobs for approval. Auto sends only when the apply method supports it.",
     "Skip AI scoring in semi_auto": "When enabled, semi-auto skips AI scoring and queues deterministic matches right away for faster review.",
+    "Enable pre-cheap gate": "Use a fast TF-IDF + keyword overlap check to skip obvious mismatches before AI scoring.",
     "Gmail recipient (optional fallback/test inbox)": "Optional fallback inbox for non-employer delivery or dry-run testing.",
     "Gmail sender": "Authenticated Gmail account used to send applications.",
     "Client secrets path": "Path to your Google OAuth client secrets JSON file.",
@@ -119,6 +121,7 @@ class JobBotDashboard:
         self.final_apply_threshold_var = tk.StringVar(value=str(config.final_apply_threshold))
         self.cheap_reject_threshold_var = tk.StringVar(value=str(config.cheap_reject_threshold))
         self.cheap_escalate_threshold_var = tk.StringVar(value=str(config.cheap_escalate_threshold))
+        self.precheap_gate_threshold_var = tk.StringVar(value=str(config.precheap_gate_reject_threshold))
         self.keyword_var = tk.StringVar(value=config.source.keyword)
         self.location_var = tk.StringVar(value=config.source.location)
         self.source_provider_var = tk.StringVar(value=config.source.provider)
@@ -135,6 +138,7 @@ class JobBotDashboard:
         self.salary_floor_var = tk.StringVar(value=str(config.salary_floor))
         self.gmail_enabled_var = tk.BooleanVar(value=config.gmail.enabled)
         self.skip_ai_scoring_var = tk.BooleanVar(value=config.skip_ai_scoring_in_semi_auto)
+        self.precheap_gate_enabled_var = tk.BooleanVar(value=config.precheap_gate_enabled)
         self.automation_mode_var = tk.StringVar(value=config.automation_mode)
         self.llm_provider_var = tk.StringVar(value=config.llm_provider)
         self.cheap_stage_provider_var = tk.StringVar(value=config.cheap_stage_provider)
@@ -150,6 +154,7 @@ class JobBotDashboard:
         self.anthropic_api_key_var = tk.StringVar(value=config.anthropic_api_key)
         self.openai_api_key_var = tk.StringVar(value=config.openai_api_key)
 
+        self.outcome_var = tk.StringVar(value="no_response")
         self.review_tree: ttk.Treeview | None = None
         self.log_text: tk.Text | None = None
         self.cost_text: tk.Text | None = None
@@ -245,6 +250,7 @@ class JobBotDashboard:
             ("Final apply threshold", self.final_apply_threshold_var),
             ("Cheap reject threshold", self.cheap_reject_threshold_var),
             ("Cheap escalate threshold", self.cheap_escalate_threshold_var),
+            ("Pre-cheap reject threshold", self.precheap_gate_threshold_var),
             ("Strong stage provider", self.strong_stage_provider_var),
             ("Strong stage model", self.strong_stage_model_var),
             ("Doc stage provider", self.doc_stage_provider_var),
@@ -344,8 +350,11 @@ class JobBotDashboard:
         skip_ai_check = ttk.Checkbutton(frame, text="Skip AI scoring in semi_auto", variable=self.skip_ai_scoring_var, command=self._autosave_setup)
         skip_ai_check.grid(row=len(labels) + 1, column=1, columnspan=2, sticky="w", pady=6)
         self._add_tooltip(skip_ai_check, FIELD_TOOLTIPS["Skip AI scoring in semi_auto"])
+        precheap_check = ttk.Checkbutton(frame, text="Enable pre-cheap gate", variable=self.precheap_gate_enabled_var, command=self._autosave_setup)
+        precheap_check.grid(row=len(labels) + 2, column=1, columnspan=2, sticky="w", pady=6)
+        self._add_tooltip(precheap_check, FIELD_TOOLTIPS["Enable pre-cheap gate"])
         portal_row = ttk.Frame(frame)
-        portal_row.grid(row=len(labels) + 2, column=1, columnspan=2, sticky="ew", pady=(6, 0))
+        portal_row.grid(row=len(labels) + 3, column=1, columnspan=2, sticky="ew", pady=(6, 0))
         portal_row.columnconfigure(0, weight=1)
         portal_status = ttk.Label(portal_row, textvariable=self.portal_readiness_var)
         portal_status.grid(row=0, column=0, sticky="w")
@@ -355,7 +364,7 @@ class JobBotDashboard:
         self.portal_test_buttons.append(portal_test_button)
         self._add_tooltip(portal_test_button, "Run an in-app headless Chromium launch check and report the exact portal runtime readiness.")
         gmail_status = ttk.Label(frame, textvariable=self.gmail_readiness_var)
-        gmail_status.grid(row=len(labels) + 3, column=1, columnspan=2, sticky="w", pady=(6, 0))
+        gmail_status.grid(row=len(labels) + 4, column=1, columnspan=2, sticky="w", pady=(6, 0))
         self._add_tooltip(gmail_status, "Shows whether Gmail email sending looks configured before you try Approve and Send on email jobs.")
 
     def _build_run_tab(self, frame: ttk.Frame) -> None:
@@ -435,6 +444,17 @@ class JobBotDashboard:
         review_portal_test_button.pack(side="left")
         self.portal_test_buttons.append(review_portal_test_button)
         self._add_tooltip(review_portal_test_button, "Run a portal runtime verification using the current desktop app session.")
+
+        outcome_frame = ttk.Frame(buttons)
+        outcome_frame.pack(side="left", padx=(12, 0))
+        outcome_options = ("no_response", "rejected", "phone_screen", "interview", "offer", "withdrew")
+        outcome_combo = ttk.Combobox(outcome_frame, textvariable=self.outcome_var, values=outcome_options, width=14, state="readonly")
+        outcome_combo.pack(side="left")
+        outcome_button = ttk.Button(outcome_frame, text="Record Outcome", command=self._record_outcome)
+        outcome_button.pack(side="left", padx=(4, 0))
+        self._add_tooltip(outcome_combo, "Select what happened after this application was sent.")
+        self._add_tooltip(outcome_button, "Record the outcome for the selected job. Used to track your application success rate.")
+
         portal_status = ttk.Label(buttons, textvariable=self.portal_readiness_var)
         portal_status.pack(side="left", padx=(12, 0))
         self._add_tooltip(portal_status, "Shows whether browser-based portal autofill is available on this machine.")
@@ -647,7 +667,9 @@ class JobBotDashboard:
         config.final_apply_threshold = int(self.final_apply_threshold_var.get().strip() or "80")
         config.cheap_reject_threshold = int(self.cheap_reject_threshold_var.get().strip() or "55")
         config.cheap_escalate_threshold = int(self.cheap_escalate_threshold_var.get().strip() or "75")
+        config.precheap_gate_reject_threshold = int(self.precheap_gate_threshold_var.get().strip() or "30")
         config.skip_ai_scoring_in_semi_auto = self.skip_ai_scoring_var.get()
+        config.precheap_gate_enabled = self.precheap_gate_enabled_var.get()
         config.gmail.enabled = self.gmail_enabled_var.get()
         config.gmail.recipient_email = self.recipient_var.get().strip()
         config.gmail.sender_email = self.sender_var.get().strip()
@@ -837,6 +859,18 @@ class JobBotDashboard:
                     text=f"Last run: {run['status']} | stage={run['stage']} | seen={run['jobs_seen']} matched={run['jobs_matched']}"
                 )
 
+    def _record_outcome(self) -> None:
+        row = self._selected_row()
+        if not row:
+            return
+        outcome = self.outcome_var.get().strip()
+        if not outcome:
+            messagebox.showwarning("Job Bot", "Select an outcome before recording.")
+            return
+        self.database.record_outcome(str(row["id"]), outcome)
+        self.status_var.set(f"Outcome recorded: {outcome} for {row['title']} at {row['employer']}")
+        self._refresh_costs()
+
     def _refresh_costs(self) -> None:
         if not self.cost_text:
             return
@@ -847,6 +881,16 @@ class JobBotDashboard:
             lines.append(f"{row['stage_name']}: {row['evaluations']} evals, ${float(row.get('total_cost') or 0.0):.4f}")
         if len(lines) == 2:
             lines.append("No API cost data recorded yet.")
+        lines.append("")
+        summary = self.database.get_outcomes_summary()
+        lines.append(f"Application outcomes: {summary['total_applied']} applied, {summary['total_with_outcome']} tracked")
+        if summary["total_with_outcome"] > 0:
+            lines.append(f"Response rate: {summary['response_rate_pct']}% (phone screen / interview / offer)")
+            by_outcome = summary["by_outcome"]
+            for label in ("no_response", "rejected", "phone_screen", "interview", "offer", "withdrew"):
+                count = by_outcome.get(label, 0)
+                if count:
+                    lines.append(f"  {label}: {count}")
         self.cost_text.delete("1.0", tk.END)
         self.cost_text.insert("1.0", "\n".join(lines))
 
@@ -968,7 +1012,7 @@ class JobBotDashboard:
                 f"Tailoring route:    {row.get('tailoring_route') or 'N/A'}",
                 f"Provider / model:   {(row.get('tailoring_provider') or '') + ('/' + row.get('tailoring_model') if row.get('tailoring_model') else '') or 'N/A (local)'}",
                 f"AI attempted:       {'Yes' if self._doc_ai_attempted(row) else 'No'}",
-                f"AI accepted:        {'Yes' if row.get('tailoring_route') == 'openai' else ('No (fell back)' if row.get('tailoring_route') == 'fallback' else 'N/A')}",
+                f"AI accepted:        {'Yes' if row.get('tailoring_route') == 'openai' else ('*** FELL BACK TO LOCAL HEURISTICS — cover letter and resume may be less tailored ***' if row.get('tailoring_route') == 'fallback' else 'N/A')}",
                 f"Resume AI accepted: {self._doc_section_status(str(row.get('resume_ai_status') or ''))}",
                 f"Cover letter AI accepted: {self._doc_section_status(str(row.get('cover_letter_ai_status') or ''))}",
                 f"Rejected bullets repaired: {row.get('rejected_bullets_repaired', 0)}",
@@ -984,6 +1028,14 @@ class JobBotDashboard:
                 "",
                 "--- Approval log ---",
                 row.get("approval_log") or "No approval attempt recorded yet.",
+                "",
+                "--- Cover letter quality check ---",
+            ]
+            + self._cover_letter_quality_lines(row)
+            + [
+                "",
+                "--- Application outcome ---",
+                self._outcome_line(str(row["id"])),
                 "",
                 "Job description:",
                 row["description_full"] or "No description captured.",
@@ -1029,6 +1081,31 @@ class JobBotDashboard:
     def _doc_section_status(value: str) -> str:
         mapping = {"accepted": "Yes", "partial": "Partial", "local": "No"}
         return mapping.get(value.strip().lower(), "N/A")
+
+    def _cover_letter_quality_lines(self, row: dict[str, object]) -> list[str]:
+        import re
+        cl_path = str(row.get("cover_letter_pdf_path") or row.get("cover_letter_docx_path") or row.get("cover_letter_path") or "")
+        if not cl_path or not Path(cl_path).exists():
+            return ["Cover letter not generated yet — run Generate first."]
+        try:
+            text = Path(cl_path).read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return ["Could not read cover letter file."]
+        employer = str(row.get("employer") or "").strip().lower()
+        has_company = bool(employer and employer in text.lower())
+        has_metric = bool(re.search(r'\d+\s*[\%\+x]|\$\s*\d+|\d+\s*(year|month|team|person|customer|user)', text, re.IGNORECASE))
+        word_count = len(text.split())
+        return [
+            f"Company name present:  {'Yes' if has_company else 'No — add employer name'}",
+            f"Metric/number present: {'Yes' if has_metric else 'No — add a quantified result'}",
+            f"Word count:            {word_count} ({'OK' if word_count <= 300 else 'Over 300 — consider trimming'})",
+        ]
+
+    def _outcome_line(self, job_id: str) -> str:
+        outcome = self.database.get_latest_outcome(job_id)
+        if outcome:
+            return f"Recorded: {outcome}  (use dropdown above to update)"
+        return "Not recorded yet — use the outcome dropdown to record what happened."
 
     def _open_apply_link(self) -> None:
         row = self._selected_row()

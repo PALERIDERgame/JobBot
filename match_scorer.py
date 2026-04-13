@@ -5,9 +5,17 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib import error, request
+
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+except ImportError:  # pragma: no cover
+    TfidfVectorizer = None
+    cosine_similarity = None
 
 from config import JobBotConfig
 from database import Database, Job, StageEvaluationRecord
@@ -18,6 +26,11 @@ from resume_parser import ResumeData, ResumeWorkEntry
 LOGGER = logging.getLogger(__name__)
 PROMPT_VERSION = "cost_funnel_v2"
 
+_PRECHEAP_STOPWORDS = {
+    "and", "the", "for", "with", "from", "that", "this", "your", "will", "role", "team", "work", "into",
+    "their", "about", "across", "have", "has", "our", "you", "job", "position", "new", "york", "experience",
+    "using", "within", "required", "preferred", "strong",
+}
 OPENAI_PRICE_PER_MTOKEN = {
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
     "gpt-4o": {"input": 2.50, "output": 10.00},
@@ -28,6 +41,40 @@ ANTHROPIC_PRICE_PER_MTOKEN = {
     "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
     "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00},
 }
+
+
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503}
+_VALID_CHEAP_DECISIONS = {"reject", "escalate", "pass_direct", "error"}
+_VALID_STRONG_DECISIONS = {"reject", "review", "apply_candidate", "skip", "error"}
+
+
+def _call_with_retry(fn, *, max_attempts: int = 3, base_delay: float = 2.0):
+    """Call fn(), retrying on transient API errors with exponential backoff."""
+    last_exc = None
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            exc_text = str(exc)
+            status_code = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+            # Fail fast on auth/client errors
+            if status_code in {400, 401, 403}:
+                raise
+            # Check for retryable status codes or transient error messages
+            is_retryable = (
+                status_code in _RETRYABLE_STATUS_CODES
+                or isinstance(exc, (TimeoutError, ConnectionError, error.URLError))
+                or "timeout" in exc_text.lower()
+                or "rate limit" in exc_text.lower()
+                or "overloaded" in exc_text.lower()
+            )
+            if not is_retryable or attempt == max_attempts - 1:
+                raise
+            delay = base_delay * (2 ** attempt)
+            LOGGER.warning("AI API transient error (attempt %d/%d), retrying in %.1fs: %s", attempt + 1, max_attempts, delay, exc_text)
+            last_exc = exc
+            time.sleep(delay)
+    raise last_exc  # pragma: no cover
 
 
 @dataclass(slots=True)
@@ -74,6 +121,16 @@ class StageEvaluation:
         )
 
 
+@dataclass(slots=True)
+class PrecheapGateResult:
+    gate_score: int
+    tfidf_score: int
+    keyword_overlap_count: int
+    keyword_overlap_terms: list[str]
+    decision: str
+    reason: str
+
+
 class MatchScorer:
     def __init__(self, config: JobBotConfig, database: Database | None = None) -> None:
         self.config = config
@@ -115,6 +172,70 @@ class MatchScorer:
             job=job,
             resume_data=resume_data,
             prompt=self._build_strong_prompt(job, resume_data),
+        )
+
+    def precheap_gate(self, job: Job, resume_data: ResumeData) -> PrecheapGateResult:
+        if not self.config.precheap_gate_enabled:
+            return PrecheapGateResult(
+                gate_score=0,
+                tfidf_score=0,
+                keyword_overlap_count=0,
+                keyword_overlap_terms=[],
+                decision="pass",
+                reason="Pre-cheap gate disabled.",
+            )
+        if TfidfVectorizer is None or cosine_similarity is None:
+            return PrecheapGateResult(
+                gate_score=0,
+                tfidf_score=0,
+                keyword_overlap_count=0,
+                keyword_overlap_terms=[],
+                decision="pass",
+                reason="Pre-cheap gate skipped (scikit-learn unavailable).",
+            )
+
+        resume_text = self._build_resume_gate_text(resume_data)
+        job_text = self._build_job_gate_text(job)
+        if not resume_text or not job_text:
+            return PrecheapGateResult(
+                gate_score=0,
+                tfidf_score=0,
+                keyword_overlap_count=0,
+                keyword_overlap_terms=[],
+                decision="pass",
+                reason="Pre-cheap gate skipped (insufficient text).",
+            )
+
+        overlap_terms = self._keyword_overlap_terms(job_text, resume_text)
+        overlap_count = len(overlap_terms)
+        keyword_overlap_score = min(overlap_count * 5, 100)
+        tfidf_score = self._tfidf_similarity_score(resume_text, job_text)
+        gate_score = int(round((0.7 * tfidf_score) + (0.3 * keyword_overlap_score)))
+        threshold = self.config.precheap_gate_reject_threshold
+        decision = "reject" if gate_score < threshold else "pass"
+        top_terms = overlap_terms[:10]
+        reason = (
+            f"Pre-cheap gate {decision}: tfidf={tfidf_score}, "
+            f"overlap={overlap_count} ({', '.join(top_terms)})"
+        )
+
+        LOGGER.info(
+            "precheap_gate job_id=%s gate_score=%s tfidf_score=%s overlap=%s terms=%s decision=%s threshold=%s",
+            job.id,
+            gate_score,
+            tfidf_score,
+            overlap_count,
+            ",".join(top_terms),
+            decision,
+            threshold,
+        )
+        return PrecheapGateResult(
+            gate_score=gate_score,
+            tfidf_score=tfidf_score,
+            keyword_overlap_count=overlap_count,
+            keyword_overlap_terms=top_terms,
+            decision=decision,
+            reason=reason,
         )
 
     def score_job(self, job: Job, resume_data: ResumeData) -> MatchScore:
@@ -242,7 +363,8 @@ class MatchScorer:
                     "Return one work entry for each source work entry in the same order.",
                     "Preserve at least one bullet per role and do not invent jobs or dates.",
                     "Keep rewritten bullets plausible and grounded in the source resume.",
-                    "Keep cover letter concise and professional.",
+                    "Cover letter must use the problem-solution format: open by naming the specific role and company, then identify ONE challenge or goal the company/role is facing (inferred from the job description), present the candidate as the solution with 1-2 quantified achievements from their actual experience, and close with a specific call to action.",
+                    "Cover letter must: mention the company by name at least once, include at least one metric or number from the candidate's experience, stay under 300 words, and NOT open with 'I am writing to apply'.",
                 ],
             },
         }
@@ -260,10 +382,21 @@ class MatchScorer:
             "You tailor resume and cover-letter content for job applications. "
             "Return only valid JSON with keys work_entries, key_skills, and cover_letter_text. "
             "Do not invent employers, titles, or dates. Preserve chronology. "
-            "Improve wording quality and relevance while keeping claims plausibly grounded in the source resume."
+            "Improve wording quality and relevance while keeping claims plausibly grounded in the source resume. "
+            "For cover_letter_text, always use the problem-solution format: name the role/company, identify a challenge from the job description, "
+            "present the candidate as the solution with a quantified achievement, and close with a call to action. "
+            "The cover letter must mention the company by name, include at least one metric, stay under 300 words, and never open with 'I am writing to apply'."
         )
         try:
-            text = self._create_completion(provider, model, prompt, system_prompt=system_prompt)
+            text, _meta = self._create_doc_tailoring_completion(provider, model, prompt, system_prompt=system_prompt)
+            if not text:
+                return DocumentTailoringAttempt(
+                    attempted=True,
+                    provider=provider,
+                    model=model,
+                    failure_reason="OpenAI response did not contain extractable text.",
+                    retry_count=retry_count,
+                )
             cleaned_text = self._extract_json_text(text)
             try:
                 payload = json.loads(cleaned_text)
@@ -368,11 +501,22 @@ class MatchScorer:
             )
 
         try:
-            text, input_tokens, output_tokens = self._create_completion_with_usage(provider, model, prompt)
+            text, input_tokens, output_tokens = _call_with_retry(
+                lambda: self._create_completion_with_usage(provider, model, prompt)
+            )
             payload = json.loads(text)
-            score = int(payload.get("score", 0))
+            # Validate and clamp score to [0, 100]
+            raw_score = payload.get("score", 0)
+            score = max(0, min(100, int(raw_score))) if raw_score is not None else 0
+            if raw_score != score:
+                LOGGER.warning("AI returned out-of-range score %s for %s; clamped to %s", raw_score, job.id, score)
             confidence = self._parse_confidence(payload.get("confidence", 0.0))
             decision = self._decision_for(stage_name, score=score, confidence=confidence, force_escalate=bool(payload.get("force_escalate", False)))
+            # Validate decision enum
+            valid_decisions = _VALID_CHEAP_DECISIONS if stage_name == "cheap" else _VALID_STRONG_DECISIONS
+            if decision not in valid_decisions:
+                LOGGER.warning("Unexpected decision %r for stage %s on %s; treating as escalate/review", decision, stage_name, job.id)
+                decision = "escalate" if stage_name == "cheap" else "review"
             evaluation = StageEvaluation(
                 stage_name=stage_name,
                 provider=provider,
@@ -381,7 +525,7 @@ class MatchScorer:
                 decision=decision,
                 score=score,
                 confidence=confidence,
-                rationale=str(payload.get("rationale", "")),
+                rationale=str(payload.get("rationale", "")) or "No rationale provided.",
                 strengths=[str(item) for item in payload.get("strengths", [])][:5],
                 gaps=[str(item) for item in payload.get("gaps", [])][:5],
                 input_tokens=input_tokens,
@@ -491,6 +635,11 @@ class MatchScorer:
         return None
 
     def _build_cheap_prompt(self, job: Job, resume_data: ResumeData, *, force_escalate: bool) -> dict[str, object]:
+        overlap_terms = self._keyword_overlap_terms(
+            self._build_job_gate_text(job),
+            self._build_resume_gate_text(resume_data),
+        )
+        overlap_count = len(overlap_terms)
         screening: dict[str, object] = {}
         if self.config.source.location and self.config.source.location.strip():
             screening["target_location"] = self.config.source.location.strip()
@@ -510,25 +659,38 @@ class MatchScorer:
             "job": self._job_summary(job),
             "force_escalate": force_escalate,
             "screening_constraints": screening,
+            "keyword_overlap_terms": overlap_terms[:12],
+            "keyword_overlap_count": overlap_count,
             "instructions": {
                 "return_json": True,
                 "fields": ["score", "confidence", "rationale", "strengths", "gaps"],
                 "goal": (
                     "Fast screening pass using the rubric above. Apply screening_constraints first — "
                     "if the job clearly fails location or salary constraints, score below 25. "
-                    "Use the rubric to score resume fit. Be consistent; return a confident score when the match is obvious."
+                    "Use the rubric to score resume fit. Be consistent; return a confident score when the match is obvious. "
+                    "If keyword_overlap_count is high, avoid scoring below 50 unless core requirements are clearly missing."
                 ),
             },
         }
 
     def _build_strong_prompt(self, job: Job, resume_data: ResumeData) -> dict[str, object]:
+        overlap_terms = self._keyword_overlap_terms(
+            self._build_job_gate_text(job),
+            self._build_resume_gate_text(resume_data),
+        )
+        overlap_count = len(overlap_terms)
         return {
             "resume_summary": self._resume_summary(resume_data),
             "job": self._job_summary(job),
+            "keyword_overlap_terms": overlap_terms[:12],
+            "keyword_overlap_count": overlap_count,
             "instructions": {
                 "return_json": True,
                 "fields": ["score", "confidence", "rationale", "strengths", "gaps"],
-                "goal": "Deeper fit review using the rubric above. Score the resume against core job requirements precisely.",
+                "goal": (
+                    "Deeper fit review using the rubric above. Score the resume against core job requirements precisely. "
+                    "If keyword_overlap_count is high, avoid scoring below 50 unless core requirements are clearly missing."
+                ),
             },
         }
 
@@ -549,6 +711,48 @@ class MatchScorer:
             "description_excerpt": job.description_full[:2500],
             "apply_url": job.apply_url,
         }
+
+    @staticmethod
+    def _tokenize_terms(text: str) -> set[str]:
+        if not text:
+            return set()
+        tokens = {
+            token
+            for token in re.findall(r"[a-z][a-z0-9+#&-]{2,}", text.lower())
+            if token not in _PRECHEAP_STOPWORDS
+        }
+        return tokens
+
+    def _keyword_overlap_terms(self, job_text: str, resume_text: str) -> list[str]:
+        job_terms = self._tokenize_terms(job_text)
+        resume_terms = self._tokenize_terms(resume_text)
+        overlap = sorted(job_terms & resume_terms)
+        return overlap
+
+    @staticmethod
+    def _build_resume_gate_text(resume_data: ResumeData) -> str:
+        parts = [
+            resume_data.summary or "",
+            " ".join(resume_data.skills or []),
+            " ".join(resume_data.experience_lines or []),
+        ]
+        return " ".join(part for part in parts if part).strip()
+
+    @staticmethod
+    def _build_job_gate_text(job: Job) -> str:
+        return f"{job.title} {job.description_full}".strip()
+
+    @staticmethod
+    def _tfidf_similarity_score(resume_text: str, job_text: str) -> int:
+        if TfidfVectorizer is None or cosine_similarity is None:
+            return 0
+        try:
+            vectorizer = TfidfVectorizer(stop_words="english", max_features=1500)
+            vectors = vectorizer.fit_transform([resume_text, job_text])
+            similarity = cosine_similarity(vectors[0:1], vectors[1:2])[0][0]
+            return int(round(float(similarity) * 100))
+        except ValueError:
+            return 0
 
     def _decision_for(self, stage_name: str, *, score: int, confidence: float, force_escalate: bool) -> str:
         if stage_name == "cheap":
@@ -679,6 +883,68 @@ class MatchScorer:
             response_format={"type": "json_object"},
         )
         return (response.choices[0].message.content or "").strip()
+
+    def _create_doc_tailoring_completion(
+        self, provider: str, model: str, prompt: dict[str, object], *, system_prompt: str
+    ) -> tuple[str, dict[str, object]]:
+        """Use OpenAI Responses API with structured JSON schema output for document tailoring.
+
+        Returns (text, meta) where text is a JSON string and meta describes how it was extracted.
+        """
+        client = self._build_client(provider)
+        schema = {
+            "type": "object",
+            "properties": {
+                "work_entries": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "role_line": {"type": "string"},
+                            "date_line": {"type": "string"},
+                            "bullets": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["role_line", "date_line", "bullets"],
+                        "additionalProperties": False,
+                    },
+                },
+                "key_skills": {"type": "array", "items": {"type": "string"}},
+                "cover_letter_text": {"type": "string"},
+            },
+            "required": ["work_entries", "key_skills", "cover_letter_text"],
+            "additionalProperties": False,
+        }
+        response = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(prompt)},
+            ],
+            text={"format": {"type": "json_schema", "name": "document_tailoring", "schema": schema, "strict": True}},
+            max_output_tokens=4000,
+        )
+        # Try structured output from model_dump (json_schema mode)
+        try:
+            dumped = response.model_dump(mode="python")
+            structured = dumped.get("response")
+            if isinstance(structured, dict) and "work_entries" in structured:
+                text = json.dumps(structured)
+                return text, {"mode": "json_schema", "shape_summary": "message(response)", "text_length": len(text)}
+        except Exception:
+            pass
+        # Fall back to text extraction from output items
+        text = ""
+        for item in getattr(response, "output", []) or []:
+            if getattr(item, "type", None) != "message":
+                continue
+            for content in getattr(item, "content", []) or []:
+                if getattr(content, "type", None) == "output_text":
+                    text = getattr(content, "text", "") or ""
+                    if text:
+                        break
+            if text:
+                break
+        return text, {"mode": "text_fallback", "shape_summary": "message(output_text)", "text_length": len(text)}
 
     def _create_ollama_completion(self, model: str, prompt: dict[str, object], *, system_prompt: str) -> tuple[str, int, int]:
         body = json.dumps(

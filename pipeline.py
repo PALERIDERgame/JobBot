@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from application_routing import EmailApplyAssessment, assess_email_apply
-from config import AppPaths, JobBotConfig, resolve_output_dir
+from config import AppPaths, JobBotConfig, resolve_output_dir, validate_config_for_run
 from deterministic_filter import apply_deterministic_filter
 from database import Database, Job
 from doc_generator import DocumentGenerator, GeneratedDocs
@@ -80,6 +80,7 @@ class JobBotPipeline:
         run_cost = 0.0
         resume: ResumeData | None = None
         try:
+            validate_config_for_run(self.config, self.paths)
             self.database.update_run(run_id, stage="scraping", message="Fetching jobs")
             fetched = self.scraper.fetch_jobs()
             jobs_seen = len(fetched)
@@ -140,7 +141,7 @@ class JobBotPipeline:
                     return (job, filter_result) + self._score_candidate(job, resume, filter_result.force_escalate)
 
                 if self.config.automation_mode == "semi_auto":
-                    with ThreadPoolExecutor(max_workers=10) as executor:
+                    with ThreadPoolExecutor(max_workers=self.config.scoring_max_workers) as executor:
                         scored = list(executor.map(_score, candidates))
                 else:
                     scored = [_score(c) for c in candidates]
@@ -292,6 +293,26 @@ class JobBotPipeline:
         self, job: "Job", resume: "ResumeData", force_escalate: bool
     ) -> "tuple[StageEvaluation, StageEvaluation | None, float]":
         """Thread-safe. Returns (cheap_eval, strong_eval_or_none, cost_delta)."""
+        gate = self.scorer.precheap_gate(job, resume)
+        if gate.decision == "reject":
+            return StageEvaluation(
+                stage_name="cheap",
+                provider="precheap_gate",
+                model="tfidf_keyword",
+                status="skipped",
+                decision="reject",
+                score=0,
+                confidence=1.0,
+                rationale=gate.reason,
+                strengths=[],
+                gaps=[],
+                input_tokens=0,
+                output_tokens=0,
+                estimated_cost_usd=0.0,
+                error_message="",
+                evaluated_at=datetime.now(timezone.utc).isoformat(),
+                cached=True,
+            ), None, 0.0
         cheap_eval = self.scorer.cheap_evaluate(job, resume, force_escalate=force_escalate)
         cost = cheap_eval.estimated_cost_usd
         if cheap_eval.status != "scored" or cheap_eval.decision == "reject":

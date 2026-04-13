@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 from config import JobBotConfig
 from database import Job
 from document_tailoring import DocumentTailoringPayload
-from match_scorer import MatchScorer
+from match_scorer import MatchScorer, TfidfVectorizer
 from resume_parser import ResumeData, ResumeWorkEntry
 
 
@@ -88,6 +88,39 @@ class MatchScorerTests(unittest.TestCase):
         result = scorer.strong_evaluate(job, resume)
         self.assertEqual(result.status, "scored")
         self.assertAlmostEqual(result.confidence or 0.0, 0.6)
+
+    def test_precheap_gate_rejects_low_similarity(self) -> None:
+        if TfidfVectorizer is None:
+            self.skipTest("scikit-learn not available")
+        config = JobBotConfig(precheap_gate_enabled=True, precheap_gate_reject_threshold=30)
+        scorer = MatchScorer(config)
+        job = Job("1", "Chef", "Acme", "Remote", "", "Kitchen prep and cooking duties.", "board", "", "", "jobspy", "", "")
+        resume = ResumeData("", "", "Jane", "jane@example.com", "", "Python engineer", ["Python", "APIs"], ["Built APIs"])
+        result = scorer.precheap_gate(job, resume)
+        self.assertEqual(result.decision, "reject")
+
+    def test_precheap_gate_passes_with_overlap(self) -> None:
+        if TfidfVectorizer is None:
+            self.skipTest("scikit-learn not available")
+        config = JobBotConfig(precheap_gate_enabled=True, precheap_gate_reject_threshold=30)
+        scorer = MatchScorer(config)
+        job = Job(
+            "1",
+            "Python Developer",
+            "Acme",
+            "Remote",
+            "",
+            "Looking for Python, APIs, and automation experience.",
+            "board",
+            "",
+            "",
+            "jobspy",
+            "",
+            "",
+        )
+        resume = ResumeData("", "", "Jane", "jane@example.com", "", "Python engineer", ["Python", "Automation"], ["Built APIs"])
+        result = scorer.precheap_gate(job, resume)
+        self.assertEqual(result.decision, "pass")
 
     def test_suggest_job_keywords_returns_space_separated_terms(self) -> None:
         config = JobBotConfig(cheap_stage_provider="openai", cheap_stage_model="gpt-5-nano", openai_api_key="openai-test")

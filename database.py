@@ -164,6 +164,21 @@ class Database:
                     PRIMARY KEY(job_id, stage_name, resume_hash, provider, model, prompt_version),
                     FOREIGN KEY(job_id) REFERENCES jobs(id)
                 );
+
+                CREATE TABLE IF NOT EXISTS outcomes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    noted_at TEXT NOT NULL,
+                    notes TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(job_id) REFERENCES jobs(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status);
+                CREATE INDEX IF NOT EXISTS idx_jobs_scraped_at ON jobs(scraped_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_match_results_status ON match_results(status);
+                CREATE INDEX IF NOT EXISTS idx_ai_evaluations_job_stage ON ai_evaluations(job_id, stage_name);
+                CREATE INDEX IF NOT EXISTS idx_outcomes_job_id ON outcomes(job_id);
             """
         )
         self._ensure_column("generated_documents", "resume_docx_path", "TEXT NOT NULL DEFAULT ''")
@@ -686,6 +701,46 @@ class Database:
             "SELECT * FROM run_history ORDER BY id DESC LIMIT 1"
         ).fetchone()
         return dict(row) if row else None
+
+    def record_outcome(self, job_id: str, outcome: str, notes: str = "") -> None:
+        noted_at = datetime.now(timezone.utc).isoformat()
+        connection = self.connect()
+        with self._lock:
+            connection.execute(
+                "INSERT INTO outcomes (job_id, outcome, noted_at, notes) VALUES (?, ?, ?, ?)",
+                (job_id, outcome, noted_at, notes),
+            )
+            connection.commit()
+
+    def get_outcomes_summary(self) -> dict[str, Any]:
+        connection = self.connect()
+        rows = connection.execute(
+            "SELECT outcome, COUNT(*) AS count FROM outcomes GROUP BY outcome"
+        ).fetchall()
+        outcome_counts = {str(row["outcome"]): int(row["count"]) for row in rows}
+        total_applied = connection.execute(
+            "SELECT COUNT(*) AS n FROM deliveries WHERE status IN ('sent', 'pending_approval')"
+        ).fetchone()
+        total_with_outcome = connection.execute(
+            "SELECT COUNT(DISTINCT job_id) AS n FROM outcomes"
+        ).fetchone()
+        positive = sum(outcome_counts.get(k, 0) for k in ("phone_screen", "interview", "offer"))
+        total_tracked = int(total_with_outcome["n"]) if total_with_outcome else 0
+        response_rate = round(positive / total_tracked * 100, 1) if total_tracked > 0 else 0.0
+        return {
+            "total_applied": int(total_applied["n"]) if total_applied else 0,
+            "total_with_outcome": total_tracked,
+            "response_rate_pct": response_rate,
+            "by_outcome": outcome_counts,
+        }
+
+    def get_latest_outcome(self, job_id: str) -> str | None:
+        connection = self.connect()
+        row = connection.execute(
+            "SELECT outcome FROM outcomes WHERE job_id = ? ORDER BY noted_at DESC LIMIT 1",
+            (job_id,),
+        ).fetchone()
+        return str(row["outcome"]) if row else None
 
     def close(self) -> None:
         if self._connection is not None:

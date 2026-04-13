@@ -82,7 +82,7 @@ class JobBotConfig:
     doc_stage_model: str = "gpt-5-mini"
     ollama_base_url: str = "http://localhost:11434"
     proxy_list: list[str] = field(default_factory=list)
-    scoring_threshold: int = 30
+    scoring_threshold: int = 70
     rate_limit_min_seconds: int = 3
     rate_limit_max_seconds: int = 5
     resume_source_path: str = ""
@@ -92,11 +92,14 @@ class JobBotConfig:
     exclude_titles: list[str] = field(default_factory=lambda: ["principal", "sales", "designer"])
     force_escalate_keywords: list[str] = field(default_factory=lambda: ["python", "automation", "llm", "agent"])
     salary_floor: int = 0
-    cheap_reject_threshold: int = 25
-    cheap_escalate_threshold: int = 35
+    cheap_reject_threshold: int = 55
+    cheap_escalate_threshold: int = 75
     final_apply_threshold: int = 80
+    precheap_gate_enabled: bool = True
+    precheap_gate_reject_threshold: int = 30
     skip_ai_scoring_in_semi_auto: bool = True
     enable_cost_tracking: bool = True
+    scoring_max_workers: int = 4
     anthropic_api_key: str = ""
     openai_api_key: str = ""
 
@@ -216,8 +219,11 @@ def load_or_create_config(paths: AppPaths) -> JobBotConfig:
         cheap_reject_threshold=int(raw.get("cheap_reject_threshold", 55)),
         cheap_escalate_threshold=int(raw.get("cheap_escalate_threshold", 75)),
         final_apply_threshold=int(raw.get("final_apply_threshold", 80)),
+        precheap_gate_enabled=bool(raw.get("precheap_gate_enabled", True)),
+        precheap_gate_reject_threshold=int(raw.get("precheap_gate_reject_threshold", 30)),
         skip_ai_scoring_in_semi_auto=bool(raw.get("skip_ai_scoring_in_semi_auto", True)),
         enable_cost_tracking=bool(raw.get("enable_cost_tracking", True)),
+        scoring_max_workers=int(raw.get("scoring_max_workers", 4)),
         anthropic_api_key=str(raw.get("anthropic_api_key", "")),
         openai_api_key=str(raw.get("openai_api_key", "")),
     )
@@ -258,14 +264,60 @@ def validate_config(config: JobBotConfig) -> None:
         raise ValueError("cheap_escalate_threshold must be between 0 and 100")
     if not 0 <= config.final_apply_threshold <= 100:
         raise ValueError("final_apply_threshold must be between 0 and 100")
+    if not 0 <= config.precheap_gate_reject_threshold <= 100:
+        raise ValueError("precheap_gate_reject_threshold must be between 0 and 100")
     if config.source.results_per_page <= 0:
         raise ValueError("source.results_per_page must be greater than 0")
     if config.cheap_reject_threshold > config.cheap_escalate_threshold:
         raise ValueError("cheap_reject_threshold must be <= cheap_escalate_threshold")
+    if config.cheap_escalate_threshold > config.final_apply_threshold:
+        raise ValueError("cheap_escalate_threshold must be <= final_apply_threshold (otherwise the strong stage can never produce an apply_candidate)")
     if config.schedule.start_hour_est < 0 or config.schedule.end_hour_est > 23:
         raise ValueError("Schedule hours must be between 0 and 23")
     if config.schedule.end_hour_est < config.schedule.start_hour_est:
         raise ValueError("Schedule end hour must be >= start hour")
+
+
+def validate_config_for_run(config: JobBotConfig, paths: "AppPaths") -> None:
+    """Validate that the config is ready to run a pipeline. Raises ConfigurationError with actionable messages."""
+    errors: list[str] = []
+
+    # Resume file must exist
+    if config.resume_source_path.strip():
+        resume_path = Path(config.resume_source_path.strip()).expanduser()
+        if not resume_path.is_absolute():
+            resume_path = paths.root / resume_path
+        if not resume_path.exists():
+            errors.append(f"Resume file not found: {resume_path}. Update 'Resume source' in Setup tab.")
+    else:
+        errors.append("No resume configured. Set 'Resume source' in the Setup tab.")
+
+    # API keys must be present for non-Ollama providers that will actually be called.
+    # In semi_auto mode: docs are generated manually after the run, so skip doc stage check.
+    # In semi_auto + skip_ai_scoring: no AI calls happen at all during the run.
+    is_semi_auto = config.automation_mode == "semi_auto"
+    skip_ai_stages = is_semi_auto and config.skip_ai_scoring_in_semi_auto
+    stages_to_check = []
+    if not skip_ai_stages:
+        stages_to_check += [
+            ("cheap", "cheap_stage_provider", None),
+            ("strong", "strong_stage_provider", None),
+        ]
+    if not is_semi_auto:
+        stages_to_check.append(("doc", "doc_stage_provider", None))
+    for stage_name, provider_attr, key_attr in stages_to_check:
+        provider = getattr(config, f"{stage_name}_stage_provider")
+        if provider == "anthropic":
+            key = config.anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+            if not key:
+                errors.append(f"{stage_name.title()} stage uses Anthropic but no API key is set. Add it in the Setup tab or set ANTHROPIC_API_KEY env var.")
+        elif provider == "openai":
+            key = config.openai_api_key or os.environ.get("OPENAI_API_KEY", "")
+            if not key:
+                errors.append(f"{stage_name.title()} stage uses OpenAI but no API key is set. Add it in the Setup tab or set OPENAI_API_KEY env var.")
+
+    if errors:
+        raise ValueError("Cannot start run:\n" + "\n".join(f"  • {e}" for e in errors))
 
 
 def save_config(config: JobBotConfig, path: Path) -> None:
