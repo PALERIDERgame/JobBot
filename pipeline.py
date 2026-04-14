@@ -137,7 +137,14 @@ class JobBotPipeline:
             with ThreadPoolExecutor(max_workers=self.config.scoring_max_workers) as executor:
                 ranked = list(executor.map(_rank_candidate, candidates))
             ranked.sort(key=lambda item: item[2].score, reverse=True)
+            all_ranked = ranked
             ranked = [item for item in ranked if item[2].score >= self.config.fast_rank_min_score or bool(item[1].force_escalate)]
+            if not ranked and all_ranked:
+                ranked = all_ranked[: min(5, len(all_ranked))]
+                LOGGER.warning(
+                    "Fast rank produced zero survivors; admitting fallback top slice of %d jobs for cheap reranking",
+                    len(ranked),
+                )
             LOGGER.info(
                 "Fast rank finished in %.2fs. candidates=%d survivors=%d min_score=%d",
                 (datetime.now(timezone.utc) - fast_rank_started).total_seconds(),
@@ -190,11 +197,22 @@ class JobBotPipeline:
 
                 with ThreadPoolExecutor(max_workers=self.config.scoring_max_workers) as executor:
                     cheap_results = list(executor.map(_cheap_score, cheap_shortlist))
+                cheap_duration = (datetime.now(timezone.utc) - cheap_started).total_seconds()
                 LOGGER.info(
                     "Cheap AI finished in %.2fs for %d jobs",
-                    (datetime.now(timezone.utc) - cheap_started).total_seconds(),
+                    cheap_duration,
                     len(cheap_results),
                 )
+                if cheap_results:
+                    per_job = cheap_duration / len(cheap_results)
+                    if per_job > 3.0:
+                        LOGGER.warning(
+                            "Cheap-stage latency is high: %.2fs/job across %d jobs. provider=%s model=%s",
+                            per_job,
+                            len(cheap_results),
+                            self.config.cheap_stage_provider,
+                            self.config.cheap_stage_model,
+                        )
 
             cheap_survivors: list[tuple[Job, object, object, StageEvaluation]] = []
             cheap_results.sort(key=lambda item: (item[3].score or 0), reverse=True)

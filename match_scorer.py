@@ -151,6 +151,7 @@ class MatchScorer:
         self.config = config
         self.database = database
         self._client_cache: dict[str, object | None] = {}
+        self._request_mode_logged: set[tuple[str, str, str]] = set()
 
     @staticmethod
     def build_resume_hash(resume_data: ResumeData) -> str:
@@ -574,7 +575,11 @@ class MatchScorer:
             text, input_tokens, output_tokens = _call_with_retry(
                 lambda: self._create_completion_with_usage(provider, model, prompt)
             )
-            payload = json.loads(text)
+            cleaned_text = self._extract_json_text(text)
+            try:
+                payload = json.loads(cleaned_text)
+            except json.JSONDecodeError:
+                payload = json.loads(cleaned_text.replace("\r\n", "\\n").replace("\n", "\\n"))
             # Validate and clamp score to [0, 100]
             raw_score = payload.get("score", 0)
             score = max(0, min(100, int(raw_score))) if raw_score is not None else 0
@@ -607,6 +612,8 @@ class MatchScorer:
             return self._store_result(job.id, evaluation, resume_hash)
         except Exception as exc:  # pragma: no cover
             LOGGER.exception("Failed %s evaluation for %s", stage_name, job.id)
+            if 'text' in locals():
+                LOGGER.warning("AI scoring parse preview for %s: %s", job.id, self._safe_preview(text))
             return self._store_result(
                 job.id,
                 StageEvaluation(
@@ -725,20 +732,22 @@ class MatchScorer:
                 "is clearly below salary_floor_usd. If salary is unlisted or ambiguous, do not reject."
             )
         return {
-            "resume_summary": self._resume_summary(resume_data),
-            "job": self._job_summary(job),
+            "resume_summary": self._resume_summary(resume_data, compact=True),
+            "job": self._job_summary(job, excerpt_limit=900),
             "force_escalate": force_escalate,
             "screening_constraints": screening,
-            "keyword_overlap_terms": overlap_terms[:12],
+            "keyword_overlap_terms": overlap_terms[:6],
             "keyword_overlap_count": overlap_count,
+            "local_fast_rank": {
+                "query_overlap_score": self._query_overlap_score(self._build_job_gate_text(job)),
+                "title_match_score": self._title_match_score(job.title),
+            },
             "instructions": {
                 "return_json": True,
                 "fields": ["score", "confidence", "rationale", "strengths", "gaps"],
                 "goal": (
-                    "Fast screening pass using the rubric above. Apply screening_constraints first — "
-                    "if the job clearly fails location or salary constraints, score below 25. "
-                    "Use the rubric to score resume fit. Be consistent; return a confident score when the match is obvious. "
-                    "If keyword_overlap_count is high, avoid scoring below 50 unless core requirements are clearly missing."
+                    "Fast shortlist reranking pass. Apply screening_constraints first, then score fit using the rubric. "
+                    "Focus on whether this job belongs near the top of the shortlist, not on exhaustive analysis."
                 ),
             },
         }
@@ -750,35 +759,34 @@ class MatchScorer:
         )
         overlap_count = len(overlap_terms)
         return {
-            "resume_summary": self._resume_summary(resume_data),
-            "job": self._job_summary(job),
-            "keyword_overlap_terms": overlap_terms[:12],
+            "resume_summary": self._resume_summary(resume_data, compact=False),
+            "job": self._job_summary(job, excerpt_limit=1600),
+            "keyword_overlap_terms": overlap_terms[:8],
             "keyword_overlap_count": overlap_count,
             "instructions": {
                 "return_json": True,
                 "fields": ["score", "confidence", "rationale", "strengths", "gaps"],
                 "goal": (
-                    "Deeper fit review using the rubric above. Score the resume against core job requirements precisely. "
-                    "If keyword_overlap_count is high, avoid scoring below 50 unless core requirements are clearly missing."
+                    "Final shortlist verification. Score the resume against the core job requirements precisely, but stay concise."
                 ),
             },
         }
 
-    def _resume_summary(self, resume_data: ResumeData) -> dict[str, object]:
+    def _resume_summary(self, resume_data: ResumeData, *, compact: bool = False) -> dict[str, object]:
         return {
             "name": resume_data.name,
-            "summary": resume_data.summary,
-            "skills": resume_data.skills[:15],
-            "experience_highlights": resume_data.experience_lines[:8],
+            "summary": (resume_data.summary or "")[: (240 if compact else 500)],
+            "skills": resume_data.skills[: (8 if compact else 15)],
+            "experience_highlights": resume_data.experience_lines[: (4 if compact else 8)],
         }
 
-    def _job_summary(self, job: Job) -> dict[str, object]:
+    def _job_summary(self, job: Job, *, excerpt_limit: int = 2500) -> dict[str, object]:
         return {
             "title": job.title,
             "employer": job.employer,
             "location": job.location,
             "salary_range": job.salary_range,
-            "description_excerpt": job.description_full[:2500],
+            "description_excerpt": job.description_full[:excerpt_limit],
             "apply_url": job.apply_url,
         }
 
@@ -884,6 +892,21 @@ class MatchScorer:
         lowered = (text or "").lower()
         return any(phrase.strip().lower() in lowered for phrase in phrases if phrase.strip())
 
+    def _openai_chat_request_kwargs(self, model: str) -> tuple[dict[str, object], str]:
+        kwargs: dict[str, object] = {"max_completion_tokens": 700}
+        mode = "openai_chat_compact"
+        if not model.startswith("gpt-5"):
+            kwargs["temperature"] = 0
+            mode = "openai_chat_temperature_zero"
+        return kwargs, mode
+
+    def _log_request_mode(self, provider: str, model: str, mode: str) -> None:
+        key = (provider, model, mode)
+        if key in self._request_mode_logged:
+            return
+        self._request_mode_logged.add(key)
+        LOGGER.info("Scoring request mode: provider=%s model=%s mode=%s", provider, model, mode)
+
     def _decision_for(self, stage_name: str, *, score: int, confidence: float, force_escalate: bool) -> str:
         if stage_name == "cheap":
             if force_escalate:
@@ -982,15 +1005,16 @@ class MatchScorer:
             usage = getattr(response, "usage", None)
             return text, int(getattr(usage, "input_tokens", 0) or 0), int(getattr(usage, "output_tokens", 0) or 0)
 
+        request_kwargs, request_mode = self._openai_chat_request_kwargs(model)
+        self._log_request_mode(provider, model, request_mode)
         response = client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(prompt)},
             ],
-            max_completion_tokens=1000,
-            temperature=0,
             response_format={"type": "json_object"},
+            **request_kwargs,
         )
         text = (response.choices[0].message.content or "").strip()
         usage = getattr(response, "usage", None)
@@ -1014,15 +1038,16 @@ class MatchScorer:
                 if block_text:
                     return block_text.strip()
             return ""
+        request_kwargs, request_mode = self._openai_chat_request_kwargs(model)
+        self._log_request_mode(provider, model, request_mode)
         response = client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(prompt)},
             ],
-            max_completion_tokens=1000,
-            temperature=0,
             response_format={"type": "json_object"},
+            **request_kwargs,
         )
         return (response.choices[0].message.content or "").strip()
 

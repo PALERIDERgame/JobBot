@@ -74,8 +74,8 @@ class JobBotConfig:
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     automation_mode: str = "semi_auto"
     llm_provider: str = "anthropic"
-    cheap_stage_provider: str = "ollama_local"
-    cheap_stage_model: str = "qwen2.5:7b"
+    cheap_stage_provider: str = "openai"
+    cheap_stage_model: str = "gpt-5-nano"
     strong_stage_provider: str = "anthropic"
     strong_stage_model: str = "claude-sonnet-4-20250514"
     doc_stage_provider: str = "openai"
@@ -99,8 +99,8 @@ class JobBotConfig:
     precheap_gate_reject_threshold: int = 30
     skip_ai_scoring_in_semi_auto: bool = True
     fast_rank_min_score: int = 20
-    cheap_ai_top_n: int = 20
-    strong_ai_top_n: int = 7
+    cheap_ai_top_n: int = 8
+    strong_ai_top_n: int = 3
     progressive_queue_enabled: bool = True
     enable_cost_tracking: bool = True
     scoring_max_workers: int = 4
@@ -178,8 +178,8 @@ def load_or_create_config(paths: AppPaths) -> JobBotConfig:
         raw = _load_serialized_config(handle.read())
 
     cheap_stage_provider = _normalize_stage_provider(
-        raw.get("cheap_stage_provider", "ollama_local"),
-        fallback="ollama_local",
+        raw.get("cheap_stage_provider", "openai"),
+        fallback="openai",
         cheap_stage_provider="ollama_local",
         strong_stage_provider=str(raw.get("strong_stage_provider", "anthropic")),
     )
@@ -203,7 +203,7 @@ def load_or_create_config(paths: AppPaths) -> JobBotConfig:
         automation_mode=str(raw.get("automation_mode", "semi_auto")),
         llm_provider=str(raw.get("llm_provider", "anthropic")),
         cheap_stage_provider=cheap_stage_provider,
-        cheap_stage_model=str(raw.get("cheap_stage_model", "qwen2.5:7b")),
+        cheap_stage_model=str(raw.get("cheap_stage_model", "gpt-5-nano")),
         strong_stage_provider=strong_stage_provider,
         strong_stage_model=str(raw.get("strong_stage_model", "claude-sonnet-4-20250514")),
         doc_stage_provider=doc_stage_provider,
@@ -227,8 +227,8 @@ def load_or_create_config(paths: AppPaths) -> JobBotConfig:
         precheap_gate_reject_threshold=int(raw.get("precheap_gate_reject_threshold", 30)),
         skip_ai_scoring_in_semi_auto=bool(raw.get("skip_ai_scoring_in_semi_auto", True)),
         fast_rank_min_score=int(raw.get("fast_rank_min_score", 20) if raw.get("fast_rank_min_score") not in (None, 35) else 20),
-        cheap_ai_top_n=int(raw.get("cheap_ai_top_n", 20)),
-        strong_ai_top_n=int(raw.get("strong_ai_top_n", 7)),
+        cheap_ai_top_n=int(raw.get("cheap_ai_top_n", 8)),
+        strong_ai_top_n=int(raw.get("strong_ai_top_n", 3)),
         progressive_queue_enabled=bool(raw.get("progressive_queue_enabled", True)),
         enable_cost_tracking=bool(raw.get("enable_cost_tracking", True)),
         scoring_max_workers=int(raw.get("scoring_max_workers", 4)),

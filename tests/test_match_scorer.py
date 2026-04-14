@@ -147,6 +147,43 @@ class MatchScorerTests(unittest.TestCase):
         boosted = Job("2", "Software Engineer", "Acme", "Remote", "", "General backend work with agentic systems", "board", "", "", "jobspy", "", "")
         self.assertGreater(scorer.fast_rank_job(boosted, resume).score, scorer.fast_rank_job(plain, resume).score)
 
+    def test_build_cheap_prompt_is_compact_for_shortlist_rerank(self) -> None:
+        scorer = MatchScorer(JobBotConfig(source=JobBotConfig().source))
+        job = Job("1", "Python Developer", "Acme", "Remote", "", "Python role " * 400, "board", "https://example.com", "", "usajobs", "", "")
+        resume = ResumeData("", "", "Jane", "jane@example.com", "", "Python engineer " * 80, ["Python"] * 20, ["Built APIs"] * 20)
+        prompt = scorer._build_cheap_prompt(job, resume, force_escalate=False)
+        self.assertLessEqual(len(prompt["job"]["description_excerpt"]), 900)
+        self.assertLessEqual(len(prompt["resume_summary"]["skills"]), 8)
+        self.assertLessEqual(len(prompt["resume_summary"]["experience_highlights"]), 4)
+        self.assertLessEqual(len(prompt["keyword_overlap_terms"]), 6)
+
+    def test_openai_gpt5_request_kwargs_omit_temperature(self) -> None:
+        scorer = MatchScorer(JobBotConfig())
+        kwargs, mode = scorer._openai_chat_request_kwargs("gpt-5-mini")
+        self.assertEqual(kwargs["max_completion_tokens"], 700)
+        self.assertNotIn("temperature", kwargs)
+        self.assertEqual(mode, "openai_chat_compact")
+
+    def test_non_gpt5_request_kwargs_keep_temperature_zero(self) -> None:
+        scorer = MatchScorer(JobBotConfig())
+        kwargs, mode = scorer._openai_chat_request_kwargs("gpt-4o-mini")
+        self.assertEqual(kwargs["max_completion_tokens"], 700)
+        self.assertEqual(kwargs["temperature"], 0)
+        self.assertEqual(mode, "openai_chat_temperature_zero")
+
+    def test_strong_evaluate_parses_markdown_wrapped_json(self) -> None:
+        config = JobBotConfig(strong_stage_provider="openai", strong_stage_model="gpt-5-mini", openai_api_key="openai-test")
+        scorer = MatchScorer(config)
+        scorer._build_client = MagicMock(return_value=object())
+        scorer._create_completion_with_usage = MagicMock(
+            return_value=("```json\n{\"score\": 77, \"confidence\": 0.8, \"rationale\": \"Good fit\", \"strengths\": [\"Python\"], \"gaps\": []}\n```", 400, 50)
+        )
+        job = Job("1", "Python Developer", "Acme", "Remote", "", "Python role", "board", "https://example.com", "", "usajobs", "", "")
+        resume = ResumeData("", "", "Jane", "jane@example.com", "", "Python engineer", ["Python"], ["Built APIs"])
+        result = scorer.strong_evaluate(job, resume)
+        self.assertEqual(result.status, "scored")
+        self.assertEqual(result.score, 77)
+
     def test_suggest_job_keywords_returns_space_separated_terms(self) -> None:
         config = JobBotConfig(cheap_stage_provider="openai", cheap_stage_model="gpt-5-nano", openai_api_key="openai-test")
         scorer = MatchScorer(config)
@@ -245,13 +282,15 @@ class MatchScorerTests(unittest.TestCase):
             openai_api_key="openai-test",
         )
         scorer = MatchScorer(config)
-        attempt = scorer.tailor_documents_with_ai(
-            Job("1", "Head of Marketing", "Acme", "Remote", "", "Lead B2B growth and reporting.", "board", "", "", "jobspy", "", ""),
-            ResumeData("", "", "Jane", "jane@example.com", "", "Summary", ["Python"], ["Built APIs"]),
-            DocumentTailoringPayload(),
-        )
+        with self.assertLogs("match_scorer", level="WARNING") as captured:
+            attempt = scorer.tailor_documents_with_ai(
+                Job("1", "Head of Marketing", "Acme", "Remote", "", "Lead B2B growth and reporting.", "board", "", "", "jobspy", "", ""),
+                ResumeData("", "", "Jane", "jane@example.com", "", "Summary", ["Python"], ["Built APIs"]),
+                DocumentTailoringPayload(),
+            )
         self.assertFalse(attempt.attempted)
         self.assertIn("model mismatch", attempt.failure_reason.lower())
+        self.assertTrue(any("model mismatch" in line.lower() for line in captured.output))
 
     def test_extract_json_text_recovers_markdown_wrapped_json(self) -> None:
         cleaned = MatchScorer._extract_json_text("```json\nbefore\n{\"key\": 1}\nafter\n```")
@@ -370,10 +409,12 @@ class MatchScorerTests(unittest.TestCase):
             ["Built APIs"],
             work_experience_entries=[ResumeWorkEntry("Role 1", "2024", ["Built dashboards"])],
         )
-        attempt = scorer.tailor_documents_with_ai(
-            Job("1", "Head of Marketing", "Acme", "Remote", "", "Lead B2B growth", "board", "", "", "jobspy", "", ""),
-            resume,
-            DocumentTailoringPayload(work_entries=resume.work_experience_entries, key_skills=["Python"], cover_letter_text="Local"),
-        )
+        with self.assertLogs("match_scorer", level="WARNING") as captured:
+            attempt = scorer.tailor_documents_with_ai(
+                Job("1", "Head of Marketing", "Acme", "Remote", "", "Lead B2B growth", "board", "", "", "jobspy", "", ""),
+                resume,
+                DocumentTailoringPayload(work_entries=resume.work_experience_entries, key_skills=["Python"], cover_letter_text="Local"),
+            )
         self.assertTrue(attempt.attempted)
         self.assertEqual(attempt.failure_reason, "OpenAI response could not be parsed as JSON.")
+        self.assertTrue(any("parse preview" in line.lower() for line in captured.output))

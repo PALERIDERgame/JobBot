@@ -17,7 +17,10 @@ class ConfigTests(unittest.TestCase):
                 self.assertTrue(paths.config_file.exists())
                 self.assertEqual(config.scoring_threshold, 70)
                 self.assertEqual(config.source.results_per_page, 100)
-                self.assertEqual(config.cheap_stage_provider, "ollama_local")
+                self.assertEqual(config.cheap_stage_provider, "openai")
+                self.assertEqual(config.cheap_stage_model, "gpt-5-nano")
+                self.assertEqual(config.cheap_ai_top_n, 8)
+                self.assertEqual(config.strong_ai_top_n, 3)
                 self.assertEqual(config.strong_stage_provider, "anthropic")
 
     def test_resolve_output_dir_uses_appdata_when_relative(self) -> None:
