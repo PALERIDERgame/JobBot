@@ -18,6 +18,7 @@ A log of why key configuration and design choices were made. Use this to remembe
 - [[Decision — AI Provider Choice]] — Why Ollama + hosted strong stage
 - [[Decision — Semi-Auto vs Auto Mode]] — Why semi-auto is the default
 - [[Decision — Scoring Threshold Values]] — Current thresholds and tuning history
+- [[Decision — Progressive Scoring Redesign]] — Why the queue now appears early and AI verifies only the shortlist
 
 ## Related
 

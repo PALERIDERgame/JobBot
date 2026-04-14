@@ -98,6 +98,10 @@ class JobBotConfig:
     precheap_gate_enabled: bool = True
     precheap_gate_reject_threshold: int = 30
     skip_ai_scoring_in_semi_auto: bool = True
+    fast_rank_min_score: int = 35
+    cheap_ai_top_n: int = 20
+    strong_ai_top_n: int = 7
+    progressive_queue_enabled: bool = True
     enable_cost_tracking: bool = True
     scoring_max_workers: int = 4
     anthropic_api_key: str = ""
@@ -222,6 +226,10 @@ def load_or_create_config(paths: AppPaths) -> JobBotConfig:
         precheap_gate_enabled=bool(raw.get("precheap_gate_enabled", True)),
         precheap_gate_reject_threshold=int(raw.get("precheap_gate_reject_threshold", 30)),
         skip_ai_scoring_in_semi_auto=bool(raw.get("skip_ai_scoring_in_semi_auto", True)),
+        fast_rank_min_score=int(raw.get("fast_rank_min_score", 35)),
+        cheap_ai_top_n=int(raw.get("cheap_ai_top_n", 20)),
+        strong_ai_top_n=int(raw.get("strong_ai_top_n", 7)),
+        progressive_queue_enabled=bool(raw.get("progressive_queue_enabled", True)),
         enable_cost_tracking=bool(raw.get("enable_cost_tracking", True)),
         scoring_max_workers=int(raw.get("scoring_max_workers", 4)),
         anthropic_api_key=str(raw.get("anthropic_api_key", "")),
@@ -252,6 +260,14 @@ def validate_config(config: JobBotConfig) -> None:
         raise ValueError("source.jobspy_sites must contain at least one site")
     if config.source.days_back <= 0:
         raise ValueError("source.days_back must be greater than 0")
+    if not 0 <= config.fast_rank_min_score <= 100:
+        raise ValueError("fast_rank_min_score must be between 0 and 100")
+    if config.cheap_ai_top_n < 0:
+        raise ValueError("cheap_ai_top_n must be >= 0")
+    if config.strong_ai_top_n < 0:
+        raise ValueError("strong_ai_top_n must be >= 0")
+    if config.strong_ai_top_n > config.cheap_ai_top_n and config.cheap_ai_top_n > 0:
+        raise ValueError("strong_ai_top_n must be <= cheap_ai_top_n")
     if config.cheap_stage_provider not in {"ollama_local", "openai", "anthropic"}:
         raise ValueError("cheap_stage_provider must be 'ollama_local', 'openai', or 'anthropic'")
     if config.strong_stage_provider not in {"openai", "anthropic"}:

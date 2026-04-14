@@ -14,7 +14,7 @@ from database import Database, Job
 from doc_generator import DocumentGenerator, GeneratedDocs
 from document_tailoring import DocumentTailoringPayload
 from gmail_client import DeliveryResult, GmailClient
-from match_scorer import MatchScore, MatchScorer, StageEvaluation
+from match_scorer import FastRankResult, MatchScore, MatchScorer, StageEvaluation
 from portal_filler import PortalAutofillReadiness, PortalFiller
 from resume_parser import ResumeData, load_cached_resume, parse_resume
 from scrapers.scraper_router import ScraperRouter
@@ -73,12 +73,14 @@ class JobBotPipeline:
             progress_callback(stage, message, progress)
 
     def run(self) -> PipelineResult:
+        return self._run_progressive()
+
+    def _run_progressive(self) -> PipelineResult:
         started_at = datetime.now(timezone.utc).isoformat()
         run_id = self.database.create_run(started_at, stage="starting")
         jobs_seen = 0
         jobs_matched = 0
         run_cost = 0.0
-        resume: ResumeData | None = None
         try:
             validate_config_for_run(self.config, self.paths)
             self.database.update_run(run_id, stage="scraping", message="Fetching jobs")
@@ -92,7 +94,7 @@ class JobBotPipeline:
             recent_job_ids = self.database.recent_job_ids(hours=24)
 
             # Phase 1: deterministic filter (sequential — maintains seen_job_ids correctly)
-            candidates: list[tuple] = []
+            candidates: list[tuple[Job, object]] = []
             for idx, (job, _raw_payload) in enumerate(fetched, start=1):
                 self.database.update_run(
                     run_id,
@@ -109,77 +111,150 @@ class JobBotPipeline:
                     self._record_skipped_match(job, filter_result.reason)
                     continue
 
-                if self.config.automation_mode == "semi_auto" and self.config.skip_ai_scoring_in_semi_auto:
-                    self.database.update_run(
-                        run_id,
-                        stage="review_queue",
-                        message=f"Queued without AI scoring: {job.title} at {job.employer}",
-                        jobs_seen=jobs_seen,
-                        jobs_matched=jobs_matched + 1,
-                    )
-                    self._record_review_queue_match(job, "AI scoring skipped in semi_auto for faster review queueing.")
-                    self.database.record_delivery(
-                        job.id,
-                        method="approval_queue",
-                        status="pending_approval",
-                        message_id="",
-                        error_message="Waiting for manual approval in review queue.",
-                        delivered_at="",
-                    )
-                    jobs_matched += 1
-                    continue
-
                 candidates.append((job, filter_result))
 
-            # Phase 2: score candidates (parallel for semi_auto, sequential otherwise)
-            if candidates:
-                resume = self._load_resume()
-                self.database.update_run(run_id, stage="cheap_scoring", message=f"Scoring {len(candidates)} candidates...", jobs_seen=jobs_seen)
+            if not candidates:
+                finished_at = datetime.now(timezone.utc).isoformat()
+                self.database.update_run(
+                    run_id,
+                    ended_at=finished_at,
+                    status="completed",
+                    stage="completed",
+                    message="Run completed",
+                    jobs_seen=jobs_seen,
+                    jobs_matched=0,
+                )
+                return PipelineResult(run_id, "completed", jobs_seen, 0, "Run completed", 0.0)
 
-                def _score(args: tuple) -> tuple:
-                    job, filter_result = args
-                    return (job, filter_result) + self._score_candidate(job, resume, filter_result.force_escalate)
+            resume = self._load_resume()
+            self.database.update_run(run_id, stage="fast_ranking", message=f"Fast-ranking {len(candidates)} candidates...", jobs_seen=jobs_seen)
+            fast_rank_started = datetime.now(timezone.utc)
 
-                if self.config.automation_mode == "semi_auto":
-                    with ThreadPoolExecutor(max_workers=self.config.scoring_max_workers) as executor:
-                        scored = list(executor.map(_score, candidates))
-                else:
-                    scored = [_score(c) for c in candidates]
-            else:
-                scored = []
+            def _rank_candidate(args: tuple[Job, object]) -> tuple[Job, object, object]:
+                job, filter_result = args
+                return job, filter_result, self.scorer.fast_rank_job(job, resume, force_escalate=bool(filter_result.force_escalate))
 
-            # Phase 3: record results and handle delivery (sequential)
-            for job, filter_result, cheap_eval, strong_eval, cost_delta in scored:
-                run_cost += cost_delta
-                if cheap_eval.status != "scored" or cheap_eval.decision == "reject":
-                    self._record_evaluation_result(job, cheap_eval)
-                    continue
-                if strong_eval is None:
-                    continue
-                self._record_evaluation_result(job, strong_eval)
-                if strong_eval.status != "scored" or strong_eval.decision not in {"apply_candidate", "review"}:
-                    continue
+            with ThreadPoolExecutor(max_workers=self.config.scoring_max_workers) as executor:
+                ranked = list(executor.map(_rank_candidate, candidates))
+            ranked.sort(key=lambda item: item[2].score, reverse=True)
+            ranked = [item for item in ranked if item[2].score >= self.config.fast_rank_min_score or bool(item[1].force_escalate)]
+            LOGGER.info(
+                "Fast rank finished in %.2fs. candidates=%d survivors=%d min_score=%d",
+                (datetime.now(timezone.utc) - fast_rank_started).total_seconds(),
+                len(candidates),
+                len(ranked),
+                self.config.fast_rank_min_score,
+            )
 
-                if self.config.automation_mode == "semi_auto":
-                    self.database.update_run(
-                        run_id,
-                        stage="review_queue",
-                        message=f"Queued for manual review: {job.title} at {job.employer}",
-                        jobs_seen=jobs_seen,
-                        jobs_matched=jobs_matched + 1,
-                    )
+            if self.config.automation_mode == "semi_auto":
+                for index, (job, _filter_result, fast_rank) in enumerate(ranked, start=1):
+                    self._record_fast_rank_result(job, fast_rank, provisional_rank=index)
                     self.database.record_delivery(
                         job.id,
                         method="approval_queue",
                         status="pending_approval",
                         message_id="",
-                        error_message="Waiting for manual approval in review queue.",
+                        error_message="Queued with provisional fast-rank score while AI verification continues.",
                         delivered_at="",
                     )
-                    jobs_matched += 1
-                    continue
+                jobs_matched = len(ranked)
+                self.database.update_run(
+                    run_id,
+                    stage="review_queue",
+                    message=f"Queued {jobs_matched} provisional candidates after fast rank",
+                    jobs_seen=jobs_seen,
+                    jobs_matched=jobs_matched,
+                )
 
-                if strong_eval.decision != "apply_candidate":
+            use_progressive_ai = self.config.progressive_queue_enabled or self.config.automation_mode == "auto"
+            if self.config.automation_mode == "semi_auto" and self.config.skip_ai_scoring_in_semi_auto and not self.config.progressive_queue_enabled:
+                use_progressive_ai = False
+
+            cheap_shortlist = ranked[: self.config.cheap_ai_top_n] if use_progressive_ai and self.config.cheap_ai_top_n > 0 else []
+            LOGGER.info("AI shortlist sizes: fast_rank=%d cheap_top_n=%d", len(ranked), len(cheap_shortlist))
+
+            cheap_results: list[tuple[Job, object, object, StageEvaluation]] = []
+            if cheap_shortlist:
+                self.database.update_run(
+                    run_id,
+                    stage="cheap_scoring",
+                    message=f"Cheap reranking {len(cheap_shortlist)} shortlisted jobs...",
+                    jobs_seen=jobs_seen,
+                    jobs_matched=jobs_matched,
+                )
+                cheap_started = datetime.now(timezone.utc)
+
+                def _cheap_score(args: tuple[Job, object, object]) -> tuple[Job, object, object, StageEvaluation]:
+                    job, filter_result, fast_rank = args
+                    return job, filter_result, fast_rank, self.scorer.cheap_evaluate(job, resume, force_escalate=bool(filter_result.force_escalate))
+
+                with ThreadPoolExecutor(max_workers=self.config.scoring_max_workers) as executor:
+                    cheap_results = list(executor.map(_cheap_score, cheap_shortlist))
+                LOGGER.info(
+                    "Cheap AI finished in %.2fs for %d jobs",
+                    (datetime.now(timezone.utc) - cheap_started).total_seconds(),
+                    len(cheap_results),
+                )
+
+            cheap_survivors: list[tuple[Job, object, object, StageEvaluation]] = []
+            cheap_results.sort(key=lambda item: (item[3].score or 0), reverse=True)
+            for index, (job, filter_result, fast_rank, cheap_eval) in enumerate(cheap_results, start=1):
+                run_cost += cheap_eval.estimated_cost_usd
+                self._record_evaluation_result(job, cheap_eval, score_source="cheap_ai", verification_stage="cheap_verified", provisional_rank=index)
+                if self.config.automation_mode == "semi_auto" and (cheap_eval.status != "scored" or cheap_eval.decision == "reject"):
+                    self.database.record_delivery(
+                        job.id,
+                        method="approval_queue",
+                        status="skipped",
+                        message_id="",
+                        error_message="Removed from review queue after cheap AI rejection.",
+                        delivered_at="",
+                    )
+                if cheap_eval.status == "scored" and cheap_eval.decision != "reject":
+                    cheap_survivors.append((job, filter_result, fast_rank, cheap_eval))
+
+            strong_shortlist = cheap_survivors[: self.config.strong_ai_top_n] if self.config.strong_ai_top_n > 0 else []
+            LOGGER.info("Strong shortlist size: %d", len(strong_shortlist))
+
+            strong_results: list[tuple[Job, object, object, StageEvaluation, StageEvaluation]] = []
+            if strong_shortlist:
+                self.database.update_run(
+                    run_id,
+                    stage="strong_scoring",
+                    message=f"Strong-verifying {len(strong_shortlist)} finalists...",
+                    jobs_seen=jobs_seen,
+                    jobs_matched=jobs_matched,
+                )
+                strong_started = datetime.now(timezone.utc)
+
+                def _strong_score(args: tuple[Job, object, object, StageEvaluation]) -> tuple[Job, object, object, StageEvaluation, StageEvaluation]:
+                    job, filter_result, fast_rank, cheap_eval = args
+                    return job, filter_result, fast_rank, cheap_eval, self.scorer.strong_evaluate(job, resume)
+
+                with ThreadPoolExecutor(max_workers=self.config.scoring_max_workers) as executor:
+                    strong_results = list(executor.map(_strong_score, strong_shortlist))
+                LOGGER.info(
+                    "Strong AI finished in %.2fs for %d jobs",
+                    (datetime.now(timezone.utc) - strong_started).total_seconds(),
+                    len(strong_results),
+                )
+
+            for index, (job, _filter_result, _fast_rank, _cheap_eval, strong_eval) in enumerate(strong_results, start=1):
+                run_cost += strong_eval.estimated_cost_usd
+                self._record_evaluation_result(job, strong_eval, score_source="strong_ai", verification_stage="strong_verified", provisional_rank=index)
+                if self.config.automation_mode == "semi_auto" and (strong_eval.status != "scored" or strong_eval.decision not in {"apply_candidate", "review"}):
+                    self.database.record_delivery(
+                        job.id,
+                        method="approval_queue",
+                        status="skipped",
+                        message_id="",
+                        error_message="Removed from review queue after strong AI verification.",
+                        delivered_at="",
+                    )
+
+                if self.config.automation_mode != "auto":
+                    continue
+                if strong_eval.status != "scored" or strong_eval.decision != "apply_candidate":
                     continue
 
                 self.database.update_run(
@@ -197,7 +272,7 @@ class JobBotPipeline:
                     ai_notes=strong_eval.rationale,
                 )
                 jobs_matched += 1
-                if self.config.automation_mode == "auto" and job.apply_method == "email":
+                if job.apply_method == "email":
                     self.database.update_run(
                         run_id,
                         stage="delivery",
@@ -215,13 +290,6 @@ class JobBotPipeline:
                         delivered_at=datetime.now(timezone.utc).isoformat(),
                     )
                 else:
-                    self.database.update_run(
-                        run_id,
-                        stage="review_queue",
-                        message=f"Queued for approval: {job.title} at {job.employer}",
-                        jobs_seen=jobs_seen,
-                        jobs_matched=jobs_matched,
-                    )
                     self.database.record_delivery(
                         job.id,
                         method="approval_queue",
@@ -350,12 +418,42 @@ class JobBotPipeline:
             gaps=[],
             is_match=False,
             status="skipped",
+            score_source="deterministic_filter",
+            verification_stage="filtered_out",
+            provisional_rank=0,
             error_message="",
             scored_at=datetime.now(timezone.utc).isoformat(),
         )
 
-    def _record_evaluation_result(self, job: Job, evaluation: StageEvaluation) -> None:
+    def _record_fast_rank_result(self, job: Job, fast_rank: FastRankResult, *, provisional_rank: int) -> None:
+        self.database.record_match_result(
+            job.id,
+            score=fast_rank.score,
+            rationale=fast_rank.rationale,
+            strengths=[f"overlap: {term}" for term in fast_rank.keyword_overlap_terms[:3]],
+            gaps=[],
+            is_match=False,
+            status="review",
+            score_source="fast_rank",
+            verification_stage="fast_ranked",
+            provisional_rank=provisional_rank,
+            error_message="",
+            scored_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    def _record_evaluation_result(
+        self,
+        job: Job,
+        evaluation: StageEvaluation,
+        *,
+        score_source: str,
+        verification_stage: str,
+        provisional_rank: int = 0,
+    ) -> None:
         is_match = evaluation.status == "scored" and evaluation.decision == "apply_candidate"
+        status = evaluation.decision if evaluation.status == "scored" else evaluation.status
+        if verification_stage == "cheap_verified" and status == "escalate":
+            status = "review"
         self.database.record_match_result(
             job.id,
             score=evaluation.score,
@@ -363,7 +461,10 @@ class JobBotPipeline:
             strengths=evaluation.strengths,
             gaps=evaluation.gaps,
             is_match=is_match,
-            status=evaluation.decision if evaluation.status == "scored" else evaluation.status,
+            status=status,
+            score_source=score_source,
+            verification_stage=verification_stage,
+            provisional_rank=provisional_rank,
             error_message=evaluation.error_message,
             scored_at=evaluation.evaluated_at,
         )
@@ -377,6 +478,9 @@ class JobBotPipeline:
             gaps=[],
             is_match=False,
             status="review",
+            score_source="manual_queue",
+            verification_stage="queued",
+            provisional_rank=0,
             error_message="",
             scored_at=datetime.now(timezone.utc).isoformat(),
         )

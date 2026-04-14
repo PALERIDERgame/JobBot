@@ -122,6 +122,31 @@ class MatchScorerTests(unittest.TestCase):
         result = scorer.precheap_gate(job, resume)
         self.assertEqual(result.decision, "pass")
 
+    def test_fast_rank_prefers_relevant_python_role(self) -> None:
+        scorer = MatchScorer(JobBotConfig())
+        resume = ResumeData("", "", "Jane", "jane@example.com", "", "Python engineer", ["Python", "Automation"], ["Built APIs and automation systems"])
+        relevant = Job("1", "Python Developer", "Acme", "Remote", "", "Python APIs automation", "board", "", "", "jobspy", "", "")
+        irrelevant = Job("2", "Retail Store Manager", "Acme", "Remote", "", "Retail scheduling and merchandising", "board", "", "", "jobspy", "", "")
+        relevant_rank = scorer.fast_rank_job(relevant, resume)
+        irrelevant_rank = scorer.fast_rank_job(irrelevant, resume)
+        self.assertGreater(relevant_rank.score, irrelevant_rank.score)
+
+    def test_fast_rank_applies_salary_penalty(self) -> None:
+        config = JobBotConfig(salary_floor=150000)
+        scorer = MatchScorer(config)
+        resume = ResumeData("", "", "Jane", "jane@example.com", "", "Python engineer", ["Python"], ["Built APIs"])
+        low_salary = Job("1", "Python Developer", "Acme", "Remote", "$90,000 - $110,000", "Python role", "board", "", "", "jobspy", "", "")
+        high_salary = Job("2", "Python Developer", "Acme", "Remote", "$160,000 - $180,000", "Python role", "board", "", "", "jobspy", "", "")
+        self.assertGreater(scorer.fast_rank_job(high_salary, resume).score, scorer.fast_rank_job(low_salary, resume).score)
+
+    def test_fast_rank_force_escalate_keyword_boosts_score(self) -> None:
+        config = JobBotConfig(force_escalate_keywords=["agentic"])
+        scorer = MatchScorer(config)
+        resume = ResumeData("", "", "Jane", "jane@example.com", "", "Python engineer", ["Python"], ["Built APIs"])
+        plain = Job("1", "Software Engineer", "Acme", "Remote", "", "General backend work", "board", "", "", "jobspy", "", "")
+        boosted = Job("2", "Software Engineer", "Acme", "Remote", "", "General backend work with agentic systems", "board", "", "", "jobspy", "", "")
+        self.assertGreater(scorer.fast_rank_job(boosted, resume).score, scorer.fast_rank_job(plain, resume).score)
+
     def test_suggest_job_keywords_returns_space_separated_terms(self) -> None:
         config = JobBotConfig(cheap_stage_provider="openai", cheap_stage_model="gpt-5-nano", openai_api_key="openai-test")
         scorer = MatchScorer(config)

@@ -64,7 +64,10 @@ class Database:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             self._connection = sqlite3.connect(self.db_path, check_same_thread=False)
             self._connection.row_factory = sqlite3.Row
-            self._connection.execute("PRAGMA journal_mode=WAL;")
+            try:
+                self._connection.execute("PRAGMA journal_mode=WAL;")
+            except sqlite3.OperationalError:
+                self._connection.execute("PRAGMA journal_mode=DELETE;")
             self._connection.execute("PRAGMA synchronous=NORMAL;")
             self._connection.execute("PRAGMA temp_store=MEMORY;")
         return self._connection
@@ -109,6 +112,9 @@ class Database:
                     gaps TEXT NOT NULL DEFAULT '[]',
                     is_match INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'pending',
+                    score_source TEXT NOT NULL DEFAULT '',
+                    verification_stage TEXT NOT NULL DEFAULT '',
+                    provisional_rank INTEGER NOT NULL DEFAULT 0,
                     error_message TEXT NOT NULL DEFAULT '',
                     scored_at TEXT NOT NULL DEFAULT '',
                     FOREIGN KEY(job_id) REFERENCES jobs(id)
@@ -203,6 +209,9 @@ class Database:
         self._ensure_column("deliveries", "approval_route", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("deliveries", "approval_docs_action", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("deliveries", "approval_portal_platform", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("match_results", "score_source", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("match_results", "verification_stage", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("match_results", "provisional_rank", "INTEGER NOT NULL DEFAULT 0")
         connection.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -317,6 +326,9 @@ class Database:
         gaps: list[str],
         is_match: bool,
         status: str,
+        score_source: str = "",
+        verification_stage: str = "",
+        provisional_rank: int = 0,
         error_message: str,
         scored_at: str,
     ) -> None:
@@ -325,8 +337,8 @@ class Database:
             connection.execute(
                 """
                     INSERT INTO match_results (
-                        job_id, score, rationale, strengths, gaps, is_match, status, error_message, scored_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        job_id, score, rationale, strengths, gaps, is_match, status, score_source, verification_stage, provisional_rank, error_message, scored_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(job_id) DO UPDATE SET
                         score=excluded.score,
                         rationale=excluded.rationale,
@@ -334,6 +346,9 @@ class Database:
                         gaps=excluded.gaps,
                         is_match=excluded.is_match,
                         status=excluded.status,
+                        score_source=excluded.score_source,
+                        verification_stage=excluded.verification_stage,
+                        provisional_rank=excluded.provisional_rank,
                         error_message=excluded.error_message,
                         scored_at=excluded.scored_at
                 """,
@@ -345,6 +360,9 @@ class Database:
                     json.dumps(gaps, ensure_ascii=True),
                     int(is_match),
                     status,
+                    score_source,
+                    verification_stage,
+                    provisional_rank,
                     error_message,
                     scored_at,
                 ),
@@ -598,6 +616,9 @@ class Database:
             COALESCE(match_results.score, 0) AS score,
             COALESCE(match_results.rationale, '') AS rationale,
             COALESCE(match_results.status, 'pending') AS match_status,
+            COALESCE(match_results.score_source, '') AS score_source,
+            COALESCE(match_results.verification_stage, '') AS verification_stage,
+            COALESCE(match_results.provisional_rank, 0) AS provisional_rank,
             COALESCE(generated_documents.resume_docx_path, '') AS resume_docx_path,
             COALESCE(generated_documents.resume_pdf_path, '') AS resume_pdf_path,
             COALESCE(generated_documents.cover_letter_path, '') AS cover_letter_path,
@@ -618,7 +639,20 @@ class Database:
         if min_scraped_at:
             query += " WHERE jobs.scraped_at >= ?"
             params = (min_scraped_at,)
-        query += " ORDER BY COALESCE(match_results.score, 0) DESC, jobs.scraped_at DESC"
+            query += " AND COALESCE(deliveries.status, 'pending') != 'skipped' AND COALESCE(match_results.status, 'pending') NOT IN ('skipped', 'reject', 'error')"
+        else:
+            query += " WHERE COALESCE(deliveries.status, 'pending') != 'skipped' AND COALESCE(match_results.status, 'pending') NOT IN ('skipped', 'reject', 'error')"
+        query += """
+        ORDER BY
+            CASE COALESCE(match_results.verification_stage, '')
+                WHEN 'strong_verified' THEN 3
+                WHEN 'cheap_verified' THEN 2
+                WHEN 'fast_ranked' THEN 1
+                ELSE 0
+            END DESC,
+            COALESCE(match_results.score, 0) DESC,
+            jobs.scraped_at DESC
+        """
         rows = connection.execute(query, params).fetchall()
         return [dict(row) for row in rows]
 
@@ -641,6 +675,9 @@ class Database:
                 COALESCE(match_results.score, 0) AS score,
                 COALESCE(match_results.rationale, '') AS rationale,
                 COALESCE(match_results.status, 'pending') AS match_status,
+                COALESCE(match_results.score_source, '') AS score_source,
+                COALESCE(match_results.verification_stage, '') AS verification_stage,
+                COALESCE(match_results.provisional_rank, 0) AS provisional_rank,
                 COALESCE(generated_documents.output_dir, '') AS output_dir,
                 COALESCE(generated_documents.resume_docx_path, '') AS resume_docx_path,
                 COALESCE(generated_documents.resume_pdf_path, '') AS resume_pdf_path,

@@ -56,8 +56,12 @@ FIELD_TOOLTIPS = {
     "Cheap reject threshold": "Cheap-stage score at or below this value gets rejected early.",
     "Cheap escalate threshold": "Cheap-stage score at or above this value moves to the strong stage.",
     "Pre-cheap reject threshold": "TF-IDF/keyword gate score below this value is rejected before any AI calls.",
+    "Fast rank min score": "Minimum local fast-rank score required before a job can enter the progressive shortlist or provisional queue.",
+    "Cheap AI top N": "Only the top N fast-ranked jobs are sent to the cheap AI reranker.",
+    "Strong AI top N": "Only the top N cheap-stage survivors are sent to the strong AI verifier.",
     "Automation mode": "Semi-auto queues jobs for approval. Auto sends only when the apply method supports it.",
     "Skip AI scoring in semi_auto": "When enabled, semi-auto skips AI scoring and queues deterministic matches right away for faster review.",
+    "Enable progressive queue": "Queue provisional fast-ranked jobs immediately, then improve their scores as AI verification finishes.",
     "Enable pre-cheap gate": "Use a fast TF-IDF + keyword overlap check to skip obvious mismatches before AI scoring.",
     "Gmail recipient (optional fallback/test inbox)": "Optional fallback inbox for non-employer delivery or dry-run testing.",
     "Gmail sender": "Authenticated Gmail account used to send applications.",
@@ -122,6 +126,9 @@ class JobBotDashboard:
         self.cheap_reject_threshold_var = tk.StringVar(value=str(config.cheap_reject_threshold))
         self.cheap_escalate_threshold_var = tk.StringVar(value=str(config.cheap_escalate_threshold))
         self.precheap_gate_threshold_var = tk.StringVar(value=str(config.precheap_gate_reject_threshold))
+        self.fast_rank_min_score_var = tk.StringVar(value=str(config.fast_rank_min_score))
+        self.cheap_ai_top_n_var = tk.StringVar(value=str(config.cheap_ai_top_n))
+        self.strong_ai_top_n_var = tk.StringVar(value=str(config.strong_ai_top_n))
         self.keyword_var = tk.StringVar(value=config.source.keyword)
         self.location_var = tk.StringVar(value=config.source.location)
         self.source_provider_var = tk.StringVar(value=config.source.provider)
@@ -138,6 +145,7 @@ class JobBotDashboard:
         self.salary_floor_var = tk.StringVar(value=str(config.salary_floor))
         self.gmail_enabled_var = tk.BooleanVar(value=config.gmail.enabled)
         self.skip_ai_scoring_var = tk.BooleanVar(value=config.skip_ai_scoring_in_semi_auto)
+        self.progressive_queue_enabled_var = tk.BooleanVar(value=config.progressive_queue_enabled)
         self.precheap_gate_enabled_var = tk.BooleanVar(value=config.precheap_gate_enabled)
         self.automation_mode_var = tk.StringVar(value=config.automation_mode)
         self.llm_provider_var = tk.StringVar(value=config.llm_provider)
@@ -251,6 +259,9 @@ class JobBotDashboard:
             ("Cheap reject threshold", self.cheap_reject_threshold_var),
             ("Cheap escalate threshold", self.cheap_escalate_threshold_var),
             ("Pre-cheap reject threshold", self.precheap_gate_threshold_var),
+            ("Fast rank min score", self.fast_rank_min_score_var),
+            ("Cheap AI top N", self.cheap_ai_top_n_var),
+            ("Strong AI top N", self.strong_ai_top_n_var),
             ("Strong stage provider", self.strong_stage_provider_var),
             ("Strong stage model", self.strong_stage_model_var),
             ("Doc stage provider", self.doc_stage_provider_var),
@@ -350,11 +361,14 @@ class JobBotDashboard:
         skip_ai_check = ttk.Checkbutton(frame, text="Skip AI scoring in semi_auto", variable=self.skip_ai_scoring_var, command=self._autosave_setup)
         skip_ai_check.grid(row=len(labels) + 1, column=1, columnspan=2, sticky="w", pady=6)
         self._add_tooltip(skip_ai_check, FIELD_TOOLTIPS["Skip AI scoring in semi_auto"])
+        progressive_check = ttk.Checkbutton(frame, text="Enable progressive queue", variable=self.progressive_queue_enabled_var, command=self._autosave_setup)
+        progressive_check.grid(row=len(labels) + 2, column=1, columnspan=2, sticky="w", pady=6)
+        self._add_tooltip(progressive_check, FIELD_TOOLTIPS["Enable progressive queue"])
         precheap_check = ttk.Checkbutton(frame, text="Enable pre-cheap gate", variable=self.precheap_gate_enabled_var, command=self._autosave_setup)
-        precheap_check.grid(row=len(labels) + 2, column=1, columnspan=2, sticky="w", pady=6)
+        precheap_check.grid(row=len(labels) + 3, column=1, columnspan=2, sticky="w", pady=6)
         self._add_tooltip(precheap_check, FIELD_TOOLTIPS["Enable pre-cheap gate"])
         portal_row = ttk.Frame(frame)
-        portal_row.grid(row=len(labels) + 3, column=1, columnspan=2, sticky="ew", pady=(6, 0))
+        portal_row.grid(row=len(labels) + 4, column=1, columnspan=2, sticky="ew", pady=(6, 0))
         portal_row.columnconfigure(0, weight=1)
         portal_status = ttk.Label(portal_row, textvariable=self.portal_readiness_var)
         portal_status.grid(row=0, column=0, sticky="w")
@@ -364,7 +378,7 @@ class JobBotDashboard:
         self.portal_test_buttons.append(portal_test_button)
         self._add_tooltip(portal_test_button, "Run an in-app headless Chromium launch check and report the exact portal runtime readiness.")
         gmail_status = ttk.Label(frame, textvariable=self.gmail_readiness_var)
-        gmail_status.grid(row=len(labels) + 4, column=1, columnspan=2, sticky="w", pady=(6, 0))
+        gmail_status.grid(row=len(labels) + 5, column=1, columnspan=2, sticky="w", pady=(6, 0))
         self._add_tooltip(gmail_status, "Shows whether Gmail email sending looks configured before you try Approve and Send on email jobs.")
 
     def _build_run_tab(self, frame: ttk.Frame) -> None:
@@ -395,7 +409,7 @@ class JobBotDashboard:
         self._add_tooltip(self.cost_text, "Tracked estimated API costs by stage.")
 
     def _build_review_tab(self, frame: ttk.Frame) -> None:
-        columns = ("title", "employer", "posted_at", "score", "source", "hr_email", "document_status", "delivery_status")
+        columns = ("title", "employer", "posted_at", "score", "score_source", "verification_stage", "hr_email", "document_status", "delivery_status")
         tree_container = ttk.Frame(frame)
         tree_container.pack(fill="both", expand=True)
         tree_container.columnconfigure(0, weight=1)
@@ -409,6 +423,8 @@ class JobBotDashboard:
         tree.column("title", width=250)
         tree.column("employer", width=180)
         tree.column("posted_at", width=150)
+        tree.column("score_source", width=110)
+        tree.column("verification_stage", width=125)
         tree.column("hr_email", width=90, anchor="center")
         review_scrollbar = ttk.Scrollbar(tree_container, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=review_scrollbar.set)
@@ -668,7 +684,11 @@ class JobBotDashboard:
         config.cheap_reject_threshold = int(self.cheap_reject_threshold_var.get().strip() or "55")
         config.cheap_escalate_threshold = int(self.cheap_escalate_threshold_var.get().strip() or "75")
         config.precheap_gate_reject_threshold = int(self.precheap_gate_threshold_var.get().strip() or "30")
+        config.fast_rank_min_score = int(self.fast_rank_min_score_var.get().strip() or "35")
+        config.cheap_ai_top_n = int(self.cheap_ai_top_n_var.get().strip() or "20")
+        config.strong_ai_top_n = int(self.strong_ai_top_n_var.get().strip() or "7")
         config.skip_ai_scoring_in_semi_auto = self.skip_ai_scoring_var.get()
+        config.progressive_queue_enabled = self.progressive_queue_enabled_var.get()
         config.precheap_gate_enabled = self.precheap_gate_enabled_var.get()
         config.gmail.enabled = self.gmail_enabled_var.get()
         config.gmail.recipient_email = self.recipient_var.get().strip()
@@ -917,7 +937,8 @@ class JobBotDashboard:
                     row["employer"],
                     self._format_posted_at(str(row.get("posted_at") or "")),
                     row["score"],
-                    row["source"],
+                    row.get("score_source") or row["source"],
+                    row.get("verification_stage") or "",
                     self._hr_email_status(row),
                     row["document_status"],
                     row["delivery_status"],
@@ -978,6 +999,9 @@ class JobBotDashboard:
                 f"Source: {row['source']}",
                 f"Resume source type: {Path(self.config.resume_source_path).suffix.lower() or 'unknown'}",
                 f"Score: {row['score']}",
+                f"Score source: {row.get('score_source') or 'unknown'}",
+                f"Verification stage: {row.get('verification_stage') or 'unknown'}",
+                f"Provisional rank: {row.get('provisional_rank') or 'n/a'}",
                 f"Match status: {row['match_status']}",
                 f"Apply method: {row['apply_method']}",
                 f"HR email: {email_assessment.confidence}",

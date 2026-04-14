@@ -131,10 +131,25 @@ class PrecheapGateResult:
     reason: str
 
 
+@dataclass(slots=True)
+class FastRankResult:
+    score: int
+    rationale: str
+    title_match_score: int
+    target_title_overlap: int
+    keyword_overlap_count: int
+    keyword_overlap_terms: list[str]
+    tfidf_score: int
+    force_escalate_hit: bool
+    location_penalty: int
+    salary_penalty: int
+
+
 class MatchScorer:
     def __init__(self, config: JobBotConfig, database: Database | None = None) -> None:
         self.config = config
         self.database = database
+        self._client_cache: dict[str, object | None] = {}
 
     @staticmethod
     def build_resume_hash(resume_data: ResumeData) -> str:
@@ -241,6 +256,54 @@ class MatchScorer:
     def score_job(self, job: Job, resume_data: ResumeData) -> MatchScore:
         evaluation = self.strong_evaluate(job, resume_data)
         return evaluation.to_match_score(self.config.final_apply_threshold)
+
+    def fast_rank_job(self, job: Job, resume_data: ResumeData, *, force_escalate: bool = False) -> FastRankResult:
+        resume_text = self._build_resume_gate_text(resume_data)
+        job_text = self._build_job_gate_text(job)
+        overlap_terms = self._keyword_overlap_terms(job_text, resume_text)
+        overlap_count = len(overlap_terms)
+        tfidf_score = self._tfidf_similarity_score(resume_text, job_text)
+        title_match_score = self._title_match_score(job.title)
+        target_title_overlap = self._target_title_overlap(job.title)
+        force_hit = force_escalate or self._contains_any(job_text, self.config.force_escalate_keywords)
+        location_penalty = self._location_penalty(job)
+        salary_penalty = self._salary_penalty(job)
+
+        raw_score = (
+            (tfidf_score * 0.45)
+            + (min(overlap_count * 8, 100) * 0.25)
+            + (title_match_score * 0.20)
+            + (target_title_overlap * 0.10)
+        )
+        if force_hit:
+            raw_score += 12
+        raw_score -= location_penalty + salary_penalty
+        score = max(0, min(100, int(round(raw_score))))
+        rationale_bits = [
+            f"title={title_match_score}",
+            f"tfidf={tfidf_score}",
+            f"overlap={overlap_count}",
+        ]
+        if target_title_overlap:
+            rationale_bits.append(f"target_titles={target_title_overlap}")
+        if force_hit:
+            rationale_bits.append("force_escalate")
+        if location_penalty:
+            rationale_bits.append(f"location_penalty={location_penalty}")
+        if salary_penalty:
+            rationale_bits.append(f"salary_penalty={salary_penalty}")
+        return FastRankResult(
+            score=score,
+            rationale="Fast rank: " + ", ".join(rationale_bits),
+            title_match_score=title_match_score,
+            target_title_overlap=target_title_overlap,
+            keyword_overlap_count=overlap_count,
+            keyword_overlap_terms=overlap_terms[:12],
+            tfidf_score=tfidf_score,
+            force_escalate_hit=force_hit,
+            location_penalty=location_penalty,
+            salary_penalty=salary_penalty,
+        )
 
     def suggest_job_keywords(self, resume_data: ResumeData) -> str:
         provider = self.config.cheap_stage_provider
@@ -754,6 +817,52 @@ class MatchScorer:
         except ValueError:
             return 0
 
+    def _title_match_score(self, title: str) -> int:
+        title_lower = (title or "").lower()
+        include_hits = sum(1 for item in self.config.include_titles if item.strip() and item.strip().lower() in title_lower)
+        exclude_hits = sum(1 for item in self.config.exclude_titles if item.strip() and item.strip().lower() in title_lower)
+        target_hits = sum(1 for item in self.config.target_titles if item.strip() and item.strip().lower() in title_lower)
+        score = 25 + (include_hits * 20) + (target_hits * 12) - (exclude_hits * 35)
+        return max(0, min(100, score))
+
+    def _target_title_overlap(self, title: str) -> int:
+        title_tokens = self._tokenize_terms(title)
+        target_tokens = self._tokenize_terms(" ".join(self.config.target_titles))
+        if not title_tokens or not target_tokens:
+            return 0
+        overlap = len(title_tokens & target_tokens)
+        return min(overlap * 20, 100)
+
+    def _location_penalty(self, job: Job) -> int:
+        target = (self.config.source.location or "").strip().lower()
+        job_location = (job.location or "").strip().lower()
+        if not target or not job_location:
+            return 0
+        if "remote" in job_location:
+            return 0
+        target_terms = self._tokenize_terms(target)
+        job_terms = self._tokenize_terms(job_location)
+        return 0 if (target_terms & job_terms) else 18
+
+    def _salary_penalty(self, job: Job) -> int:
+        floor = int(self.config.salary_floor or 0)
+        if floor <= 0:
+            return 0
+        salary_text = (job.salary_range or "").replace(",", "")
+        values = [int(match) for match in re.findall(r"\d{2,6}", salary_text)]
+        if not values:
+            return 0
+        lower_bound = min(values)
+        if lower_bound >= floor:
+            return 0
+        gap_ratio = max(0.0, min(1.0, (floor - lower_bound) / max(floor, 1)))
+        return int(round(10 + (gap_ratio * 20)))
+
+    @staticmethod
+    def _contains_any(text: str, phrases: list[str]) -> bool:
+        lowered = (text or "").lower()
+        return any(phrase.strip().lower() in lowered for phrase in phrases if phrase.strip())
+
     def _decision_for(self, stage_name: str, *, score: int, confidence: float, force_escalate: bool) -> str:
         if stage_name == "cheap":
             if force_escalate:
@@ -770,12 +879,17 @@ class MatchScorer:
         return "skip"
 
     def _build_client(self, provider: str):
+        if provider in self._client_cache:
+            return self._client_cache[provider]
         if provider == "ollama_local":
             try:
                 req = request.Request(f"{self.config.ollama_base_url.rstrip('/')}/api/tags", method="GET")
                 with request.urlopen(req, timeout=2):
-                    return {"base_url": self.config.ollama_base_url.rstrip("/")}
+                    client = {"base_url": self.config.ollama_base_url.rstrip("/")}
+                    self._client_cache[provider] = client
+                    return client
             except Exception:  # pragma: no cover
+                self._client_cache[provider] = None
                 return None
         if provider == "anthropic":
             api_key = self.config.anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY", "")
@@ -783,16 +897,23 @@ class MatchScorer:
                 try:
                     from anthropic import Anthropic
                 except ImportError:  # pragma: no cover
+                    self._client_cache[provider] = None
                     return None
-                return Anthropic(api_key=api_key)
+                client = Anthropic(api_key=api_key)
+                self._client_cache[provider] = client
+                return client
         if provider == "openai":
             api_key = self.config.openai_api_key or os.environ.get("OPENAI_API_KEY", "")
             if api_key:
                 try:
                     from openai import OpenAI
                 except ImportError:  # pragma: no cover
+                    self._client_cache[provider] = None
                     return None
-                return OpenAI(api_key=api_key)
+                client = OpenAI(api_key=api_key)
+                self._client_cache[provider] = client
+                return client
+        self._client_cache[provider] = None
         return None
 
     def _create_completion_with_usage(self, provider: str, model: str, prompt: dict[str, object]) -> tuple[str, int, int]:
