@@ -141,6 +141,7 @@ class FastRankResult:
     keyword_overlap_terms: list[str]
     tfidf_score: int
     force_escalate_hit: bool
+    query_overlap_score: int
     location_penalty: int
     salary_penalty: int
 
@@ -265,15 +266,18 @@ class MatchScorer:
         tfidf_score = self._tfidf_similarity_score(resume_text, job_text)
         title_match_score = self._title_match_score(job.title)
         target_title_overlap = self._target_title_overlap(job.title)
+        query_overlap_score = self._query_overlap_score(job_text)
         force_hit = force_escalate or self._contains_any(job_text, self.config.force_escalate_keywords)
         location_penalty = self._location_penalty(job)
         salary_penalty = self._salary_penalty(job)
 
         raw_score = (
-            (tfidf_score * 0.45)
-            + (min(overlap_count * 8, 100) * 0.25)
-            + (title_match_score * 0.20)
-            + (target_title_overlap * 0.10)
+            12
+            + (tfidf_score * 0.25)
+            + (min(overlap_count * 8, 100) * 0.20)
+            + (title_match_score * 0.25)
+            + (target_title_overlap * 0.15)
+            + (query_overlap_score * 0.15)
         )
         if force_hit:
             raw_score += 12
@@ -286,6 +290,8 @@ class MatchScorer:
         ]
         if target_title_overlap:
             rationale_bits.append(f"target_titles={target_title_overlap}")
+        if query_overlap_score:
+            rationale_bits.append(f"query={query_overlap_score}")
         if force_hit:
             rationale_bits.append("force_escalate")
         if location_penalty:
@@ -301,6 +307,7 @@ class MatchScorer:
             keyword_overlap_terms=overlap_terms[:12],
             tfidf_score=tfidf_score,
             force_escalate_hit=force_hit,
+            query_overlap_score=query_overlap_score,
             location_penalty=location_penalty,
             salary_penalty=salary_penalty,
         )
@@ -822,7 +829,10 @@ class MatchScorer:
         include_hits = sum(1 for item in self.config.include_titles if item.strip() and item.strip().lower() in title_lower)
         exclude_hits = sum(1 for item in self.config.exclude_titles if item.strip() and item.strip().lower() in title_lower)
         target_hits = sum(1 for item in self.config.target_titles if item.strip() and item.strip().lower() in title_lower)
-        score = 25 + (include_hits * 20) + (target_hits * 12) - (exclude_hits * 35)
+        title_tokens = self._tokenize_terms(title_lower)
+        keyword_tokens = self._tokenize_terms(" ".join(self.config.include_titles + self.config.target_titles + [self.config.source.keyword]))
+        token_overlap = len(title_tokens & keyword_tokens)
+        score = 35 + (include_hits * 22) + (target_hits * 15) + (token_overlap * 8) - (exclude_hits * 35)
         return max(0, min(100, score))
 
     def _target_title_overlap(self, title: str) -> int:
@@ -842,7 +852,7 @@ class MatchScorer:
             return 0
         target_terms = self._tokenize_terms(target)
         job_terms = self._tokenize_terms(job_location)
-        return 0 if (target_terms & job_terms) else 18
+        return 0 if (target_terms & job_terms) else 10
 
     def _salary_penalty(self, job: Job) -> int:
         floor = int(self.config.salary_floor or 0)
@@ -856,7 +866,18 @@ class MatchScorer:
         if lower_bound >= floor:
             return 0
         gap_ratio = max(0.0, min(1.0, (floor - lower_bound) / max(floor, 1)))
-        return int(round(10 + (gap_ratio * 20)))
+        return int(round(6 + (gap_ratio * 14)))
+
+    def _query_overlap_score(self, job_text: str) -> int:
+        query = (self.config.source.keyword or "").strip()
+        if not query:
+            return 0
+        query_tokens = self._tokenize_terms(query)
+        if not query_tokens:
+            return 0
+        job_tokens = self._tokenize_terms(job_text)
+        overlap = len(query_tokens & job_tokens)
+        return min(overlap * 25, 100)
 
     @staticmethod
     def _contains_any(text: str, phrases: list[str]) -> bool:
@@ -967,7 +988,7 @@ class MatchScorer:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(prompt)},
             ],
-            max_tokens=1000,
+            max_completion_tokens=1000,
             temperature=0,
             response_format={"type": "json_object"},
         )
@@ -999,7 +1020,7 @@ class MatchScorer:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(prompt)},
             ],
-            max_tokens=1000,
+            max_completion_tokens=1000,
             temperature=0,
             response_format={"type": "json_object"},
         )

@@ -98,7 +98,7 @@ class JobBotConfig:
     precheap_gate_enabled: bool = True
     precheap_gate_reject_threshold: int = 30
     skip_ai_scoring_in_semi_auto: bool = True
-    fast_rank_min_score: int = 35
+    fast_rank_min_score: int = 20
     cheap_ai_top_n: int = 20
     strong_ai_top_n: int = 7
     progressive_queue_enabled: bool = True
@@ -226,7 +226,7 @@ def load_or_create_config(paths: AppPaths) -> JobBotConfig:
         precheap_gate_enabled=bool(raw.get("precheap_gate_enabled", True)),
         precheap_gate_reject_threshold=int(raw.get("precheap_gate_reject_threshold", 30)),
         skip_ai_scoring_in_semi_auto=bool(raw.get("skip_ai_scoring_in_semi_auto", True)),
-        fast_rank_min_score=int(raw.get("fast_rank_min_score", 35)),
+        fast_rank_min_score=int(raw.get("fast_rank_min_score", 20) if raw.get("fast_rank_min_score") not in (None, 35) else 20),
         cheap_ai_top_n=int(raw.get("cheap_ai_top_n", 20)),
         strong_ai_top_n=int(raw.get("strong_ai_top_n", 7)),
         progressive_queue_enabled=bool(raw.get("progressive_queue_enabled", True)),
