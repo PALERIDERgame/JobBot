@@ -46,6 +46,12 @@ class StageEvaluationRecord:
     rationale: str
     strengths: list[str]
     gaps: list[str]
+    required_match_breakdown: dict[str, Any]
+    missing_required_items: list[str]
+    adjacent_transferable_strengths: list[str]
+    red_flags: list[str]
+    recommended_action: str
+    resume_tailoring_focus: list[str]
     input_tokens: int
     output_tokens: int
     estimated_cost_usd: float
@@ -104,12 +110,46 @@ class Database:
                     jobs_matched INTEGER NOT NULL DEFAULT 0
                 );
 
+                CREATE TABLE IF NOT EXISTS runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT,
+                    status TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    message TEXT NOT NULL DEFAULT '',
+                    jobs_seen INTEGER NOT NULL DEFAULT 0,
+                    jobs_matched INTEGER NOT NULL DEFAULT 0,
+                    estimated_cost_usd REAL NOT NULL DEFAULT 0,
+                    fast_rank_candidates INTEGER NOT NULL DEFAULT 0,
+                    fast_rank_survivors INTEGER NOT NULL DEFAULT 0,
+                    cheap_shortlist_size INTEGER NOT NULL DEFAULT 0,
+                    cheap_stage_duration_ms INTEGER NOT NULL DEFAULT 0,
+                    cheap_stage_provider TEXT NOT NULL DEFAULT '',
+                    cheap_stage_model TEXT NOT NULL DEFAULT '',
+                    cheap_parse_failures INTEGER NOT NULL DEFAULT 0,
+                    strong_shortlist_size INTEGER NOT NULL DEFAULT 0,
+                    strong_stage_duration_ms INTEGER NOT NULL DEFAULT 0,
+                    strong_stage_provider TEXT NOT NULL DEFAULT '',
+                    strong_stage_model TEXT NOT NULL DEFAULT '',
+                    strong_parse_failures INTEGER NOT NULL DEFAULT 0,
+                    error_summary TEXT NOT NULL DEFAULT ''
+                );
+
                 CREATE TABLE IF NOT EXISTS match_results (
                     job_id TEXT PRIMARY KEY,
                     score INTEGER,
                     rationale TEXT NOT NULL DEFAULT '',
                     strengths TEXT NOT NULL DEFAULT '[]',
                     gaps TEXT NOT NULL DEFAULT '[]',
+                    confidence REAL,
+                    required_match_breakdown TEXT NOT NULL DEFAULT '{}',
+                    missing_required_items TEXT NOT NULL DEFAULT '[]',
+                    adjacent_transferable_strengths TEXT NOT NULL DEFAULT '[]',
+                    red_flags TEXT NOT NULL DEFAULT '[]',
+                    recommended_action TEXT NOT NULL DEFAULT '',
+                    resume_tailoring_focus TEXT NOT NULL DEFAULT '[]',
+                    gating_reason TEXT NOT NULL DEFAULT '',
+                    policy_blocked INTEGER NOT NULL DEFAULT 0,
                     is_match INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'pending',
                     score_source TEXT NOT NULL DEFAULT '',
@@ -162,6 +202,12 @@ class Database:
                     rationale TEXT NOT NULL DEFAULT '',
                     strengths TEXT NOT NULL DEFAULT '[]',
                     gaps TEXT NOT NULL DEFAULT '[]',
+                    required_match_breakdown TEXT NOT NULL DEFAULT '{}',
+                    missing_required_items TEXT NOT NULL DEFAULT '[]',
+                    adjacent_transferable_strengths TEXT NOT NULL DEFAULT '[]',
+                    red_flags TEXT NOT NULL DEFAULT '[]',
+                    recommended_action TEXT NOT NULL DEFAULT '',
+                    resume_tailoring_focus TEXT NOT NULL DEFAULT '[]',
                     input_tokens INTEGER NOT NULL DEFAULT 0,
                     output_tokens INTEGER NOT NULL DEFAULT 0,
                     estimated_cost_usd REAL NOT NULL DEFAULT 0,
@@ -185,6 +231,7 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_match_results_status ON match_results(status);
                 CREATE INDEX IF NOT EXISTS idx_ai_evaluations_job_stage ON ai_evaluations(job_id, stage_name);
                 CREATE INDEX IF NOT EXISTS idx_outcomes_job_id ON outcomes(job_id);
+                CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at DESC);
             """
         )
         self._ensure_column("generated_documents", "resume_docx_path", "TEXT NOT NULL DEFAULT ''")
@@ -212,6 +259,35 @@ class Database:
         self._ensure_column("match_results", "score_source", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("match_results", "verification_stage", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("match_results", "provisional_rank", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("match_results", "confidence", "REAL")
+        self._ensure_column("match_results", "required_match_breakdown", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("match_results", "missing_required_items", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column("match_results", "adjacent_transferable_strengths", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column("match_results", "red_flags", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column("match_results", "recommended_action", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("match_results", "resume_tailoring_focus", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column("match_results", "gating_reason", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("match_results", "policy_blocked", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("ai_evaluations", "required_match_breakdown", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("ai_evaluations", "missing_required_items", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column("ai_evaluations", "adjacent_transferable_strengths", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column("ai_evaluations", "red_flags", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column("ai_evaluations", "recommended_action", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("ai_evaluations", "resume_tailoring_focus", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column("runs", "estimated_cost_usd", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("runs", "fast_rank_candidates", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("runs", "fast_rank_survivors", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("runs", "cheap_shortlist_size", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("runs", "cheap_stage_duration_ms", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("runs", "cheap_stage_provider", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("runs", "cheap_stage_model", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("runs", "cheap_parse_failures", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("runs", "strong_shortlist_size", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("runs", "strong_stage_duration_ms", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("runs", "strong_stage_provider", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("runs", "strong_stage_model", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("runs", "strong_parse_failures", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("runs", "error_summary", "TEXT NOT NULL DEFAULT ''")
         connection.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -235,8 +311,16 @@ class Database:
                 """,
                 (started_at, stage, status, message),
             )
+            run_id = int(cursor.lastrowid)
+            connection.execute(
+                """
+                    INSERT INTO runs (id, started_at, stage, status, message)
+                    VALUES (?, ?, ?, ?, ?)
+                """,
+                (run_id, started_at, stage, status, message),
+            )
             connection.commit()
-            return int(cursor.lastrowid)
+            return run_id
 
     def update_run(
         self,
@@ -248,9 +332,25 @@ class Database:
         message: str | None = None,
         jobs_seen: int | None = None,
         jobs_matched: int | None = None,
+        estimated_cost_usd: float | None = None,
+        fast_rank_candidates: int | None = None,
+        fast_rank_survivors: int | None = None,
+        cheap_shortlist_size: int | None = None,
+        cheap_stage_duration_ms: int | None = None,
+        cheap_stage_provider: str | None = None,
+        cheap_stage_model: str | None = None,
+        cheap_parse_failures: int | None = None,
+        strong_shortlist_size: int | None = None,
+        strong_stage_duration_ms: int | None = None,
+        strong_stage_provider: str | None = None,
+        strong_stage_model: str | None = None,
+        strong_parse_failures: int | None = None,
+        error_summary: str | None = None,
     ) -> None:
-        assignments: list[str] = []
-        params: list[Any] = []
+        history_assignments: list[str] = []
+        history_params: list[Any] = []
+        runs_assignments: list[str] = []
+        runs_params: list[Any] = []
         for column, value in (
             ("ended_at", ended_at),
             ("status", status),
@@ -260,17 +360,45 @@ class Database:
             ("jobs_matched", jobs_matched),
         ):
             if value is not None:
-                assignments.append(f"{column} = ?")
-                params.append(value)
-        if not assignments:
+                runs_assignments.append(f"{column} = ?")
+                runs_params.append(value)
+                history_assignments.append(f"{column} = ?")
+                history_params.append(value)
+        for column, value in (
+            ("estimated_cost_usd", estimated_cost_usd),
+            ("fast_rank_candidates", fast_rank_candidates),
+            ("fast_rank_survivors", fast_rank_survivors),
+            ("cheap_shortlist_size", cheap_shortlist_size),
+            ("cheap_stage_duration_ms", cheap_stage_duration_ms),
+            ("cheap_stage_provider", cheap_stage_provider),
+            ("cheap_stage_model", cheap_stage_model),
+            ("cheap_parse_failures", cheap_parse_failures),
+            ("strong_shortlist_size", strong_shortlist_size),
+            ("strong_stage_duration_ms", strong_stage_duration_ms),
+            ("strong_stage_provider", strong_stage_provider),
+            ("strong_stage_model", strong_stage_model),
+            ("strong_parse_failures", strong_parse_failures),
+            ("error_summary", error_summary),
+        ):
+            if value is not None:
+                runs_assignments.append(f"{column} = ?")
+                runs_params.append(value)
+        if not history_assignments and not runs_assignments:
             return
-        params.append(run_id)
         connection = self.connect()
         with self._lock:
-            connection.execute(
-                f"UPDATE run_history SET {', '.join(assignments)} WHERE id = ?",
-                params,
-            )
+            if history_assignments:
+                history_params.append(run_id)
+                connection.execute(
+                    f"UPDATE run_history SET {', '.join(history_assignments)} WHERE id = ?",
+                    history_params,
+                )
+            if runs_assignments:
+                runs_params.append(run_id)
+                connection.execute(
+                    f"UPDATE runs SET {', '.join(runs_assignments)} WHERE id = ?",
+                    runs_params,
+                )
             connection.commit()
 
     def upsert_job(self, job: Job, raw_payload: dict[str, Any] | None = None) -> None:
@@ -324,6 +452,15 @@ class Database:
         rationale: str,
         strengths: list[str],
         gaps: list[str],
+        confidence: float | None = None,
+        required_match_breakdown: dict[str, Any] | None = None,
+        missing_required_items: list[str] | None = None,
+        adjacent_transferable_strengths: list[str] | None = None,
+        red_flags: list[str] | None = None,
+        recommended_action: str = "",
+        resume_tailoring_focus: list[str] | None = None,
+        gating_reason: str = "",
+        policy_blocked: bool = False,
         is_match: bool,
         status: str,
         score_source: str = "",
@@ -337,13 +474,25 @@ class Database:
             connection.execute(
                 """
                     INSERT INTO match_results (
-                        job_id, score, rationale, strengths, gaps, is_match, status, score_source, verification_stage, provisional_rank, error_message, scored_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        job_id, score, rationale, strengths, gaps, confidence, required_match_breakdown,
+                        missing_required_items, adjacent_transferable_strengths, red_flags, recommended_action,
+                        resume_tailoring_focus, gating_reason, policy_blocked, is_match, status, score_source,
+                        verification_stage, provisional_rank, error_message, scored_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(job_id) DO UPDATE SET
                         score=excluded.score,
                         rationale=excluded.rationale,
                         strengths=excluded.strengths,
                         gaps=excluded.gaps,
+                        confidence=excluded.confidence,
+                        required_match_breakdown=excluded.required_match_breakdown,
+                        missing_required_items=excluded.missing_required_items,
+                        adjacent_transferable_strengths=excluded.adjacent_transferable_strengths,
+                        red_flags=excluded.red_flags,
+                        recommended_action=excluded.recommended_action,
+                        resume_tailoring_focus=excluded.resume_tailoring_focus,
+                        gating_reason=excluded.gating_reason,
+                        policy_blocked=excluded.policy_blocked,
                         is_match=excluded.is_match,
                         status=excluded.status,
                         score_source=excluded.score_source,
@@ -358,6 +507,15 @@ class Database:
                     rationale,
                     json.dumps(strengths, ensure_ascii=True),
                     json.dumps(gaps, ensure_ascii=True),
+                    confidence,
+                    json.dumps(required_match_breakdown or {}, ensure_ascii=True),
+                    json.dumps(missing_required_items or [], ensure_ascii=True),
+                    json.dumps(adjacent_transferable_strengths or [], ensure_ascii=True),
+                    json.dumps(red_flags or [], ensure_ascii=True),
+                    recommended_action,
+                    json.dumps(resume_tailoring_focus or [], ensure_ascii=True),
+                    gating_reason,
+                    int(policy_blocked),
                     int(is_match),
                     status,
                     score_source,
@@ -505,9 +663,10 @@ class Database:
                 """
                     INSERT INTO ai_evaluations (
                         job_id, stage_name, resume_hash, provider, model, prompt_version,
-                        status, decision, score, confidence, rationale, strengths, gaps,
-                        input_tokens, output_tokens, estimated_cost_usd, cached, evaluated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        status, decision, score, confidence, rationale, strengths, gaps, required_match_breakdown,
+                        missing_required_items, adjacent_transferable_strengths, red_flags, recommended_action,
+                        resume_tailoring_focus, input_tokens, output_tokens, estimated_cost_usd, cached, evaluated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(job_id, stage_name, resume_hash, provider, model, prompt_version) DO UPDATE SET
                         status=excluded.status,
                         decision=excluded.decision,
@@ -516,6 +675,12 @@ class Database:
                         rationale=excluded.rationale,
                         strengths=excluded.strengths,
                         gaps=excluded.gaps,
+                        required_match_breakdown=excluded.required_match_breakdown,
+                        missing_required_items=excluded.missing_required_items,
+                        adjacent_transferable_strengths=excluded.adjacent_transferable_strengths,
+                        red_flags=excluded.red_flags,
+                        recommended_action=excluded.recommended_action,
+                        resume_tailoring_focus=excluded.resume_tailoring_focus,
                         input_tokens=excluded.input_tokens,
                         output_tokens=excluded.output_tokens,
                         estimated_cost_usd=excluded.estimated_cost_usd,
@@ -536,6 +701,12 @@ class Database:
                     record.rationale,
                     json.dumps(record.strengths, ensure_ascii=True),
                     json.dumps(record.gaps, ensure_ascii=True),
+                    json.dumps(record.required_match_breakdown, ensure_ascii=True),
+                    json.dumps(record.missing_required_items, ensure_ascii=True),
+                    json.dumps(record.adjacent_transferable_strengths, ensure_ascii=True),
+                    json.dumps(record.red_flags, ensure_ascii=True),
+                    record.recommended_action,
+                    json.dumps(record.resume_tailoring_focus, ensure_ascii=True),
                     record.input_tokens,
                     record.output_tokens,
                     record.estimated_cost_usd,
@@ -580,6 +751,12 @@ class Database:
             rationale=payload["rationale"],
             strengths=json.loads(payload["strengths"]),
             gaps=json.loads(payload["gaps"]),
+            required_match_breakdown=json.loads(payload.get("required_match_breakdown") or "{}"),
+            missing_required_items=json.loads(payload.get("missing_required_items") or "[]"),
+            adjacent_transferable_strengths=json.loads(payload.get("adjacent_transferable_strengths") or "[]"),
+            red_flags=json.loads(payload.get("red_flags") or "[]"),
+            recommended_action=payload.get("recommended_action", ""),
+            resume_tailoring_focus=json.loads(payload.get("resume_tailoring_focus") or "[]"),
             input_tokens=payload["input_tokens"],
             output_tokens=payload["output_tokens"],
             estimated_cost_usd=float(payload["estimated_cost_usd"]),
@@ -619,6 +796,15 @@ class Database:
             COALESCE(match_results.score_source, '') AS score_source,
             COALESCE(match_results.verification_stage, '') AS verification_stage,
             COALESCE(match_results.provisional_rank, 0) AS provisional_rank,
+            COALESCE(match_results.confidence, 0) AS confidence,
+            COALESCE(match_results.required_match_breakdown, '{}') AS required_match_breakdown,
+            COALESCE(match_results.missing_required_items, '[]') AS missing_required_items,
+            COALESCE(match_results.adjacent_transferable_strengths, '[]') AS adjacent_transferable_strengths,
+            COALESCE(match_results.red_flags, '[]') AS red_flags,
+            COALESCE(match_results.recommended_action, '') AS recommended_action,
+            COALESCE(match_results.resume_tailoring_focus, '[]') AS resume_tailoring_focus,
+            COALESCE(match_results.gating_reason, '') AS gating_reason,
+            COALESCE(match_results.policy_blocked, 0) AS policy_blocked,
             COALESCE(generated_documents.resume_docx_path, '') AS resume_docx_path,
             COALESCE(generated_documents.resume_pdf_path, '') AS resume_pdf_path,
             COALESCE(generated_documents.cover_letter_path, '') AS cover_letter_path,
@@ -678,6 +864,15 @@ class Database:
                 COALESCE(match_results.score_source, '') AS score_source,
                 COALESCE(match_results.verification_stage, '') AS verification_stage,
                 COALESCE(match_results.provisional_rank, 0) AS provisional_rank,
+                COALESCE(match_results.confidence, 0) AS confidence,
+                COALESCE(match_results.required_match_breakdown, '{}') AS required_match_breakdown,
+                COALESCE(match_results.missing_required_items, '[]') AS missing_required_items,
+                COALESCE(match_results.adjacent_transferable_strengths, '[]') AS adjacent_transferable_strengths,
+                COALESCE(match_results.red_flags, '[]') AS red_flags,
+                COALESCE(match_results.recommended_action, '') AS recommended_action,
+                COALESCE(match_results.resume_tailoring_focus, '[]') AS resume_tailoring_focus,
+                COALESCE(match_results.gating_reason, '') AS gating_reason,
+                COALESCE(match_results.policy_blocked, 0) AS policy_blocked,
                 COALESCE(generated_documents.output_dir, '') AS output_dir,
                 COALESCE(generated_documents.resume_docx_path, '') AS resume_docx_path,
                 COALESCE(generated_documents.resume_pdf_path, '') AS resume_pdf_path,
@@ -735,9 +930,22 @@ class Database:
     def latest_run(self) -> dict[str, Any] | None:
         connection = self.connect()
         row = connection.execute(
+            "SELECT * FROM runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if row:
+            return dict(row)
+        row = connection.execute(
             "SELECT * FROM run_history ORDER BY id DESC LIMIT 1"
         ).fetchone()
         return dict(row) if row else None
+
+    def recent_runs(self, *, limit: int = 10) -> list[dict[str, Any]]:
+        connection = self.connect()
+        rows = connection.execute(
+            "SELECT * FROM runs ORDER BY id DESC LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def record_outcome(self, job_id: str, outcome: str, notes: str = "") -> None:
         noted_at = datetime.now(timezone.utc).isoformat()

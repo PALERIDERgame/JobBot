@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -42,6 +43,15 @@ class ApprovalResult:
     portal_platform: str
 
 
+@dataclass(slots=True)
+class RoutingAssessment:
+    queue_status: str
+    auto_apply_allowed: bool
+    gating_reason: str
+    policy_blocked: bool
+    policy_red_flags: list[str]
+
+
 class JobBotPipeline:
     def __init__(self, config: JobBotConfig, paths: AppPaths, database: Database) -> None:
         self.config = config
@@ -72,6 +82,11 @@ class JobBotPipeline:
         if progress_callback:
             progress_callback(stage, message, progress)
 
+    @staticmethod
+    def _is_scoring_parse_failure(evaluation: StageEvaluation) -> bool:
+        error_message = str(evaluation.error_message or "")
+        return error_message.startswith(("empty_response_text:", "invalid_json:", "invalid_payload_shape:"))
+
     def run(self) -> PipelineResult:
         return self._run_progressive()
 
@@ -81,6 +96,12 @@ class JobBotPipeline:
         jobs_seen = 0
         jobs_matched = 0
         run_cost = 0.0
+        fast_rank_candidates = 0
+        fast_rank_survivors = 0
+        cheap_shortlist_size = 0
+        cheap_parse_failures = 0
+        strong_shortlist_size = 0
+        strong_parse_failures = 0
         try:
             validate_config_for_run(self.config, self.paths)
             self.database.update_run(run_id, stage="scraping", message="Fetching jobs")
@@ -138,6 +159,7 @@ class JobBotPipeline:
                 ranked = list(executor.map(_rank_candidate, candidates))
             ranked.sort(key=lambda item: item[2].score, reverse=True)
             all_ranked = ranked
+            fast_rank_candidates = len(candidates)
             ranked = [item for item in ranked if item[2].score >= self.config.fast_rank_min_score or bool(item[1].force_escalate)]
             if not ranked and all_ranked:
                 ranked = all_ranked[: min(5, len(all_ranked))]
@@ -145,12 +167,23 @@ class JobBotPipeline:
                     "Fast rank produced zero survivors; admitting fallback top slice of %d jobs for cheap reranking",
                     len(ranked),
                 )
+            fast_rank_survivors = len(ranked)
+            fast_rank_duration_ms = int((datetime.now(timezone.utc) - fast_rank_started).total_seconds() * 1000)
             LOGGER.info(
                 "Fast rank finished in %.2fs. candidates=%d survivors=%d min_score=%d",
-                (datetime.now(timezone.utc) - fast_rank_started).total_seconds(),
-                len(candidates),
-                len(ranked),
+                fast_rank_duration_ms / 1000,
+                fast_rank_candidates,
+                fast_rank_survivors,
                 self.config.fast_rank_min_score,
+            )
+            self.database.update_run(
+                run_id,
+                stage="fast_ranking",
+                message=f"Fast-ranked {fast_rank_survivors} survivors from {fast_rank_candidates} candidates",
+                jobs_seen=jobs_seen,
+                jobs_matched=jobs_matched,
+                fast_rank_candidates=fast_rank_candidates,
+                fast_rank_survivors=fast_rank_survivors,
             )
 
             if self.config.automation_mode == "semi_auto":
@@ -178,6 +211,7 @@ class JobBotPipeline:
                 use_progressive_ai = False
 
             cheap_shortlist = ranked[: self.config.cheap_ai_top_n] if use_progressive_ai and self.config.cheap_ai_top_n > 0 else []
+            cheap_shortlist_size = len(cheap_shortlist)
             LOGGER.info("AI shortlist sizes: fast_rank=%d cheap_top_n=%d", len(ranked), len(cheap_shortlist))
 
             cheap_results: list[tuple[Job, object, object, StageEvaluation]] = []
@@ -198,10 +232,26 @@ class JobBotPipeline:
                 with ThreadPoolExecutor(max_workers=self.config.scoring_max_workers) as executor:
                     cheap_results = list(executor.map(_cheap_score, cheap_shortlist))
                 cheap_duration = (datetime.now(timezone.utc) - cheap_started).total_seconds()
+                cheap_duration_ms = int(cheap_duration * 1000)
+                cheap_parse_failures = sum(
+                    1 for *_rest, cheap_eval in cheap_results if self._is_scoring_parse_failure(cheap_eval)
+                )
                 LOGGER.info(
                     "Cheap AI finished in %.2fs for %d jobs",
                     cheap_duration,
                     len(cheap_results),
+                )
+                self.database.update_run(
+                    run_id,
+                    stage="cheap_scoring",
+                    message=f"Cheap reranked {len(cheap_results)} shortlisted jobs",
+                    jobs_seen=jobs_seen,
+                    jobs_matched=jobs_matched,
+                    cheap_shortlist_size=cheap_shortlist_size,
+                    cheap_stage_duration_ms=cheap_duration_ms,
+                    cheap_stage_provider=cheap_results[0][3].provider if cheap_results else self.config.cheap_stage_provider,
+                    cheap_stage_model=cheap_results[0][3].model if cheap_results else self.config.cheap_stage_model,
+                    cheap_parse_failures=cheap_parse_failures,
                 )
                 if cheap_results:
                     per_job = cheap_duration / len(cheap_results)
@@ -232,7 +282,12 @@ class JobBotPipeline:
                     cheap_survivors.append((job, filter_result, fast_rank, cheap_eval))
 
             strong_shortlist = cheap_survivors[: self.config.strong_ai_top_n] if self.config.strong_ai_top_n > 0 else []
-            LOGGER.info("Strong shortlist size: %d", len(strong_shortlist))
+            strong_shortlist_size = len(strong_shortlist)
+            LOGGER.info("Strong shortlist size: %d", strong_shortlist_size)
+            self.database.update_run(
+                run_id,
+                strong_shortlist_size=strong_shortlist_size,
+            )
 
             strong_results: list[tuple[Job, object, object, StageEvaluation, StageEvaluation]] = []
             if strong_shortlist:
@@ -251,16 +306,39 @@ class JobBotPipeline:
 
                 with ThreadPoolExecutor(max_workers=self.config.scoring_max_workers) as executor:
                     strong_results = list(executor.map(_strong_score, strong_shortlist))
+                strong_duration_ms = int((datetime.now(timezone.utc) - strong_started).total_seconds() * 1000)
+                strong_parse_failures = sum(
+                    1 for *_rest, strong_eval in strong_results if self._is_scoring_parse_failure(strong_eval)
+                )
                 LOGGER.info(
                     "Strong AI finished in %.2fs for %d jobs",
-                    (datetime.now(timezone.utc) - strong_started).total_seconds(),
+                    strong_duration_ms / 1000,
                     len(strong_results),
+                )
+                self.database.update_run(
+                    run_id,
+                    stage="strong_scoring",
+                    message=f"Strong-verified {len(strong_results)} finalists",
+                    jobs_seen=jobs_seen,
+                    jobs_matched=jobs_matched,
+                    strong_shortlist_size=strong_shortlist_size,
+                    strong_stage_duration_ms=strong_duration_ms,
+                    strong_stage_provider=strong_results[0][4].provider if strong_results else self.config.strong_stage_provider,
+                    strong_stage_model=strong_results[0][4].model if strong_results else self.config.strong_stage_model,
+                    strong_parse_failures=strong_parse_failures,
                 )
 
             for index, (job, _filter_result, _fast_rank, _cheap_eval, strong_eval) in enumerate(strong_results, start=1):
                 run_cost += strong_eval.estimated_cost_usd
-                self._record_evaluation_result(job, strong_eval, score_source="strong_ai", verification_stage="strong_verified", provisional_rank=index)
-                if self.config.automation_mode == "semi_auto" and (strong_eval.status != "scored" or strong_eval.decision not in {"apply_candidate", "review"}):
+                routing = self._record_evaluation_result(
+                    job,
+                    strong_eval,
+                    score_source="strong_ai",
+                    verification_stage="strong_verified",
+                    provisional_rank=index,
+                )
+                queue_status = routing.queue_status if routing else strong_eval.decision
+                if self.config.automation_mode == "semi_auto" and queue_status not in {"apply_candidate", "review"}:
                     self.database.record_delivery(
                         job.id,
                         method="approval_queue",
@@ -272,7 +350,7 @@ class JobBotPipeline:
 
                 if self.config.automation_mode != "auto":
                     continue
-                if strong_eval.status != "scored" or strong_eval.decision != "apply_candidate":
+                if not routing or not routing.auto_apply_allowed:
                     continue
 
                 self.database.update_run(
@@ -317,17 +395,43 @@ class JobBotPipeline:
                         delivered_at="",
                     )
 
+            final_message = "Run completed"
+            error_summary = ""
+            if cheap_shortlist_size > 0 and not cheap_survivors:
+                if cheap_parse_failures >= cheap_shortlist_size:
+                    error_summary = (
+                        f"cheap_stage_failed: all {cheap_shortlist_size} cheap-stage evaluations failed parsing or extraction"
+                    )
+                    final_message = "Run completed with cheap-stage scoring failures"
+                elif cheap_parse_failures > 0:
+                    error_summary = (
+                        f"cheap_stage_partial_failures: {cheap_parse_failures}/{cheap_shortlist_size} cheap-stage evaluations failed parsing or extraction"
+                    )
+            if strong_shortlist_size > 0 and strong_parse_failures == strong_shortlist_size:
+                error_summary = (
+                    f"strong_stage_failed: all {strong_shortlist_size} strong-stage evaluations failed parsing or extraction"
+                )
+                final_message = "Run completed with strong-stage scoring failures"
+
             finished_at = datetime.now(timezone.utc).isoformat()
             self.database.update_run(
                 run_id,
                 ended_at=finished_at,
                 status="completed",
                 stage="completed",
-                message="Run completed",
+                message=final_message,
                 jobs_seen=jobs_seen,
                 jobs_matched=jobs_matched,
+                estimated_cost_usd=round(run_cost, 4),
+                fast_rank_candidates=fast_rank_candidates,
+                fast_rank_survivors=fast_rank_survivors,
+                cheap_shortlist_size=cheap_shortlist_size,
+                cheap_parse_failures=cheap_parse_failures,
+                strong_shortlist_size=strong_shortlist_size,
+                strong_parse_failures=strong_parse_failures,
+                error_summary=error_summary,
             )
-            return PipelineResult(run_id, "completed", jobs_seen, jobs_matched, "Run completed", round(run_cost, 4))
+            return PipelineResult(run_id, "completed", jobs_seen, jobs_matched, final_message, round(run_cost, 4))
         except Exception as exc:  # pragma: no cover
             LOGGER.exception("Pipeline run failed")
             self.database.update_run(
@@ -338,6 +442,14 @@ class JobBotPipeline:
                 message=str(exc),
                 jobs_seen=jobs_seen,
                 jobs_matched=jobs_matched,
+                estimated_cost_usd=round(run_cost, 4),
+                fast_rank_candidates=fast_rank_candidates,
+                fast_rank_survivors=fast_rank_survivors,
+                cheap_shortlist_size=cheap_shortlist_size,
+                cheap_parse_failures=cheap_parse_failures,
+                strong_shortlist_size=strong_shortlist_size,
+                strong_parse_failures=strong_parse_failures,
+                error_summary=str(exc),
             )
             return PipelineResult(run_id, "failed", jobs_seen, jobs_matched, str(exc), round(run_cost, 4))
 
@@ -392,6 +504,12 @@ class JobBotPipeline:
                 rationale=gate.reason,
                 strengths=[],
                 gaps=[],
+                required_match_breakdown=self.scorer._empty_required_match_breakdown(),
+                missing_required_items=[],
+                adjacent_transferable_strengths=[],
+                red_flags=[],
+                recommended_action="reject",
+                resume_tailoring_focus=[],
                 input_tokens=0,
                 output_tokens=0,
                 estimated_cost_usd=0.0,
@@ -403,29 +521,108 @@ class JobBotPipeline:
         cost = cheap_eval.estimated_cost_usd
         if cheap_eval.status != "scored" or cheap_eval.decision == "reject":
             return cheap_eval, None, cost
-        if cheap_eval.decision == "pass_direct":
-            strong_eval = StageEvaluation(
-                stage_name="strong",
-                provider=cheap_eval.provider,
-                model=cheap_eval.model,
-                status=cheap_eval.status,
-                decision="apply_candidate" if (cheap_eval.score or 0) >= self.config.final_apply_threshold else "review",
-                score=cheap_eval.score,
-                confidence=cheap_eval.confidence,
-                rationale=cheap_eval.rationale,
-                strengths=cheap_eval.strengths,
-                gaps=cheap_eval.gaps,
-                input_tokens=cheap_eval.input_tokens,
-                output_tokens=cheap_eval.output_tokens,
-                estimated_cost_usd=0.0,
-                error_message=cheap_eval.error_message,
-                evaluated_at=cheap_eval.evaluated_at,
-                cached=True,
-            )
-            return cheap_eval, strong_eval, cost
         strong_eval = self.scorer.strong_evaluate(job, resume)
         cost += strong_eval.estimated_cost_usd
         return cheap_eval, strong_eval, cost
+
+    @staticmethod
+    def _merge_unique(items: list[str] | None, extras: list[str] | None) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for item in (items or []) + (extras or []):
+            text = str(item or "").strip()
+            lowered = text.lower()
+            if not text or lowered in seen:
+                continue
+            seen.add(lowered)
+            merged.append(text)
+        return merged
+
+    def _job_in_restricted_state(self, location: str) -> bool:
+        tokens = set(re.findall(r"[a-z]{2,}", (location or "").lower()))
+        policy_tokens = {
+            token
+            for value in self.config.restricted_states
+            for token in re.findall(r"[a-z]{2,}", str(value).lower())
+        }
+        return bool(tokens & policy_tokens)
+
+    def _job_has_vague_description(self, job: Job) -> bool:
+        description = re.sub(r"\s+", " ", job.description_full or "").strip().lower()
+        if len(description) < 180:
+            return True
+        signal_terms = ("require", "qualification", "responsibil", "experience", "skill", "about the role")
+        return not any(term in description for term in signal_terms)
+
+    def _policy_red_flags(self, job: Job) -> list[str]:
+        haystack = " ".join([job.title, job.location, job.description_full]).lower()
+        red_flags: list[str] = []
+        if self._job_in_restricted_state(job.location):
+            red_flags.append("Restricted-state employment review policy triggered.")
+        if any(term.strip().lower() in haystack for term in self.config.sensitive_assessment_keywords if term.strip()):
+            red_flags.append("Sensitive assessment language requires manual review.")
+        if any(term.strip().lower() in haystack for term in self.config.manual_review_keywords if term.strip()):
+            red_flags.append("Compliance-sensitive posting language requires manual review.")
+        if any(term.strip().lower() in haystack for term in self.config.work_authorization_required_terms if term.strip()):
+            red_flags.append("Explicit work-authorization requirement requires manual review.")
+        return red_flags
+
+    def _assess_strong_routing(self, job: Job, evaluation: StageEvaluation) -> RoutingAssessment:
+        if evaluation.status != "scored":
+            return RoutingAssessment(
+                queue_status=evaluation.status,
+                auto_apply_allowed=False,
+                gating_reason=evaluation.error_message or "Strong-stage evaluation did not complete successfully.",
+                policy_blocked=False,
+                policy_red_flags=[],
+            )
+        if evaluation.decision == "reject":
+            return RoutingAssessment(
+                queue_status="reject",
+                auto_apply_allowed=False,
+                gating_reason="Strong-stage evidence did not support advancing this job.",
+                policy_blocked=False,
+                policy_red_flags=[],
+            )
+        if evaluation.decision == "review":
+            return RoutingAssessment(
+                queue_status="review",
+                auto_apply_allowed=False,
+                gating_reason="Strong-stage review required human judgment.",
+                policy_blocked=False,
+                policy_red_flags=[],
+            )
+
+        policy_red_flags = self._policy_red_flags(job)
+        gating_reasons: list[str] = []
+        if self.config.auto_apply_requires_strong_stage and evaluation.stage_name != "strong":
+            gating_reasons.append("Auto-apply requires a strong-stage decision.")
+        if self.config.auto_apply_requires_high_confidence and (evaluation.confidence or 0.0) < 0.85:
+            gating_reasons.append("Confidence was below the guarded auto-apply threshold.")
+        if self.config.auto_apply_block_on_missing_required_items and evaluation.missing_required_items:
+            gating_reasons.append("Missing central required items require human review.")
+        if self.config.auto_apply_block_on_red_flags and self._merge_unique(evaluation.red_flags, policy_red_flags):
+            gating_reasons.append("Red flags require human review before applying.")
+        if self.config.review_on_vague_job_description and self._job_has_vague_description(job) and (evaluation.confidence or 0.0) < 0.85:
+            gating_reasons.append("Job description is too vague for guarded auto-apply at the current confidence level.")
+        if policy_red_flags:
+            gating_reasons.extend(policy_red_flags)
+
+        if gating_reasons:
+            return RoutingAssessment(
+                queue_status="review",
+                auto_apply_allowed=False,
+                gating_reason=" ".join(self._merge_unique(gating_reasons, [])),
+                policy_blocked=True,
+                policy_red_flags=policy_red_flags,
+            )
+        return RoutingAssessment(
+            queue_status="apply_candidate",
+            auto_apply_allowed=self.config.automation_mode == "auto",
+            gating_reason="Strong-stage evidence passed guarded auto-apply checks.",
+            policy_blocked=False,
+            policy_red_flags=[],
+        )
 
     def _record_skipped_match(self, job: Job, reason: str) -> None:
         self.database.record_match_result(
@@ -434,6 +631,15 @@ class JobBotPipeline:
             rationale=reason,
             strengths=[],
             gaps=[],
+            confidence=0.0,
+            required_match_breakdown={},
+            missing_required_items=[],
+            adjacent_transferable_strengths=[],
+            red_flags=[],
+            recommended_action="reject",
+            resume_tailoring_focus=[],
+            gating_reason=reason,
+            policy_blocked=False,
             is_match=False,
             status="skipped",
             score_source="deterministic_filter",
@@ -450,6 +656,15 @@ class JobBotPipeline:
             rationale=fast_rank.rationale,
             strengths=[f"overlap: {term}" for term in fast_rank.keyword_overlap_terms[:3]],
             gaps=[],
+            confidence=None,
+            required_match_breakdown={},
+            missing_required_items=[],
+            adjacent_transferable_strengths=[],
+            red_flags=[],
+            recommended_action="review",
+            resume_tailoring_focus=[],
+            gating_reason="Fast-rank shortlist only; human or AI verification still required.",
+            policy_blocked=False,
             is_match=False,
             status="review",
             score_source="fast_rank",
@@ -467,17 +682,39 @@ class JobBotPipeline:
         score_source: str,
         verification_stage: str,
         provisional_rank: int = 0,
-    ) -> None:
-        is_match = evaluation.status == "scored" and evaluation.decision == "apply_candidate"
+    ) -> RoutingAssessment | None:
+        routing: RoutingAssessment | None = None
+        combined_red_flags = list(evaluation.red_flags or [])
+        gating_reason = ""
+        policy_blocked = False
         status = evaluation.decision if evaluation.status == "scored" else evaluation.status
         if verification_stage == "cheap_verified" and status == "escalate":
             status = "review"
+            gating_reason = "Cheap stage requested escalation to stronger review."
+        elif verification_stage == "cheap_verified" and status == "review":
+            gating_reason = "Cheap stage kept this job in the review path."
+        elif verification_stage == "strong_verified":
+            routing = self._assess_strong_routing(job, evaluation)
+            status = routing.queue_status
+            gating_reason = routing.gating_reason
+            policy_blocked = routing.policy_blocked
+            combined_red_flags = self._merge_unique(combined_red_flags, routing.policy_red_flags)
+        is_match = status == "apply_candidate" and evaluation.status == "scored"
         self.database.record_match_result(
             job.id,
             score=evaluation.score,
             rationale=evaluation.rationale,
             strengths=evaluation.strengths,
             gaps=evaluation.gaps,
+            confidence=evaluation.confidence,
+            required_match_breakdown=evaluation.required_match_breakdown,
+            missing_required_items=evaluation.missing_required_items,
+            adjacent_transferable_strengths=evaluation.adjacent_transferable_strengths,
+            red_flags=combined_red_flags,
+            recommended_action=evaluation.recommended_action or status,
+            resume_tailoring_focus=(evaluation.resume_tailoring_focus or []) if status in {"review", "apply_candidate"} else [],
+            gating_reason=gating_reason,
+            policy_blocked=policy_blocked,
             is_match=is_match,
             status=status,
             score_source=score_source,
@@ -486,6 +723,7 @@ class JobBotPipeline:
             error_message=evaluation.error_message,
             scored_at=evaluation.evaluated_at,
         )
+        return routing
 
     def _record_review_queue_match(self, job: Job, rationale: str) -> None:
         self.database.record_match_result(
@@ -494,6 +732,15 @@ class JobBotPipeline:
             rationale=rationale,
             strengths=[],
             gaps=[],
+            confidence=0.0,
+            required_match_breakdown={},
+            missing_required_items=[],
+            adjacent_transferable_strengths=[],
+            red_flags=[],
+            recommended_action="review",
+            resume_tailoring_focus=[],
+            gating_reason=rationale,
+            policy_blocked=False,
             is_match=False,
             status="review",
             score_source="manual_queue",

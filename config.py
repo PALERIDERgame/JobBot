@@ -101,9 +101,24 @@ class JobBotConfig:
     fast_rank_min_score: int = 20
     cheap_ai_top_n: int = 8
     strong_ai_top_n: int = 3
-    progressive_queue_enabled: bool = True
+    progressive_queue_enabled: bool = False
     enable_cost_tracking: bool = True
     scoring_max_workers: int = 4
+    auto_apply_requires_high_confidence: bool = True
+    auto_apply_block_on_missing_required_items: bool = True
+    auto_apply_block_on_red_flags: bool = True
+    auto_apply_requires_strong_stage: bool = True
+    review_on_vague_job_description: bool = True
+    restricted_states: list[str] = field(default_factory=lambda: ["ca", "california", "co", "colorado", "il", "illinois"])
+    sensitive_assessment_keywords: list[str] = field(
+        default_factory=lambda: ["video interview", "emotion recognition", "facial analysis", "personality assessment", "game-based assessment"]
+    )
+    manual_review_keywords: list[str] = field(
+        default_factory=lambda: ["accommodation", "reasonable accommodation", "disability", "background check", "security clearance", "work authorization"]
+    )
+    work_authorization_required_terms: list[str] = field(
+        default_factory=lambda: ["us citizen", "u.s. citizen", "citizenship required", "security clearance required", "no sponsorship"]
+    )
     anthropic_api_key: str = ""
     openai_api_key: str = ""
 
@@ -229,9 +244,33 @@ def load_or_create_config(paths: AppPaths) -> JobBotConfig:
         fast_rank_min_score=int(raw.get("fast_rank_min_score", 20) if raw.get("fast_rank_min_score") not in (None, 35) else 20),
         cheap_ai_top_n=int(raw.get("cheap_ai_top_n", 8)),
         strong_ai_top_n=int(raw.get("strong_ai_top_n", 3)),
-        progressive_queue_enabled=bool(raw.get("progressive_queue_enabled", True)),
+        progressive_queue_enabled=bool(raw.get("progressive_queue_enabled", False)),
         enable_cost_tracking=bool(raw.get("enable_cost_tracking", True)),
         scoring_max_workers=int(raw.get("scoring_max_workers", 4)),
+        auto_apply_requires_high_confidence=bool(raw.get("auto_apply_requires_high_confidence", True)),
+        auto_apply_block_on_missing_required_items=bool(raw.get("auto_apply_block_on_missing_required_items", True)),
+        auto_apply_block_on_red_flags=bool(raw.get("auto_apply_block_on_red_flags", True)),
+        auto_apply_requires_strong_stage=bool(raw.get("auto_apply_requires_strong_stage", True)),
+        review_on_vague_job_description=bool(raw.get("review_on_vague_job_description", True)),
+        restricted_states=list(raw.get("restricted_states", ["ca", "california", "co", "colorado", "il", "illinois"])),
+        sensitive_assessment_keywords=list(
+            raw.get(
+                "sensitive_assessment_keywords",
+                ["video interview", "emotion recognition", "facial analysis", "personality assessment", "game-based assessment"],
+            )
+        ),
+        manual_review_keywords=list(
+            raw.get(
+                "manual_review_keywords",
+                ["accommodation", "reasonable accommodation", "disability", "background check", "security clearance", "work authorization"],
+            )
+        ),
+        work_authorization_required_terms=list(
+            raw.get(
+                "work_authorization_required_terms",
+                ["us citizen", "u.s. citizen", "citizenship required", "security clearance required", "no sponsorship"],
+            )
+        ),
         anthropic_api_key=str(raw.get("anthropic_api_key", "")),
         openai_api_key=str(raw.get("openai_api_key", "")),
     )
@@ -292,6 +331,15 @@ def validate_config(config: JobBotConfig) -> None:
         raise ValueError("Schedule hours must be between 0 and 23")
     if config.schedule.end_hour_est < config.schedule.start_hour_est:
         raise ValueError("Schedule end hour must be >= start hour")
+    for field_name in (
+        "restricted_states",
+        "sensitive_assessment_keywords",
+        "manual_review_keywords",
+        "work_authorization_required_terms",
+    ):
+        values = getattr(config, field_name)
+        if not isinstance(values, list):
+            raise ValueError(f"{field_name} must be a list")
 
 
 def validate_config_for_run(config: JobBotConfig, paths: "AppPaths") -> None:

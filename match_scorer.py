@@ -24,7 +24,7 @@ from resume_parser import ResumeData, ResumeWorkEntry
 
 
 LOGGER = logging.getLogger(__name__)
-PROMPT_VERSION = "cost_funnel_v2"
+PROMPT_VERSION = "cost_funnel_v3_guarded"
 
 _PRECHEAP_STOPWORDS = {
     "and", "the", "for", "with", "from", "that", "this", "your", "will", "role", "team", "work", "into",
@@ -44,8 +44,15 @@ ANTHROPIC_PRICE_PER_MTOKEN = {
 
 
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503}
-_VALID_CHEAP_DECISIONS = {"reject", "escalate", "pass_direct", "error"}
-_VALID_STRONG_DECISIONS = {"reject", "review", "apply_candidate", "skip", "error"}
+_VALID_CHEAP_DECISIONS = {"reject", "review", "escalate", "error"}
+_VALID_STRONG_DECISIONS = {"reject", "review", "apply_candidate", "error"}
+_BREAKDOWN_KEYS = (
+    "title_alignment",
+    "skills_alignment",
+    "experience_alignment",
+    "domain_alignment",
+    "logistics_alignment",
+)
 
 
 def _call_with_retry(fn, *, max_attempts: int = 3, base_delay: float = 2.0):
@@ -106,6 +113,12 @@ class StageEvaluation:
     estimated_cost_usd: float
     error_message: str
     evaluated_at: str
+    required_match_breakdown: dict[str, object] | None = None
+    missing_required_items: list[str] | None = None
+    adjacent_transferable_strengths: list[str] | None = None
+    red_flags: list[str] | None = None
+    recommended_action: str = ""
+    resume_tailoring_focus: list[str] | None = None
     cached: bool = False
 
     def to_match_score(self, threshold: int) -> MatchScore:
@@ -119,6 +132,29 @@ class StageEvaluation:
             error_message=self.error_message,
             scored_at=self.evaluated_at,
         )
+
+
+@dataclass(slots=True)
+class ScoringPayloadResult:
+    payload: dict[str, object]
+    raw_text: str
+    cleaned_text: str
+
+
+@dataclass(slots=True)
+class OpenAIScoringCompletionResult:
+    text: str
+    input_tokens: int
+    output_tokens: int
+    shape_summary: str
+
+
+class ScoringResponseError(RuntimeError):
+    def __init__(self, code: str, detail: str, *, preview: str = "") -> None:
+        super().__init__(f"{code}: {detail}")
+        self.code = code
+        self.detail = detail
+        self.preview = preview
 
 
 @dataclass(slots=True)
@@ -562,6 +598,12 @@ class MatchScorer:
                     rationale=f"{provider} is not configured or available.",
                     strengths=[],
                     gaps=[],
+                    required_match_breakdown=self._empty_required_match_breakdown(),
+                    missing_required_items=[],
+                    adjacent_transferable_strengths=[],
+                    red_flags=[],
+                    recommended_action="error",
+                    resume_tailoring_focus=[],
                     input_tokens=0,
                     output_tokens=0,
                     estimated_cost_usd=0.0,
@@ -575,11 +617,8 @@ class MatchScorer:
             text, input_tokens, output_tokens = _call_with_retry(
                 lambda: self._create_completion_with_usage(provider, model, prompt)
             )
-            cleaned_text = self._extract_json_text(text)
-            try:
-                payload = json.loads(cleaned_text)
-            except json.JSONDecodeError:
-                payload = json.loads(cleaned_text.replace("\r\n", "\\n").replace("\n", "\\n"))
+            parsed = self._parse_scoring_payload(text)
+            payload = parsed.payload
             # Validate and clamp score to [0, 100]
             raw_score = payload.get("score", 0)
             score = max(0, min(100, int(raw_score))) if raw_score is not None else 0
@@ -600,9 +639,15 @@ class MatchScorer:
                 decision=decision,
                 score=score,
                 confidence=confidence,
-                rationale=str(payload.get("rationale", "")) or "No rationale provided.",
-                strengths=[str(item) for item in payload.get("strengths", [])][:5],
-                gaps=[str(item) for item in payload.get("gaps", [])][:5],
+                rationale=str(payload.get("rationale_short") or payload.get("rationale") or "") or "No rationale provided.",
+                strengths=self._coerce_string_list(payload.get("strengths"), limit=5),
+                gaps=self._coerce_string_list(payload.get("gaps"), limit=5),
+                required_match_breakdown=self._parse_required_match_breakdown(payload.get("required_match_breakdown")),
+                missing_required_items=self._coerce_string_list(payload.get("missing_required_items"), limit=8),
+                adjacent_transferable_strengths=self._coerce_string_list(payload.get("adjacent_transferable_strengths"), limit=6),
+                red_flags=self._coerce_string_list(payload.get("red_flags"), limit=8),
+                recommended_action=str(payload.get("recommended_action") or decision),
+                resume_tailoring_focus=self._coerce_string_list(payload.get("resume_tailoring_focus"), limit=5),
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 estimated_cost_usd=self._estimate_cost(provider, model, input_tokens, output_tokens),
@@ -610,6 +655,43 @@ class MatchScorer:
                 evaluated_at=evaluated_at,
             )
             return self._store_result(job.id, evaluation, resume_hash)
+        except ScoringResponseError as exc:
+            LOGGER.warning(
+                "Failed %s evaluation for %s [%s]: %s",
+                stage_name,
+                job.id,
+                exc.code,
+                exc.detail,
+            )
+            if exc.preview:
+                LOGGER.warning("AI scoring parse preview for %s: %s", job.id, exc.preview)
+            return self._store_result(
+                job.id,
+                StageEvaluation(
+                    stage_name=stage_name,
+                    provider=provider,
+                    model=model,
+                    status="error",
+                    decision="error",
+                    score=None,
+                    confidence=None,
+                    rationale="Evaluation failed.",
+                    strengths=[],
+                    gaps=[],
+                    required_match_breakdown=self._empty_required_match_breakdown(),
+                    missing_required_items=[],
+                    adjacent_transferable_strengths=[],
+                    red_flags=[],
+                    recommended_action="error",
+                    resume_tailoring_focus=[],
+                    input_tokens=input_tokens if 'input_tokens' in locals() else 0,
+                    output_tokens=output_tokens if 'output_tokens' in locals() else 0,
+                    estimated_cost_usd=0.0,
+                    error_message=f"{exc.code}: {exc.detail}",
+                    evaluated_at=evaluated_at,
+                ),
+                resume_hash,
+            )
         except Exception as exc:  # pragma: no cover
             LOGGER.exception("Failed %s evaluation for %s", stage_name, job.id)
             if 'text' in locals():
@@ -627,10 +709,16 @@ class MatchScorer:
                     rationale="Evaluation failed.",
                     strengths=[],
                     gaps=[],
+                    required_match_breakdown=self._empty_required_match_breakdown(),
+                    missing_required_items=[],
+                    adjacent_transferable_strengths=[],
+                    red_flags=[],
+                    recommended_action="error",
+                    resume_tailoring_focus=[],
                     input_tokens=0,
                     output_tokens=0,
                     estimated_cost_usd=0.0,
-                    error_message=str(exc),
+                    error_message=f"provider_request_failed: {exc}",
                     evaluated_at=evaluated_at,
                 ),
                 resume_hash,
@@ -675,6 +763,12 @@ class MatchScorer:
                     rationale=evaluation.rationale,
                     strengths=evaluation.strengths,
                     gaps=evaluation.gaps,
+                    required_match_breakdown=evaluation.required_match_breakdown or self._empty_required_match_breakdown(),
+                    missing_required_items=evaluation.missing_required_items or [],
+                    adjacent_transferable_strengths=evaluation.adjacent_transferable_strengths or [],
+                    red_flags=evaluation.red_flags or [],
+                    recommended_action=evaluation.recommended_action,
+                    resume_tailoring_focus=evaluation.resume_tailoring_focus or [],
                     input_tokens=evaluation.input_tokens,
                     output_tokens=evaluation.output_tokens,
                     estimated_cost_usd=evaluation.estimated_cost_usd,
@@ -696,6 +790,12 @@ class MatchScorer:
             rationale=record.rationale,
             strengths=record.strengths,
             gaps=record.gaps,
+            required_match_breakdown=record.required_match_breakdown or self._empty_required_match_breakdown(),
+            missing_required_items=record.missing_required_items or [],
+            adjacent_transferable_strengths=record.adjacent_transferable_strengths or [],
+            red_flags=record.red_flags or [],
+            recommended_action=record.recommended_action,
+            resume_tailoring_focus=record.resume_tailoring_focus or [],
             input_tokens=record.input_tokens,
             output_tokens=record.output_tokens,
             estimated_cost_usd=record.estimated_cost_usd,
@@ -744,11 +844,24 @@ class MatchScorer:
             },
             "instructions": {
                 "return_json": True,
-                "fields": ["score", "confidence", "rationale", "strengths", "gaps"],
+                "fields": [
+                    "score",
+                    "confidence",
+                    "rationale_short",
+                    "strengths",
+                    "gaps",
+                    "required_match_breakdown",
+                    "missing_required_items",
+                    "adjacent_transferable_strengths",
+                    "red_flags",
+                    "recommended_action",
+                    "resume_tailoring_focus",
+                ],
                 "goal": (
-                    "Fast shortlist reranking pass. Apply screening_constraints first, then score fit using the rubric. "
-                    "Focus on whether this job belongs near the top of the shortlist, not on exhaustive analysis."
+                    "Conservative shortlist reranking pass. Apply screening_constraints first, score only on concrete resume evidence, "
+                    "and separate direct evidence from adjacent transferable strength."
                 ),
+                "stage_policy": "Cheap stage must return recommended_action as reject, review, or escalate.",
             },
         }
 
@@ -765,19 +878,42 @@ class MatchScorer:
             "keyword_overlap_count": overlap_count,
             "instructions": {
                 "return_json": True,
-                "fields": ["score", "confidence", "rationale", "strengths", "gaps"],
+                "fields": [
+                    "score",
+                    "confidence",
+                    "rationale_short",
+                    "strengths",
+                    "gaps",
+                    "required_match_breakdown",
+                    "missing_required_items",
+                    "adjacent_transferable_strengths",
+                    "red_flags",
+                    "recommended_action",
+                    "resume_tailoring_focus",
+                ],
                 "goal": (
-                    "Final shortlist verification. Score the resume against the core job requirements precisely, but stay concise."
+                    "Final shortlist verification. Distinguish required versus preferred qualifications, stay evidence-bound, "
+                    "and lower confidence when the posting is vague or incomplete."
                 ),
+                "stage_policy": "Strong stage must return recommended_action as reject, review, or apply_candidate.",
             },
         }
 
     def _resume_summary(self, resume_data: ResumeData, *, compact: bool = False) -> dict[str, object]:
         return {
             "name": resume_data.name,
+            "target_titles": self.config.target_titles[:6],
             "summary": (resume_data.summary or "")[: (240 if compact else 500)],
             "skills": resume_data.skills[: (8 if compact else 15)],
             "experience_highlights": resume_data.experience_lines[: (4 if compact else 8)],
+            "work_history": [
+                {
+                    "role_line": entry.role_line,
+                    "date_line": entry.date_line,
+                    "bullets": entry.bullets[: (2 if compact else 4)],
+                }
+                for entry in resume_data.work_experience_entries[: (3 if compact else 6)]
+            ],
         }
 
     def _job_summary(self, job: Job, *, excerpt_limit: int = 2500) -> dict[str, object]:
@@ -914,13 +1050,13 @@ class MatchScorer:
             if score < self.config.cheap_reject_threshold and confidence >= 0.75:
                 return "reject"
             if score >= self.config.cheap_escalate_threshold and confidence >= 0.85:
-                return "pass_direct"
-            return "escalate"
+                return "review"
+            return "escalate" if score >= self.config.scoring_threshold else "review"
         if score >= self.config.final_apply_threshold:
             return "apply_candidate"
         if score >= self.config.scoring_threshold:
             return "review"
-        return "skip"
+        return "reject"
 
     def _build_client(self, provider: str):
         if provider in self._client_cache:
@@ -962,15 +1098,18 @@ class MatchScorer:
 
     def _create_completion_with_usage(self, provider: str, model: str, prompt: dict[str, object]) -> tuple[str, int, int]:
         system_prompt = (
-            "You are a recruiting evaluator. Do not invent qualifications. "
-            "Return only valid JSON with keys score (int 0-100), confidence (float 0.0-1.0), "
-            "rationale (string), strengths (list), and gaps (list).\n\n"
+            "You are a conservative job-match evaluator. Use only explicit resume evidence and the job posting. "
+            "Treat unsupported claims as absent. Avoid vague notions of fit, personality, or autonomous judgment.\n\n"
+            "Return only valid JSON with keys score, confidence, rationale_short, strengths, gaps, required_match_breakdown, "
+            "missing_required_items, adjacent_transferable_strengths, red_flags, recommended_action, and resume_tailoring_focus.\n\n"
+            "required_match_breakdown must contain title_alignment, skills_alignment, experience_alignment, domain_alignment, and logistics_alignment. "
+            "Each breakdown item must be an object with score and evidence.\n\n"
             "Scoring rubric:\n"
-            "  0-24:  Clear mismatch — wrong field, wrong seniority, or clearly unqualified\n"
-            "  25-39: Marginal — some relevance but missing most key requirements\n"
-            "  40-59: Partial fit — meets some requirements, notable gaps in core skills\n"
-            "  60-79: Good fit — meets most requirements with minor gaps\n"
-            "  80-100: Strong fit — meets all or nearly all core requirements"
+            "  0-24: Clear mismatch or disqualifying missing requirement\n"
+            "  25-39: Weak evidence, major required gaps\n"
+            "  40-59: Some overlap, but not enough for autonomous advancement\n"
+            "  60-79: Credible match worth human review\n"
+            "  80-100: Strong evidence on most required dimensions"
         )
         return self._create_completion_with_usage_for_system(provider, model, prompt, system_prompt=system_prompt)
 
@@ -1005,6 +1144,13 @@ class MatchScorer:
             usage = getattr(response, "usage", None)
             return text, int(getattr(usage, "input_tokens", 0) or 0), int(getattr(usage, "output_tokens", 0) or 0)
 
+        if model.startswith("gpt-5"):
+            self._log_request_mode(provider, model, "openai_responses_json_schema")
+            result = self._create_openai_scoring_completion(client, model, prompt, system_prompt=system_prompt)
+            if not result.text.strip():
+                LOGGER.warning("OpenAI scoring returned empty text. shape=%s model=%s", result.shape_summary, model)
+            return result.text, result.input_tokens, result.output_tokens
+
         request_kwargs, request_mode = self._openai_chat_request_kwargs(model)
         self._log_request_mode(provider, model, request_mode)
         response = client.chat.completions.create(
@@ -1016,7 +1162,9 @@ class MatchScorer:
             response_format={"type": "json_object"},
             **request_kwargs,
         )
-        text = (response.choices[0].message.content or "").strip()
+        text = self._extract_openai_chat_text(response)
+        if not text.strip():
+            LOGGER.warning("OpenAI chat scoring returned empty text. shape=%s model=%s", self._describe_openai_response_shape(response), model)
         usage = getattr(response, "usage", None)
         return text, int(getattr(usage, "prompt_tokens", 0) or 0), int(getattr(usage, "completion_tokens", 0) or 0)
 
@@ -1049,7 +1197,7 @@ class MatchScorer:
             response_format={"type": "json_object"},
             **request_kwargs,
         )
-        return (response.choices[0].message.content or "").strip()
+        return self._extract_openai_chat_text(response)
 
     def _create_doc_tailoring_completion(
         self, provider: str, model: str, prompt: dict[str, object], *, system_prompt: str
@@ -1160,6 +1308,287 @@ class MatchScorer:
                         if isinstance(candidate, str) and candidate.strip():
                             parts.append(candidate.strip())
         return "\n".join(parts).strip()
+
+    @classmethod
+    def _extract_openai_chat_text(cls, response: object) -> str:
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            return cls._extract_openai_response_text(response)
+        message = getattr(choices[0], "message", None)
+        if message is None:
+            return cls._extract_openai_response_text(response)
+        content = getattr(message, "content", "")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        parts: list[str] = []
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    text_value = item.get("text") or item.get("value") or item.get("output_text")
+                    if isinstance(text_value, str) and text_value.strip():
+                        parts.append(text_value.strip())
+                else:
+                    for attr in ("text", "value", "output_text"):
+                        candidate = getattr(item, attr, None)
+                        if isinstance(candidate, str) and candidate.strip():
+                            parts.append(candidate.strip())
+                            break
+        if parts:
+            return "\n".join(parts).strip()
+        parsed = getattr(message, "parsed", None)
+        if isinstance(parsed, dict):
+            return json.dumps(parsed)
+        if parsed is not None:
+            try:
+                return json.dumps(parsed.model_dump(mode="python"))
+            except Exception:
+                pass
+        refusal = getattr(message, "refusal", None)
+        if isinstance(refusal, str) and refusal.strip():
+            return refusal.strip()
+        return cls._extract_openai_response_text(response)
+
+    @staticmethod
+    def _scoring_json_schema() -> dict[str, object]:
+        breakdown_item = {
+            "type": "object",
+            "properties": {
+                "score": {"type": "integer"},
+                "evidence": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["score", "evidence"],
+            "additionalProperties": False,
+        }
+        return {
+            "type": "object",
+            "properties": {
+                "score": {"type": "integer"},
+                "confidence": {"type": "number"},
+                "rationale_short": {"type": "string"},
+                "strengths": {"type": "array", "items": {"type": "string"}},
+                "gaps": {"type": "array", "items": {"type": "string"}},
+                "required_match_breakdown": {
+                    "type": "object",
+                    "properties": {
+                        "title_alignment": breakdown_item,
+                        "skills_alignment": breakdown_item,
+                        "experience_alignment": breakdown_item,
+                        "domain_alignment": breakdown_item,
+                        "logistics_alignment": breakdown_item,
+                    },
+                    "required": list(_BREAKDOWN_KEYS),
+                    "additionalProperties": False,
+                },
+                "missing_required_items": {"type": "array", "items": {"type": "string"}},
+                "adjacent_transferable_strengths": {"type": "array", "items": {"type": "string"}},
+                "red_flags": {"type": "array", "items": {"type": "string"}},
+                "recommended_action": {"type": "string"},
+                "resume_tailoring_focus": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": [
+                "score",
+                "confidence",
+                "rationale_short",
+                "strengths",
+                "gaps",
+                "required_match_breakdown",
+                "missing_required_items",
+                "adjacent_transferable_strengths",
+                "red_flags",
+                "recommended_action",
+                "resume_tailoring_focus",
+            ],
+            "additionalProperties": False,
+        }
+
+    def _create_openai_scoring_completion(
+        self,
+        client: object,
+        model: str,
+        prompt: dict[str, object],
+        *,
+        system_prompt: str,
+    ) -> OpenAIScoringCompletionResult:
+        response = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(prompt)},
+            ],
+            text={"format": {"type": "json_schema", "name": "job_match_scoring", "schema": self._scoring_json_schema(), "strict": True}},
+            max_output_tokens=1200,
+        )
+        text = self._extract_openai_response_text(response)
+        if not text.strip():
+            text = self._extract_openai_response_json(response)
+        usage = getattr(response, "usage", None)
+        return OpenAIScoringCompletionResult(
+            text=text,
+            input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
+            output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+            shape_summary=self._describe_openai_response_shape(response),
+        )
+
+    @staticmethod
+    def _extract_openai_response_json(response: object) -> str:
+        model_dump = getattr(response, "model_dump", None)
+        if callable(model_dump):
+            try:
+                dumped = model_dump(mode="python")
+                structured = dumped.get("response")
+                if isinstance(structured, dict):
+                    return json.dumps(structured)
+            except Exception:
+                pass
+        output = getattr(response, "output", None) or []
+        for output_item in output:
+            content = getattr(output_item, "content", None) or []
+            for content_item in content:
+                parsed = getattr(content_item, "parsed", None)
+                if isinstance(parsed, dict):
+                    return json.dumps(parsed)
+                if parsed is not None:
+                    try:
+                        return json.dumps(parsed.model_dump(mode="python"))
+                    except Exception:
+                        pass
+        return ""
+
+    @classmethod
+    def _describe_openai_response_shape(cls, response: object) -> str:
+        parts: list[str] = []
+        output_text = getattr(response, "output_text", None)
+        if isinstance(output_text, str):
+            parts.append(f"output_text_len={len(output_text)}")
+        choices = getattr(response, "choices", None)
+        if isinstance(choices, list):
+            parts.append(f"choices={len(choices)}")
+            if choices:
+                message = getattr(choices[0], "message", None)
+                if message is not None:
+                    content = getattr(message, "content", None)
+                    if isinstance(content, str):
+                        parts.append(f"message_content_len={len(content)}")
+                    elif isinstance(content, list):
+                        parts.append(f"message_parts={len(content)}")
+                    parsed = getattr(message, "parsed", None)
+                    if parsed is not None:
+                        parts.append("message_parsed")
+                    refusal = getattr(message, "refusal", None)
+                    if refusal:
+                        parts.append("message_refusal")
+        output = getattr(response, "output", None)
+        if isinstance(output, list):
+            parts.append(f"output_items={len(output)}")
+            message_items = 0
+            content_items = 0
+            parsed_items = 0
+            for item in output:
+                if getattr(item, "type", None) == "message":
+                    message_items += 1
+                content = getattr(item, "content", None) or []
+                content_items += len(content)
+                for content_item in content:
+                    if getattr(content_item, "parsed", None) is not None:
+                        parsed_items += 1
+            if message_items:
+                parts.append(f"message_items={message_items}")
+            if content_items:
+                parts.append(f"content_items={content_items}")
+            if parsed_items:
+                parts.append(f"parsed_items={parsed_items}")
+        extracted = cls._extract_openai_response_text(response)
+        if extracted:
+            parts.append(f"extracted_len={len(extracted)}")
+        return ",".join(parts) or response.__class__.__name__
+
+    def _parse_scoring_payload(self, text: str) -> ScoringPayloadResult:
+        raw_text = str(text or "")
+        if not raw_text.strip():
+            raise ScoringResponseError("empty_response_text", "Model returned no extractable text.", preview="")
+        cleaned_text = self._extract_json_text(raw_text)
+        if not cleaned_text.strip():
+            raise ScoringResponseError(
+                "empty_response_text",
+                "Model returned no extractable text after normalization.",
+                preview=self._safe_preview(raw_text),
+            )
+        try:
+            payload = json.loads(cleaned_text)
+        except json.JSONDecodeError:
+            try:
+                payload = json.loads(cleaned_text.replace("\r\n", "\\n").replace("\n", "\\n"))
+            except json.JSONDecodeError as exc:
+                raise ScoringResponseError(
+                    "invalid_json",
+                    f"Model response could not be parsed as JSON ({exc}).",
+                    preview=self._safe_preview(cleaned_text),
+                ) from exc
+        if not isinstance(payload, dict):
+            raise ScoringResponseError(
+                "invalid_payload_shape",
+                "Scoring payload was not a JSON object.",
+                preview=self._safe_preview(cleaned_text),
+            )
+        if "score" not in payload or ("rationale_short" not in payload and "rationale" not in payload):
+            raise ScoringResponseError(
+                "invalid_payload_shape",
+                "Scoring payload is missing required keys.",
+                preview=self._safe_preview(cleaned_text),
+            )
+        if "strengths" in payload and not isinstance(payload.get("strengths"), list):
+            raise ScoringResponseError(
+                "invalid_payload_shape",
+                "Scoring payload strengths must be a list.",
+                preview=self._safe_preview(cleaned_text),
+            )
+        if "gaps" in payload and not isinstance(payload.get("gaps"), list):
+            raise ScoringResponseError(
+                "invalid_payload_shape",
+                "Scoring payload gaps must be a list.",
+                preview=self._safe_preview(cleaned_text),
+            )
+        if "required_match_breakdown" in payload and not isinstance(payload.get("required_match_breakdown"), dict):
+            raise ScoringResponseError(
+                "invalid_payload_shape",
+                "Scoring payload required_match_breakdown must be an object.",
+                preview=self._safe_preview(cleaned_text),
+            )
+        return ScoringPayloadResult(payload=payload, raw_text=raw_text, cleaned_text=cleaned_text)
+
+    @staticmethod
+    def _empty_required_match_breakdown() -> dict[str, dict[str, object]]:
+        return {key: {"score": 0, "evidence": []} for key in _BREAKDOWN_KEYS}
+
+    def _parse_required_match_breakdown(self, value: object) -> dict[str, dict[str, object]]:
+        breakdown = self._empty_required_match_breakdown()
+        if not isinstance(value, dict):
+            return breakdown
+        for key in _BREAKDOWN_KEYS:
+            item = value.get(key)
+            if not isinstance(item, dict):
+                continue
+            raw_score = item.get("score", 0)
+            try:
+                score = max(0, min(100, int(raw_score)))
+            except (TypeError, ValueError):
+                score = 0
+            evidence = self._coerce_string_list(item.get("evidence"), limit=4)
+            breakdown[key] = {"score": score, "evidence": evidence}
+        return breakdown
+
+    @staticmethod
+    def _coerce_string_list(value: object, *, limit: int) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        cleaned: list[str] = []
+        for item in value:
+            text = re.sub(r"\s+", " ", str(item or "").strip())
+            if text:
+                cleaned.append(text)
+            if len(cleaned) >= limit:
+                break
+        return cleaned
 
     @staticmethod
     def _parse_keyword_response(text: str) -> list[str]:

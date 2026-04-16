@@ -1171,6 +1171,118 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(row["delivery_status"], "pending_approval")
                 self.assertEqual(row["document_status"], "pending")
 
+    def test_pipeline_records_structured_run_metrics(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                config.automation_mode = "semi_auto"
+                config.progressive_queue_enabled = True
+                config.cheap_ai_top_n = 1
+                config.strong_ai_top_n = 1
+                resume_path = Path(tmp) / "resume.txt"
+                resume_path.write_text(
+                    "Jane Candidate\njane@example.com\n555-123-4567\nSummary: Python engineer\nSkills: Python, APIs\nBuilt APIs\n",
+                    encoding="utf-8",
+                )
+                config.resume_source_path = str(resume_path)
+                database = Database(paths.database_file)
+                database.initialize()
+                pipeline = JobBotPipeline(config, paths, database)
+                sample_job = Job(
+                    id="metrics-1",
+                    title="Python Developer",
+                    employer="Acme",
+                    location="Remote",
+                    salary_range="100-120",
+                    description_full="Build APIs with Python",
+                    apply_method="board",
+                    apply_url="https://example.com",
+                    hiring_manager_email="",
+                    source="jobspy",
+                    posted_at="2026-01-01T00:00:00+00:00",
+                    scraped_at="2026-01-01T00:00:00+00:00",
+                )
+                pipeline.scraper.fetch_jobs = lambda: [(sample_job, {"sample": True})]
+                pipeline.scorer.cheap_evaluate = lambda *args, **kwargs: StageEvaluation(
+                    "cheap", "openai", "gpt-5-nano", "scored", "review", 78, 0.8, "Promising fit", ["Python"], [], 10, 5, 0.001, "", datetime.now(timezone.utc).isoformat()
+                )
+                pipeline.scorer.strong_evaluate = lambda *args, **kwargs: StageEvaluation(
+                    "strong", "openai", "gpt-5-mini", "scored", "review", 82, 0.85, "Worth review", ["Python"], [], 12, 6, 0.01, "", datetime.now(timezone.utc).isoformat()
+                )
+                result = pipeline.run()
+                self.assertEqual(result.status, "completed")
+                latest_run = database.latest_run()
+                self.assertIsNotNone(latest_run)
+                assert latest_run is not None
+                self.assertEqual(latest_run["jobs_seen"], 1)
+                self.assertEqual(latest_run["fast_rank_candidates"], 1)
+                self.assertEqual(latest_run["fast_rank_survivors"], 1)
+                self.assertEqual(latest_run["cheap_shortlist_size"], 1)
+                self.assertEqual(latest_run["cheap_stage_provider"], "openai")
+                self.assertEqual(latest_run["strong_shortlist_size"], 1)
+                self.assertEqual(latest_run["strong_stage_model"], "gpt-5-mini")
+
+    def test_pipeline_records_parse_failures_in_run_summary(self) -> None:
+        with workspace_temp_dir() as tmp:
+            with patch.dict(os.environ, {"APPDATA": str(tmp)}):
+                paths = build_app_paths()
+                config = load_or_create_config(paths)
+                config.automation_mode = "semi_auto"
+                config.progressive_queue_enabled = True
+                config.cheap_ai_top_n = 1
+                config.strong_ai_top_n = 1
+                resume_path = Path(tmp) / "resume.txt"
+                resume_path.write_text(
+                    "Jane Candidate\njane@example.com\n555-123-4567\nSummary: Python engineer\nSkills: Python, APIs\nBuilt APIs\n",
+                    encoding="utf-8",
+                )
+                config.resume_source_path = str(resume_path)
+                database = Database(paths.database_file)
+                database.initialize()
+                pipeline = JobBotPipeline(config, paths, database)
+                sample_job = Job(
+                    id="metrics-parse-1",
+                    title="Python Developer",
+                    employer="Acme",
+                    location="Remote",
+                    salary_range="100-120",
+                    description_full="Build APIs with Python",
+                    apply_method="board",
+                    apply_url="https://example.com",
+                    hiring_manager_email="",
+                    source="jobspy",
+                    posted_at="2026-01-01T00:00:00+00:00",
+                    scraped_at="2026-01-01T00:00:00+00:00",
+                )
+                pipeline.scraper.fetch_jobs = lambda: [(sample_job, {"sample": True})]
+                pipeline.scorer.cheap_evaluate = lambda *args, **kwargs: StageEvaluation(
+                    "cheap",
+                    "openai",
+                    "gpt-5-nano",
+                    "error",
+                    "error",
+                    None,
+                    None,
+                    "Evaluation failed.",
+                    [],
+                    [],
+                    10,
+                    5,
+                    0.0,
+                    "invalid_json: Model response could not be parsed as JSON.",
+                    datetime.now(timezone.utc).isoformat(),
+                )
+                result = pipeline.run()
+                self.assertEqual(result.status, "completed")
+                self.assertIn("cheap-stage scoring failures", result.message)
+                latest_run = database.latest_run()
+                self.assertIsNotNone(latest_run)
+                assert latest_run is not None
+                self.assertEqual(latest_run["cheap_parse_failures"], 1)
+                self.assertEqual(latest_run["strong_shortlist_size"], 0)
+                self.assertIn("cheap_stage_failed", latest_run["error_summary"])
+
     def test_semi_auto_approve_requires_generated_documents(self) -> None:
         with workspace_temp_dir() as tmp:
             with patch.dict(os.environ, {"APPDATA": str(tmp)}):

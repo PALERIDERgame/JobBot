@@ -184,6 +184,193 @@ class MatchScorerTests(unittest.TestCase):
         self.assertEqual(result.status, "scored")
         self.assertEqual(result.score, 77)
 
+    def test_extract_openai_chat_text_handles_content_parts(self) -> None:
+        class Message:
+            content = [{"type": "output_text", "text": '{"score": 81}'}]
+            parsed = None
+            refusal = None
+
+        class Choice:
+            message = Message()
+
+        class Response:
+            choices = [Choice()]
+
+        self.assertEqual(MatchScorer._extract_openai_chat_text(Response()), '{"score": 81}')
+
+    def test_extract_openai_response_text_handles_output_text_items(self) -> None:
+        class Content:
+            type = "output_text"
+            text = '{"score": 81}'
+
+        class OutputItem:
+            type = "message"
+            content = [Content()]
+
+        class Response:
+            output_text = ""
+            output = [OutputItem()]
+
+        self.assertEqual(MatchScorer._extract_openai_response_text(Response()), '{"score": 81}')
+
+    def test_extract_openai_response_json_uses_model_dump_response_object(self) -> None:
+        class Response:
+            def model_dump(self, mode="python"):
+                return {"response": {"score": 81, "confidence": 0.9}}
+
+        self.assertEqual(
+            MatchScorer._extract_openai_response_json(Response()),
+            '{"score": 81, "confidence": 0.9}',
+        )
+
+    def test_create_openai_scoring_completion_extracts_output_text_from_responses_api(self) -> None:
+        config = JobBotConfig(openai_api_key="openai-test")
+        scorer = MatchScorer(config)
+
+        class Usage:
+            input_tokens = 321
+            output_tokens = 45
+
+        class Content:
+            type = "output_text"
+            text = '{"score":81,"confidence":0.88,"rationale_short":"Good fit","strengths":[],"gaps":[],"required_match_breakdown":{"title_alignment":{"score":80,"evidence":[]},"skills_alignment":{"score":80,"evidence":[]},"experience_alignment":{"score":80,"evidence":[]},"domain_alignment":{"score":80,"evidence":[]},"logistics_alignment":{"score":80,"evidence":[]}},"missing_required_items":[],"adjacent_transferable_strengths":[],"red_flags":[],"recommended_action":"review","resume_tailoring_focus":[]}'
+
+        class OutputItem:
+            type = "message"
+            content = [Content()]
+
+        class Response:
+            output_text = ""
+            output = [OutputItem()]
+            usage = Usage()
+
+        fake_client = MagicMock()
+        fake_client.responses.create.return_value = Response()
+        result = scorer._create_openai_scoring_completion(fake_client, "gpt-5-mini", {"job": "test"}, system_prompt="Return JSON")
+        self.assertIn('"score":81', result.text)
+        self.assertEqual(result.input_tokens, 321)
+        self.assertEqual(result.output_tokens, 45)
+        self.assertIn("output_items=1", result.shape_summary)
+
+    def test_create_openai_scoring_completion_uses_parsed_response_when_text_empty(self) -> None:
+        config = JobBotConfig(openai_api_key="openai-test")
+        scorer = MatchScorer(config)
+
+        class Usage:
+            input_tokens = 100
+            output_tokens = 12
+
+        class Response:
+            output_text = ""
+            output = []
+            usage = Usage()
+
+            def model_dump(self, mode="python"):
+                return {
+                    "response": {
+                        "score": 73,
+                        "confidence": 0.7,
+                        "rationale_short": "Borderline",
+                        "strengths": [],
+                        "gaps": [],
+                        "required_match_breakdown": {
+                            "title_alignment": {"score": 70, "evidence": []},
+                            "skills_alignment": {"score": 70, "evidence": []},
+                            "experience_alignment": {"score": 70, "evidence": []},
+                            "domain_alignment": {"score": 70, "evidence": []},
+                            "logistics_alignment": {"score": 70, "evidence": []},
+                        },
+                        "missing_required_items": [],
+                        "adjacent_transferable_strengths": [],
+                        "red_flags": [],
+                        "recommended_action": "review",
+                        "resume_tailoring_focus": [],
+                    }
+                }
+
+        fake_client = MagicMock()
+        fake_client.responses.create.return_value = Response()
+        result = scorer._create_openai_scoring_completion(fake_client, "gpt-5-mini", {"job": "test"}, system_prompt="Return JSON")
+        self.assertIn('"score": 73', result.text)
+        self.assertEqual(result.input_tokens, 100)
+        self.assertEqual(result.output_tokens, 12)
+
+    def test_create_completion_with_usage_for_system_uses_responses_api_for_gpt5(self) -> None:
+        config = JobBotConfig(openai_api_key="openai-test")
+        scorer = MatchScorer(config)
+        scorer._build_client = MagicMock(return_value=MagicMock())
+        scorer._create_openai_scoring_completion = MagicMock(
+            return_value=type(
+                "Result",
+                (),
+                {"text": '{"score": 80, "confidence": 0.8, "rationale_short": "OK", "strengths": [], "gaps": [], "required_match_breakdown": {"title_alignment": {"score": 80, "evidence": []}, "skills_alignment": {"score": 80, "evidence": []}, "experience_alignment": {"score": 80, "evidence": []}, "domain_alignment": {"score": 80, "evidence": []}, "logistics_alignment": {"score": 80, "evidence": []}}, "missing_required_items": [], "adjacent_transferable_strengths": [], "red_flags": [], "recommended_action": "review", "resume_tailoring_focus": []}', "input_tokens": 25, "output_tokens": 10, "shape_summary": "output_items=1"},
+            )()
+        )
+        text, input_tokens, output_tokens = scorer._create_completion_with_usage_for_system(
+            "openai",
+            "gpt-5-mini",
+            {"job": "test"},
+            system_prompt="Return JSON",
+        )
+        self.assertIn('"score": 80', text)
+        self.assertEqual(input_tokens, 25)
+        self.assertEqual(output_tokens, 10)
+        scorer._create_openai_scoring_completion.assert_called_once()
+
+    def test_cheap_evaluate_gpt5_responses_path_recovers_real_run_shape(self) -> None:
+        config = JobBotConfig(cheap_stage_provider="openai", cheap_stage_model="gpt-5-mini", openai_api_key="openai-test")
+        scorer = MatchScorer(config)
+        scorer._build_client = MagicMock(return_value=MagicMock())
+        scorer._create_openai_scoring_completion = MagicMock(
+            return_value=type(
+                "Result",
+                (),
+                {"text": '{"score": 81, "confidence": 0.88, "rationale_short": "Good fit", "strengths": ["Digital marketing"], "gaps": [], "required_match_breakdown": {"title_alignment": {"score": 82, "evidence": []}, "skills_alignment": {"score": 82, "evidence": []}, "experience_alignment": {"score": 82, "evidence": []}, "domain_alignment": {"score": 82, "evidence": []}, "logistics_alignment": {"score": 82, "evidence": []}}, "missing_required_items": [], "adjacent_transferable_strengths": [], "red_flags": [], "recommended_action": "review", "resume_tailoring_focus": []}', "input_tokens": 50, "output_tokens": 20, "shape_summary": "output_items=1"},
+            )()
+        )
+        job = Job("1", "Digital Marketing Manager", "Acme", "Remote", "", "Marketing role", "board", "https://example.com", "", "jobspy", "", "")
+        resume = ResumeData("", "", "Jane", "jane@example.com", "", "Marketing manager", ["Digital marketing"], ["Ran campaigns"])
+        result = scorer.cheap_evaluate(job, resume)
+        self.assertEqual(result.status, "scored")
+        self.assertEqual(result.score, 81)
+        self.assertEqual(result.decision, "review")
+
+    def test_cheap_evaluate_returns_empty_response_text_error(self) -> None:
+        config = JobBotConfig(cheap_stage_provider="openai", cheap_stage_model="gpt-5-nano", openai_api_key="openai-test")
+        scorer = MatchScorer(config)
+        scorer._build_client = MagicMock(return_value=object())
+        scorer._create_completion_with_usage = MagicMock(return_value=("", 300, 80))
+        job = Job("1", "Python Developer", "Acme", "Remote", "", "Python role", "board", "https://example.com", "", "usajobs", "", "")
+        resume = ResumeData("", "", "Jane", "jane@example.com", "", "Python engineer", ["Python"], ["Built APIs"])
+        with self.assertLogs("match_scorer", level="WARNING"):
+            result = scorer.cheap_evaluate(job, resume)
+        self.assertEqual(result.status, "error")
+        self.assertTrue(result.error_message.startswith("empty_response_text:"))
+
+    def test_cheap_evaluate_returns_invalid_json_error(self) -> None:
+        config = JobBotConfig(cheap_stage_provider="openai", cheap_stage_model="gpt-5-nano", openai_api_key="openai-test")
+        scorer = MatchScorer(config)
+        scorer._build_client = MagicMock(return_value=object())
+        scorer._create_completion_with_usage = MagicMock(return_value=("not json", 300, 80))
+        job = Job("1", "Python Developer", "Acme", "Remote", "", "Python role", "board", "https://example.com", "", "usajobs", "", "")
+        resume = ResumeData("", "", "Jane", "jane@example.com", "", "Python engineer", ["Python"], ["Built APIs"])
+        with self.assertLogs("match_scorer", level="WARNING"):
+            result = scorer.cheap_evaluate(job, resume)
+        self.assertEqual(result.status, "error")
+        self.assertTrue(result.error_message.startswith("invalid_json:"))
+
+    def test_strong_evaluate_returns_invalid_payload_shape_error(self) -> None:
+        config = JobBotConfig(strong_stage_provider="openai", strong_stage_model="gpt-5-mini", openai_api_key="openai-test")
+        scorer = MatchScorer(config)
+        scorer._build_client = MagicMock(return_value=object())
+        scorer._create_completion_with_usage = MagicMock(return_value=('{"confidence": 0.9, "strengths": [], "gaps": []}', 400, 50))
+        job = Job("1", "Python Developer", "Acme", "Remote", "", "Python role", "board", "https://example.com", "", "usajobs", "", "")
+        resume = ResumeData("", "", "Jane", "jane@example.com", "", "Python engineer", ["Python"], ["Built APIs"])
+        with self.assertLogs("match_scorer", level="WARNING"):
+            result = scorer.strong_evaluate(job, resume)
+        self.assertEqual(result.status, "error")
+        self.assertTrue(result.error_message.startswith("invalid_payload_shape:"))
+
     def test_suggest_job_keywords_returns_space_separated_terms(self) -> None:
         config = JobBotConfig(cheap_stage_provider="openai", cheap_stage_model="gpt-5-nano", openai_api_key="openai-test")
         scorer = MatchScorer(config)

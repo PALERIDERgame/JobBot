@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import os
 import queue
@@ -875,8 +876,24 @@ class JobBotDashboard:
             if not run:
                 self.last_run_label.config(text="No runs yet")
             else:
+                cheap_provider = str(run.get("cheap_stage_provider") or "").strip()
+                cheap_model = str(run.get("cheap_stage_model") or "").strip()
+                cheap_duration_ms = int(run.get("cheap_stage_duration_ms") or 0)
+                cheap_parse_failures = int(run.get("cheap_parse_failures") or 0)
+                strong_shortlist_size = int(run.get("strong_shortlist_size") or 0)
+                cheap_summary = ""
+                if cheap_provider or cheap_model:
+                    cheap_summary = (
+                        f" | cheap={cheap_provider or 'n/a'}/{cheap_model or 'n/a'} "
+                        f"{cheap_duration_ms / 1000:.2f}s parse_fail={cheap_parse_failures}"
+                    )
+                strong_summary = f" | strong_shortlist={strong_shortlist_size}"
                 self.last_run_label.config(
-                    text=f"Last run: {run['status']} | stage={run['stage']} | seen={run['jobs_seen']} matched={run['jobs_matched']}"
+                    text=(
+                        f"Last run: {run['status']} | stage={run['stage']} | "
+                        f"seen={run['jobs_seen']} matched={run['jobs_matched']}"
+                        f"{cheap_summary}{strong_summary}"
+                    )
                 )
 
     def _record_outcome(self) -> None:
@@ -990,6 +1007,10 @@ class JobBotDashboard:
             self.details_text.insert("1.0", "Select a job to review its description, match notes, and generated files.")
             return
         email_assessment = self._email_apply_assessment_for_row(row)
+        missing_required = self._parse_json_list_field(row.get("missing_required_items"))
+        red_flags = self._parse_json_list_field(row.get("red_flags"))
+        transferable = self._parse_json_list_field(row.get("adjacent_transferable_strengths"))
+        tailoring_focus = self._parse_json_list_field(row.get("resume_tailoring_focus"))
         details = "\n".join(
             [
                 f"Title: {row['title']}",
@@ -999,10 +1020,13 @@ class JobBotDashboard:
                 f"Source: {row['source']}",
                 f"Resume source type: {Path(self.config.resume_source_path).suffix.lower() or 'unknown'}",
                 f"Score: {row['score']}",
+                f"Confidence: {float(row.get('confidence') or 0.0):.2f}",
                 f"Score source: {row.get('score_source') or 'unknown'}",
                 f"Verification stage: {row.get('verification_stage') or 'unknown'}",
                 f"Provisional rank: {row.get('provisional_rank') or 'n/a'}",
                 f"Match status: {row['match_status']}",
+                f"Recommended action: {row.get('recommended_action') or row['match_status']}",
+                f"Policy blocked: {'Yes' if int(row.get('policy_blocked') or 0) else 'No'}",
                 f"Apply method: {row['apply_method']}",
                 f"HR email: {email_assessment.confidence}",
                 f"Portal autofill readiness: {self._portal_readiness_for_row(row)}",
@@ -1013,8 +1037,23 @@ class JobBotDashboard:
                 f"Delivery detail: {row['delivery_error'] or 'None'}",
                 f"HR email review: {email_assessment.reason}",
                 "",
+                "Advance / Block Reason:",
+                row.get("gating_reason") or "No gating reason recorded.",
+                "",
                 "Match rationale:",
                 row["rationale"] or "No rationale available.",
+                "",
+                "Missing required items:",
+                ", ".join(missing_required) if missing_required else "None recorded.",
+                "",
+                "Red flags:",
+                ", ".join(red_flags) if red_flags else "None recorded.",
+                "",
+                "Transferable strengths:",
+                ", ".join(transferable) if transferable else "None recorded.",
+                "",
+                "Resume tailoring focus:",
+                ", ".join(tailoring_focus) if tailoring_focus else "Only shown for review/apply-stage jobs.",
                 "",
                 "Generated resume (DOCX):",
                 self._document_status_text(row.get("resume_docx_path", "")),
@@ -1067,6 +1106,21 @@ class JobBotDashboard:
         )
         self.details_text.delete("1.0", tk.END)
         self.details_text.insert("1.0", details)
+
+    @staticmethod
+    def _parse_json_list_field(value: object) -> list[str]:
+        if isinstance(value, list):
+            return [str(item) for item in value if str(item or "").strip()]
+        text = str(value or "").strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return [text]
+        if not isinstance(parsed, list):
+            return []
+        return [str(item) for item in parsed if str(item or "").strip()]
 
     def _selected_row(self, show_warning: bool = True):
         if not self.review_tree:
