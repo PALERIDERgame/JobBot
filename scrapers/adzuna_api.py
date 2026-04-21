@@ -16,7 +16,7 @@ class AdzunaScraper:
     def __init__(self, config: JobBotConfig) -> None:
         self.config = config
 
-    def fetch_jobs(self) -> list[tuple[Job, dict[str, Any]]]:
+    def fetch_jobs(self, keyword: str | None = None) -> list[tuple[Job, dict[str, Any]]]:
         app_id = self.config.source.adzuna_app_id.strip()
         app_key = self.config.source.adzuna_app_key.strip()
         country = (self.config.source.adzuna_country or "us").strip().lower()
@@ -29,7 +29,7 @@ class AdzunaScraper:
             "app_id": app_id,
             "app_key": app_key,
             "results_per_page": self.config.source.results_per_page,
-            "what": self.config.source.keyword,
+            "what": keyword or self.config.source.keyword,
             "where": self.config.source.location,
             "sort_by": self.config.source.adzuna_sort or "date",
             "content-type": "application/json",

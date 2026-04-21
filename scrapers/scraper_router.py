@@ -10,12 +10,12 @@ class ScraperRouter:
     def __init__(self, config: JobBotConfig) -> None:
         self.config = config
 
-    def fetch_jobs(self):
+    def fetch_jobs(self, keyword: str | None = None):
         provider = self.config.source.provider.lower()
         if provider == "adzuna":
-            return AdzunaScraper(self.config).fetch_jobs()
+            return AdzunaScraper(self.config).fetch_jobs(keyword=keyword)
         if provider == "usajobs":
-            return USAJobsScraper(self.config).fetch_jobs()
+            return USAJobsScraper(self.config).fetch_jobs(keyword=keyword)
         if provider == "jobspy":
-            return JobSpyScraper(self.config).fetch_jobs()
+            return JobSpyScraper(self.config).fetch_jobs(keyword=keyword)
         raise ValueError(f"Unsupported source provider: {self.config.source.provider}")

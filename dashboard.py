@@ -15,7 +15,7 @@ from tkinter import filedialog, messagebox, ttk
 from application_routing import EmailApplyAssessment, assess_email_apply
 from config import AppPaths, JobBotConfig, load_or_create_config, save_config
 from database import Database
-from match_scorer import MatchScorer
+from match_scorer import FitResumeSuggestions, MatchScorer
 from pipeline import JobBotPipeline
 from portal_filler import PortalAutofillReadiness
 from resume_parser import parse_resume
@@ -45,7 +45,9 @@ FIELD_TOOLTIPS = {
     "Anthropic API key": "API key for Anthropic-hosted models.",
     "OpenAI API key": "API key for OpenAI-hosted models.",
     "Job keyword": "Primary search phrase sent to the job source.",
+    "Additional keywords": "Extra search terms run alongside the main keyword. Each brings in its own results — useful for getting fresh listings on repeat runs.",
     "Location": "Optional job search location. Leave blank for broader searches.",
+    "Target titles": "Comma-separated direct-fit titles that should strongly help fast-rank title matching.",
     "USAJobs account email": "Email address registered with the USAJobs API. Sent as the User-Agent header.",
     "USAJobs authorization key": "API key for USAJobs. Required to avoid 401 Unauthorized responses.",
     "Include titles": "Comma-separated titles that should be treated as good fits.",
@@ -68,7 +70,7 @@ FIELD_TOOLTIPS = {
     "Gmail sender": "Authenticated Gmail account used to send applications.",
     "Client secrets path": "Path to your Google OAuth client secrets JSON file.",
     "Enable Gmail delivery": "Turn on Gmail delivery for approved jobs.",
-    "Fit to Resume": "Analyze the configured resume with the cheap AI stage and replace Job keyword with suggested search terms you can edit.",
+    "Fit to Resume": "Analyze the configured resume and open grouped, editable search suggestions you can apply to keyword, target titles, and include titles.",
 }
 
 
@@ -131,6 +133,7 @@ class JobBotDashboard:
         self.cheap_ai_top_n_var = tk.StringVar(value=str(config.cheap_ai_top_n))
         self.strong_ai_top_n_var = tk.StringVar(value=str(config.strong_ai_top_n))
         self.keyword_var = tk.StringVar(value=config.source.keyword)
+        self.additional_keywords_var = tk.StringVar(value=", ".join(config.source.additional_keywords))
         self.location_var = tk.StringVar(value=config.source.location)
         self.source_provider_var = tk.StringVar(value=config.source.provider)
         self.jobspy_sites_var = tk.StringVar(value=", ".join(config.source.jobspy_sites))
@@ -140,6 +143,7 @@ class JobBotDashboard:
         self.adzuna_app_id_var = tk.StringVar(value=config.source.adzuna_app_id)
         self.adzuna_app_key_var = tk.StringVar(value=config.source.adzuna_app_key)
         self.adzuna_country_var = tk.StringVar(value=config.source.adzuna_country or "us")
+        self.target_titles_var = tk.StringVar(value=", ".join(config.target_titles))
         self.include_titles_var = tk.StringVar(value=", ".join(config.include_titles))
         self.exclude_titles_var = tk.StringVar(value=", ".join(config.exclude_titles))
         self.force_keywords_var = tk.StringVar(value=", ".join(config.force_escalate_keywords))
@@ -239,7 +243,9 @@ class JobBotDashboard:
         labels = [
             ("Resume source", self.resume_var),
             ("Job keyword", self.keyword_var),
+            ("Additional keywords", self.additional_keywords_var),
             ("Location", self.location_var),
+            ("Target titles", self.target_titles_var),
             ("Include titles", self.include_titles_var),
             ("Exclude titles", self.exclude_titles_var),
             ("Salary floor", self.salary_floor_var),
@@ -532,7 +538,7 @@ class JobBotDashboard:
         except Exception as exc:
             messagebox.showwarning("Job Bot", f"Current setup values need attention before fitting to resume:\n{exc}")
             return
-        self.status_var.set("Generating job keywords from resume...")
+            self.status_var.set("Generating grouped search suggestions from resume...")
         self._set_fit_resume_button_enabled(False)
         thread = threading.Thread(target=self._fit_to_resume_background, daemon=True)
         thread.start()
@@ -544,16 +550,89 @@ class JobBotDashboard:
             if not resume_path.exists():
                 raise FileNotFoundError(f"Configured resume source was not found: {resume_path}")
             resume_data = parse_resume(resume_path, self.paths.resume_json)
-            keywords = MatchScorer(config, self.database).suggest_job_keywords(resume_data)
+            suggestions = MatchScorer(config, self.database).suggest_job_keyword_groups(resume_data)
         except Exception as exc:
             self.root.after(0, lambda: self._handle_fit_to_resume_error(str(exc)))
             return
-        self.root.after(0, lambda: self._apply_fit_to_resume_keywords(keywords))
+        self.root.after(0, lambda: self._show_fit_to_resume_dialog(suggestions))
 
-    def _apply_fit_to_resume_keywords(self, keywords: str) -> None:
-        self.keyword_var.set(keywords)
+    def _show_fit_to_resume_dialog(self, suggestions: FitResumeSuggestions) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Resume-Fit Suggestions")
+        dialog.transient(self.root)
+        dialog.resizable(True, True)
+        dialog.grab_set()
+        dialog.geometry("760x520")
+
+        container = ttk.Frame(dialog, padding=14)
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            container,
+            text="Review the grouped suggestions and adjust anything before applying them to your search setup.",
+            wraplength=680,
+            justify="left",
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        field_specs = [
+            ("Combined query", suggestions.combined_query),
+            ("Core titles", ", ".join(suggestions.core_titles)),
+            ("Adjacent titles", ", ".join(suggestions.adjacent_titles)),
+            ("Domains", ", ".join(suggestions.domains)),
+            ("Skills / tools", ", ".join(suggestions.skills_tools)),
+            ("Broadening terms", ", ".join(suggestions.broadening_terms)),
+        ]
+        editors: dict[str, tk.Text] = {}
+        for idx, (label, value) in enumerate(field_specs, start=1):
+            ttk.Label(container, text=label).grid(row=idx, column=0, sticky="nw", pady=(10, 0), padx=(0, 12))
+            editor = tk.Text(container, height=2 if idx == 1 else 3, wrap="word")
+            editor.grid(row=idx, column=1, sticky="nsew", pady=(10, 0))
+            editor.insert("1.0", value)
+            editors[label] = editor
+
+        rationale_label = ttk.Label(container, text="Why these terms")
+        rationale_label.grid(row=7, column=0, sticky="nw", pady=(10, 0), padx=(0, 12))
+        rationale = tk.Text(container, height=10, wrap="word")
+        rationale.grid(row=7, column=1, sticky="nsew", pady=(10, 0))
+        rationale_lines = [
+            f"{term}: {reason}"
+            for term, reason in suggestions.rationale_by_term.items()
+        ] or ["No rationale available."]
+        rationale.insert("1.0", "\n".join(rationale_lines))
+        rationale.configure(state="disabled")
+        container.rowconfigure(7, weight=1)
+
+        buttons = ttk.Frame(container)
+        buttons.grid(row=8, column=0, columnspan=2, sticky="e", pady=(14, 0))
+
+        def apply_and_close() -> None:
+            applied = FitResumeSuggestions(
+                combined_query=editors["Combined query"].get("1.0", tk.END).strip(),
+                core_titles=self._parse_csv(editors["Core titles"].get("1.0", tk.END).replace("\n", ",")),
+                adjacent_titles=self._parse_csv(editors["Adjacent titles"].get("1.0", tk.END).replace("\n", ",")),
+                domains=self._parse_csv(editors["Domains"].get("1.0", tk.END).replace("\n", ",")),
+                skills_tools=self._parse_csv(editors["Skills / tools"].get("1.0", tk.END).replace("\n", ",")),
+                broadening_terms=self._parse_csv(editors["Broadening terms"].get("1.0", tk.END).replace("\n", ",")),
+                rationale_by_term=suggestions.rationale_by_term,
+            )
+            self._apply_fit_to_resume_suggestions(applied)
+            dialog.destroy()
+
+        def cancel() -> None:
+            self._set_fit_resume_button_enabled(True)
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        ttk.Button(buttons, text="Cancel", command=cancel).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="Apply Suggestions", command=apply_and_close).pack(side="left")
+
+    def _apply_fit_to_resume_suggestions(self, suggestions: FitResumeSuggestions) -> None:
+        self.keyword_var.set(suggestions.combined_query.strip())
+        self.target_titles_var.set(", ".join(suggestions.core_titles))
+        self.include_titles_var.set(", ".join(suggestions.adjacent_titles))
         if self._autosave_setup():
-            self.status_var.set("Resume-fit keywords generated. Review and edit them before running.")
+            self.status_var.set("Resume-fit suggestions applied. Review and edit them before running.")
         self._set_fit_resume_button_enabled(True)
 
     def _handle_fit_to_resume_error(self, message: str) -> None:
@@ -666,6 +745,7 @@ class JobBotDashboard:
         config.anthropic_api_key = self.anthropic_api_key_var.get().strip()
         config.openai_api_key = self.openai_api_key_var.get().strip()
         config.source.keyword = self.keyword_var.get().strip()
+        config.source.additional_keywords = self._parse_csv(self.additional_keywords_var.get())
         config.source.location = self.location_var.get().strip()
         config.source.provider = self.source_provider_var.get().strip() or ("jobspy" if config.automation_mode == "semi_auto" else "adzuna")
         config.source.jobspy_sites = self._parse_csv(self.jobspy_sites_var.get()) or ["indeed", "google"]
@@ -676,6 +756,7 @@ class JobBotDashboard:
         config.source.adzuna_app_id = self.adzuna_app_id_var.get().strip()
         config.source.adzuna_app_key = self.adzuna_app_key_var.get().strip()
         config.source.adzuna_country = self.adzuna_country_var.get().strip() or "us"
+        config.target_titles = self._parse_csv(self.target_titles_var.get())
         config.include_titles = self._parse_csv(self.include_titles_var.get())
         config.exclude_titles = self._parse_csv(self.exclude_titles_var.get())
         config.force_escalate_keywords = self._parse_csv(self.force_keywords_var.get())

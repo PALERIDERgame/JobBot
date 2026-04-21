@@ -294,7 +294,7 @@ class PipelineTests(unittest.TestCase):
                     posted_at="2026-01-01T00:00:00+00:00",
                     scraped_at="2026-01-01T00:00:00+00:00",
                 )
-                pipeline.scraper.fetch_jobs = lambda: [(sample_job, {"sample": True})]
+                pipeline.scraper.fetch_jobs = lambda keyword=None: [(sample_job, {"sample": True})]
                 pipeline.scorer.cheap_evaluate = lambda job, resume, force_escalate=False: StageEvaluation(
                     "cheap", "openai", "gpt-5-nano", "scored", "escalate", 72, 0.8, "Promising", ["Python"], ["AWS"], 100, 10, 0.0001, "", "2026-01-01T00:00:00+00:00"
                 )
@@ -346,7 +346,7 @@ class PipelineTests(unittest.TestCase):
                     posted_at="2026-01-01T00:00:00+00:00",
                     scraped_at="2026-01-01T00:00:00+00:00",
                 )
-                pipeline.scraper.fetch_jobs = lambda: [(sample_job, {"sample": True})]
+                pipeline.scraper.fetch_jobs = lambda keyword=None: [(sample_job, {"sample": True})]
                 pipeline.scorer.cheap_evaluate = lambda job, resume, force_escalate=False: StageEvaluation(
                     "cheap", "openai", "gpt-5-nano", "scored", "escalate", 72, 0.8, "Promising", ["Python"], ["AWS"], 100, 10, 0.0001, "", "2026-01-01T00:00:00+00:00"
                 )
@@ -398,7 +398,7 @@ class PipelineTests(unittest.TestCase):
                     posted_at="2026-01-01T00:00:00+00:00",
                     scraped_at="2026-01-01T00:00:00+00:00",
                 )
-                pipeline.scraper.fetch_jobs = lambda: [(sample_job, {"sample": True})]
+                pipeline.scraper.fetch_jobs = lambda keyword=None: [(sample_job, {"sample": True})]
                 pipeline.scorer.cheap_evaluate = lambda job, resume, force_escalate=False: StageEvaluation(
                     "cheap", "openai", "gpt-5-nano", "scored", "escalate", 72, 0.8, "Promising", ["Python"], ["AWS"], 100, 10, 0.0001, "", "2026-01-01T00:00:00+00:00"
                 )
@@ -1160,7 +1160,7 @@ class PipelineTests(unittest.TestCase):
                     posted_at="2026-01-01T00:00:00+00:00",
                     scraped_at="2026-01-01T00:00:00+00:00",
                 )
-                pipeline.scraper.fetch_jobs = lambda: [(sample_job, {"sample": True})]
+                pipeline.scraper.fetch_jobs = lambda keyword=None: [(sample_job, {"sample": True})]
                 pipeline.scorer.cheap_evaluate = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("cheap scorer should not run"))
                 pipeline.scorer.strong_evaluate = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("strong scorer should not run"))
                 result = pipeline.run()
@@ -1203,7 +1203,7 @@ class PipelineTests(unittest.TestCase):
                     posted_at="2026-01-01T00:00:00+00:00",
                     scraped_at="2026-01-01T00:00:00+00:00",
                 )
-                pipeline.scraper.fetch_jobs = lambda: [(sample_job, {"sample": True})]
+                pipeline.scraper.fetch_jobs = lambda keyword=None: [(sample_job, {"sample": True})]
                 pipeline.scorer.cheap_evaluate = lambda *args, **kwargs: StageEvaluation(
                     "cheap", "openai", "gpt-5-nano", "scored", "review", 78, 0.8, "Promising fit", ["Python"], [], 10, 5, 0.001, "", datetime.now(timezone.utc).isoformat()
                 )
@@ -1255,7 +1255,7 @@ class PipelineTests(unittest.TestCase):
                     posted_at="2026-01-01T00:00:00+00:00",
                     scraped_at="2026-01-01T00:00:00+00:00",
                 )
-                pipeline.scraper.fetch_jobs = lambda: [(sample_job, {"sample": True})]
+                pipeline.scraper.fetch_jobs = lambda keyword=None: [(sample_job, {"sample": True})]
                 pipeline.scorer.cheap_evaluate = lambda *args, **kwargs: StageEvaluation(
                     "cheap",
                     "openai",
@@ -1313,7 +1313,7 @@ class PipelineTests(unittest.TestCase):
                     posted_at="2026-01-01T00:00:00+00:00",
                     scraped_at="2026-01-01T00:00:00+00:00",
                 )
-                pipeline.scraper.fetch_jobs = lambda: [(sample_job, {"sample": True})]
+                pipeline.scraper.fetch_jobs = lambda keyword=None: [(sample_job, {"sample": True})]
                 pipeline.run()
                 with self.assertRaisesRegex(ValueError, "Generate documents first"):
                     pipeline.approve_and_send("6")
@@ -1348,7 +1348,7 @@ class PipelineTests(unittest.TestCase):
                     posted_at="2026-01-01T00:00:00+00:00",
                     scraped_at="2026-01-01T00:00:00+00:00",
                 )
-                pipeline.scraper.fetch_jobs = lambda: [(sample_job, {"sample": True})]
+                pipeline.scraper.fetch_jobs = lambda keyword=None: [(sample_job, {"sample": True})]
                 pipeline.run()
                 docs = pipeline.generate_documents_for_job("7")
                 self.assertTrue(docs.output_dir.exists())
@@ -1389,7 +1389,7 @@ class PipelineTests(unittest.TestCase):
                     posted_at="2026-01-01T00:00:00+00:00",
                     scraped_at="2026-01-01T00:00:00+00:00",
                 )
-                pipeline.scraper.fetch_jobs = lambda: [(sample_job, {"sample": True})]
+                pipeline.scraper.fetch_jobs = lambda keyword=None: [(sample_job, {"sample": True})]
                 pipeline.run()
 
                 def fake_generate(output_dir, job, resume, score, *, ai_notes="", tailoring_payload=None, progress_callback=None):
@@ -1455,7 +1455,7 @@ class PipelineTests(unittest.TestCase):
                     posted_at="2026-01-01T00:00:00+00:00",
                     scraped_at="2026-01-01T00:00:00+00:00",
                 )
-                pipeline.scraper.fetch_jobs = lambda: [(sample_job, {"sample": True})]
+                pipeline.scraper.fetch_jobs = lambda keyword=None: [(sample_job, {"sample": True})]
                 pipeline.run()
 
                 from doc_generator import GeneratedDocs
@@ -1611,7 +1611,7 @@ class PipelineTests(unittest.TestCase):
                     posted_at="2026-01-01T00:00:00+00:00",
                     scraped_at="2026-01-01T00:00:00+00:00",
                 )
-                pipeline.scraper.fetch_jobs = lambda: [(incoming_job, {"sample": True})]
+                pipeline.scraper.fetch_jobs = lambda keyword=None: [(incoming_job, {"sample": True})]
                 result = pipeline.run()
                 self.assertEqual(result.status, "completed")
                 self.assertEqual(result.jobs_matched, 0)

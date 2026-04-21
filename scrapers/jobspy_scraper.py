@@ -14,16 +14,17 @@ class JobSpyScraper:
     def __init__(self, config: JobBotConfig) -> None:
         self.config = config
 
-    def fetch_jobs(self) -> list[tuple[Job, dict[str, Any]]]:
+    def fetch_jobs(self, keyword: str | None = None) -> list[tuple[Job, dict[str, Any]]]:
         try:
             from jobspy import scrape_jobs
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("JobSpy is not installed. Run 'python -m pip install python-jobspy'.") from exc
 
+        kw = keyword or self.config.source.keyword
         results = scrape_jobs(
             site_name=self.config.source.jobspy_sites,
-            search_term=self.config.source.keyword,
-            google_search_term=f"{self.config.source.keyword} jobs in {self.config.source.location}".strip(),
+            search_term=kw,
+            google_search_term=f"{kw} jobs in {self.config.source.location}".strip(),
             location=self.config.source.location or None,
             results_wanted=self.config.source.results_per_page,
             hours_old=max(min(self.config.source.days_back, 3) * 24, 24),

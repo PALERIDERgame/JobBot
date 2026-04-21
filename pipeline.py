@@ -104,8 +104,15 @@ class JobBotPipeline:
         strong_parse_failures = 0
         try:
             validate_config_for_run(self.config, self.paths)
-            self.database.update_run(run_id, stage="scraping", message="Fetching jobs")
-            fetched = self.scraper.fetch_jobs()
+            all_keywords = [self.config.source.keyword] + list(self.config.source.additional_keywords)
+            self.database.update_run(run_id, stage="scraping", message=f"Fetching jobs ({len(all_keywords)} keyword(s))")
+            seen_fetch_ids: set[str] = set()
+            fetched: list[tuple[object, dict]] = []
+            for kw in all_keywords:
+                for job, payload in self.scraper.fetch_jobs(keyword=kw):
+                    if job.id not in seen_fetch_ids:
+                        seen_fetch_ids.add(job.id)
+                        fetched.append((job, payload))
             jobs_seen = len(fetched)
 
             self.database.update_run(run_id, stage="filtering", message="Applying deterministic filters", jobs_seen=jobs_seen)

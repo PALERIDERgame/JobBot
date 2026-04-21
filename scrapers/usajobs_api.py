@@ -25,12 +25,12 @@ class USAJobsScraper:
         self.config = config
         self.proxy_cycle = cycle(config.proxy_list) if config.proxy_list else None
 
-    def fetch_jobs(self) -> list[tuple[Job, dict[str, Any]]]:
+    def fetch_jobs(self, keyword: str | None = None) -> list[tuple[Job, dict[str, Any]]]:
         if not self.config.source.enabled:
             return []
 
         params = {
-            "Keyword": self.config.source.keyword,
+            "Keyword": keyword or self.config.source.keyword,
             "LocationName": self.config.source.location,
             "ResultsPerPage": self.config.source.results_per_page,
             "DatePosted": min(self.config.source.days_back, 3),

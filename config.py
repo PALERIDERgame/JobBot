@@ -48,6 +48,7 @@ class SourceConfig:
     adzuna_country: str = "us"
     adzuna_category: str = ""
     adzuna_sort: str = "date"
+    additional_keywords: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
