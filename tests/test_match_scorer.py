@@ -160,7 +160,7 @@ class MatchScorerTests(unittest.TestCase):
     def test_openai_gpt5_request_kwargs_omit_temperature(self) -> None:
         scorer = MatchScorer(JobBotConfig())
         kwargs, mode = scorer._openai_chat_request_kwargs("gpt-5-mini")
-        self.assertEqual(kwargs["max_completion_tokens"], 700)
+        self.assertEqual(kwargs["max_completion_tokens"], 4000)
         self.assertNotIn("temperature", kwargs)
         self.assertEqual(mode, "openai_chat_compact")
 
@@ -371,14 +371,119 @@ class MatchScorerTests(unittest.TestCase):
         self.assertEqual(result.status, "error")
         self.assertTrue(result.error_message.startswith("invalid_payload_shape:"))
 
-    def test_suggest_job_keywords_returns_space_separated_terms(self) -> None:
-        config = JobBotConfig(cheap_stage_provider="openai", cheap_stage_model="gpt-5-nano", openai_api_key="openai-test")
+    def test_suggest_job_keywords_returns_combined_group_query(self) -> None:
+        config = JobBotConfig(cheap_stage_provider="ollama_local", cheap_stage_model="qwen2.5:7b")
         scorer = MatchScorer(config)
-        scorer._build_client = MagicMock(return_value=object())
-        scorer._create_completion = MagicMock(return_value='{"keywords": ["python developer", "automation", "llm tools", "api integration"]}')
-        resume = ResumeData("", "", "Jane", "jane@example.com", "", "Python engineer", ["Python", "Automation"], ["Built APIs"])
+        scorer._build_client = MagicMock(return_value=None)
+        resume = ResumeData(
+            "",
+            "",
+            "Jane",
+            "jane@example.com",
+            "",
+            "Python engineer focused on automation and APIs",
+            ["Python", "Automation", "APIs"],
+            ["Built APIs and automation systems"],
+            work_experience_entries=[ResumeWorkEntry("Python Developer | Acme", "2024", ["Built APIs"])],
+        )
         result = scorer.suggest_job_keywords(resume)
-        self.assertEqual(result, "python developer automation llm tools api integration")
+        self.assertIn("python developer", result)
+        self.assertIn("automation", result)
+
+    def test_suggest_job_keyword_groups_returns_structured_buckets(self) -> None:
+        config = JobBotConfig(cheap_stage_provider="ollama_local", cheap_stage_model="qwen2.5:7b")
+        scorer = MatchScorer(config)
+        scorer._build_client = MagicMock(return_value=None)
+        resume = ResumeData(
+            "",
+            "",
+            "Jane",
+            "jane@example.com",
+            "",
+            "Political organizing and campaign operations leader",
+            ["Field Organizing", "CRM", "Analytics"],
+            ["Led campaign operations and field organizing programs."],
+            key_skills_lines=["Political campaigns", "Community organizing"],
+            work_experience_entries=[ResumeWorkEntry("Organizing Director | Example Org", "2024", ["Managed field organizing teams"])],
+        )
+        result = scorer.suggest_job_keyword_groups(resume)
+        self.assertIn("organizing director", result.core_titles)
+        self.assertTrue(any(term in result.adjacent_titles for term in ("community organizer", "field organizer", "campaign coordinator")))
+        self.assertTrue(any(term in result.domains for term in ("community organizing", "political campaigns", "field organizing")))
+        self.assertTrue(result.combined_query)
+
+    def test_suggest_job_keyword_groups_filters_employer_and_location_lines_from_core_titles(self) -> None:
+        config = JobBotConfig(cheap_stage_provider="ollama_local", cheap_stage_model="qwen2.5:7b")
+        scorer = MatchScorer(config)
+        scorer._build_client = MagicMock(return_value=None)
+        resume = ResumeData(
+            "",
+            "",
+            "Jane",
+            "jane@example.com",
+            "",
+            "Digital marketing and organizing leader",
+            ["CRM", "Analytics", "Digital Marketing"],
+            ["Led digital campaigns and organizing programs."],
+            work_experience_entries=[
+                ResumeWorkEntry("Underdog Strategies, New York, NY", "2024", ["Campaign work"]),
+                ResumeWorkEntry("Behavioral Associates, New York, NY", "2023", ["Client services"]),
+                ResumeWorkEntry("Digital Marketing Manager - Acceleration Strategies, Brooklyn, NY", "2022", ["Owned growth marketing"]),
+            ],
+        )
+        result = scorer.suggest_job_keyword_groups(resume)
+        self.assertIn("digital marketing manager", result.core_titles)
+        self.assertNotIn("underdog strategies, new york, ny", result.core_titles)
+        self.assertNotIn("behavioral associates, new york, ny", result.core_titles)
+
+    def test_suggest_job_keyword_groups_filters_campaign_entities_from_core_titles(self) -> None:
+        config = JobBotConfig(cheap_stage_provider="ollama_local", cheap_stage_model="qwen2.5:7b")
+        scorer = MatchScorer(config)
+        scorer._build_client = MagicMock(return_value=None)
+        resume = ResumeData(
+            "",
+            "",
+            "Jane",
+            "jane@example.com",
+            "",
+            "Political and digital campaign operator",
+            ["CRM", "Analytics", "Digital Marketing"],
+            ["Led political campaign work and digital fundraising."],
+            work_experience_entries=[
+                ResumeWorkEntry("Bloomberg 2020 Campaign", "2020", ["Campaign operations"]),
+                ResumeWorkEntry("Political Campaign Work", "2019", ["Field work"]),
+                ResumeWorkEntry("Field Organizer", "2018", ["Grassroots organizing"]),
+            ],
+        )
+        result = scorer.suggest_job_keyword_groups(resume)
+        self.assertIn("field organizer", result.core_titles)
+        self.assertNotIn("bloomberg 2020 campaign", result.core_titles)
+        self.assertNotIn("political campaign work", result.core_titles)
+
+    def test_suggest_job_keyword_groups_recovers_core_titles_from_summary_and_experience(self) -> None:
+        config = JobBotConfig(cheap_stage_provider="ollama_local", cheap_stage_model="qwen2.5:7b")
+        scorer = MatchScorer(config)
+        scorer._build_client = MagicMock(return_value=None)
+        resume = ResumeData(
+            "",
+            "",
+            "Jane",
+            "jane@example.com",
+            "",
+            "Digital marketing and organizing leader with campaign operations experience.",
+            ["CRM", "Analytics", "Digital Marketing"],
+            [
+                "Led digital marketing strategy across campaigns.",
+                "Owned campaign operations and field organizing execution.",
+                "Handled project management, analytics, and CRM workflows.",
+            ],
+            work_experience_entries=[
+                ResumeWorkEntry("Bloomberg 2020 Campaign", "2020", ["Campaign operations"]),
+                ResumeWorkEntry("Political Campaign Work", "2019", ["Field work"]),
+            ],
+        )
+        result = scorer.suggest_job_keyword_groups(resume)
+        self.assertTrue(any(title in result.core_titles for title in ("digital marketing manager", "campaign manager", "field organizer")))
 
     def test_tailor_documents_with_ai_returns_structured_payload(self) -> None:
         config = JobBotConfig(doc_stage_provider="openai", doc_stage_model="gpt-5-mini", openai_api_key="openai-test")

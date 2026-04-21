@@ -149,6 +149,17 @@ class OpenAIScoringCompletionResult:
     shape_summary: str
 
 
+@dataclass(slots=True)
+class FitResumeSuggestions:
+    combined_query: str
+    core_titles: list[str]
+    adjacent_titles: list[str]
+    domains: list[str]
+    skills_tools: list[str]
+    broadening_terms: list[str]
+    rationale_by_term: dict[str, str]
+
+
 class ScoringResponseError(RuntimeError):
     def __init__(self, code: str, detail: str, *, preview: str = "") -> None:
         super().__init__(f"{code}: {detail}")
@@ -350,6 +361,10 @@ class MatchScorer:
         )
 
     def suggest_job_keywords(self, resume_data: ResumeData) -> str:
+        return self.suggest_job_keyword_groups(resume_data).combined_query
+
+    def suggest_job_keyword_groups(self, resume_data: ResumeData) -> FitResumeSuggestions:
+        suggestions = self._build_fit_resume_suggestions(resume_data)
         provider = self.config.cheap_stage_provider
         model = self.config.cheap_stage_model
         if provider == "ollama_local" and self._build_client(provider) is None:
@@ -357,33 +372,13 @@ class MatchScorer:
             if fallback is not None:
                 provider, model = fallback
         if self._build_client(provider) is None:
-            raise RuntimeError(f"{provider} is not configured or available.")
-
-        prompt = {
-            "resume_summary": self._resume_summary(resume_data),
-            "instructions": {
-                "return_json": True,
-                "fields": ["keywords"],
-                "goal": (
-                    "Generate concise job-search keywords based on the candidate's resume. "
-                    "Favor titles, domains, skills, and adjacent search terms that will improve job-board recall."
-                ),
-                "constraints": [
-                    "Return 8 to 16 keywords or short keyword phrases.",
-                    "Keep each keyword or phrase to 1 to 3 words.",
-                    "Do not include personal names, emails, or phone numbers.",
-                ],
-            },
-        }
-        system_prompt = (
-            "You generate job search keywords from resumes. "
-            "Return only valid JSON with a single key named keywords whose value is an array of strings."
-        )
-        text = self._create_completion(provider, model, prompt, system_prompt=system_prompt)
-        keywords = self._parse_keyword_response(text)
-        if not keywords:
-            raise RuntimeError("Keyword suggestion returned no usable terms.")
-        return " ".join(keywords)
+            return suggestions
+        try:
+            ai_suggestions = self._ai_expand_fit_resume_suggestions(provider, model, resume_data)
+        except Exception:  # pragma: no cover
+            LOGGER.exception("Fit-to-resume AI expansion failed; using deterministic suggestions only.")
+            return suggestions
+        return self._merge_fit_resume_suggestions(suggestions, ai_suggestions)
 
     def document_generation_notes(self, job: Job, resume_data: ResumeData, strong_eval: StageEvaluation) -> str:
         provider, model = self._resolve_doc_provider_model()
@@ -943,6 +938,408 @@ class MatchScorer:
         overlap = sorted(job_terms & resume_terms)
         return overlap
 
+    def _build_fit_resume_suggestions(self, resume_data: ResumeData) -> FitResumeSuggestions:
+        role_titles = self._extract_resume_titles(resume_data)
+        core_titles = self._dedupe_phrases(role_titles[:6], limit=5)
+        title_tokens = self._tokenize_terms(" ".join(core_titles))
+        evidence_text = " ".join(
+            part
+            for part in [
+                resume_data.summary,
+                " ".join(resume_data.skills),
+                " ".join(resume_data.key_skills_lines),
+                " ".join(resume_data.experience_lines[:20]),
+            ]
+            if part
+        )
+        evidence_tokens = self._tokenize_terms(evidence_text)
+        adjacent_titles = self._adjacent_titles_for_tokens(title_tokens | evidence_tokens)
+        domains = self._extract_resume_domains(resume_data)
+        skills_tools = self._extract_fit_resume_skills(resume_data)
+        broadening_terms = self._broadening_terms_for_tokens(title_tokens | evidence_tokens, domains, skills_tools)
+        combined_terms = self._dedupe_phrases(
+            core_titles[:3] + adjacent_titles[:2] + domains[:2] + skills_tools[:2] + broadening_terms[:1],
+            limit=8,
+        )
+        rationale_by_term: dict[str, str] = {}
+        for term in core_titles:
+            rationale_by_term[term] = "Direct role evidence from resume titles."
+        for term in adjacent_titles:
+            rationale_by_term.setdefault(term, "Adjacent title derived from resume skills and experience.")
+        for term in domains:
+            rationale_by_term.setdefault(term, "Domain phrase repeated in summary, skills, or experience.")
+        for term in skills_tools:
+            rationale_by_term.setdefault(term, "Skill or tool explicitly present in the resume.")
+        for term in broadening_terms:
+            rationale_by_term.setdefault(term, "Broader recall term inferred from multiple resume signals.")
+        return FitResumeSuggestions(
+            combined_query=" ".join(combined_terms),
+            core_titles=core_titles,
+            adjacent_titles=adjacent_titles,
+            domains=domains,
+            skills_tools=skills_tools,
+            broadening_terms=broadening_terms,
+            rationale_by_term=rationale_by_term,
+        )
+
+    def _ai_expand_fit_resume_suggestions(self, provider: str, model: str, resume_data: ResumeData) -> FitResumeSuggestions:
+        prompt = {
+            "resume_summary": self._resume_summary(resume_data),
+            "instructions": {
+                "return_json": True,
+                "fields": [
+                    "core_titles",
+                    "adjacent_titles",
+                    "domains",
+                    "skills_tools",
+                    "broadening_terms",
+                ],
+                "goal": (
+                    "Generate grouped job-search suggestions from the resume. "
+                    "Favor search recall while staying grounded in direct or adjacent evidence from the resume."
+                ),
+                "constraints": [
+                    "Keep each item to 1 to 4 words.",
+                    "Avoid personal names, company names, emails, and phone numbers.",
+                    "Do not emit generic standalone terms like manager or operations unless paired with a domain.",
+                    "Only use adjacent titles when they are plausibly supported by the resume.",
+                ],
+            },
+        }
+        system_prompt = (
+            "You generate grouped job search suggestions from resumes. "
+            "Return only valid JSON with keys core_titles, adjacent_titles, domains, skills_tools, and broadening_terms."
+        )
+        text = self._create_completion(provider, model, prompt, system_prompt=system_prompt)
+        payload = self._parse_fit_resume_payload(text)
+        return FitResumeSuggestions(
+            combined_query="",
+            core_titles=payload["core_titles"],
+            adjacent_titles=payload["adjacent_titles"],
+            domains=payload["domains"],
+            skills_tools=payload["skills_tools"],
+            broadening_terms=payload["broadening_terms"],
+            rationale_by_term={},
+        )
+
+    def _merge_fit_resume_suggestions(
+        self,
+        base: FitResumeSuggestions,
+        ai_suggestions: FitResumeSuggestions,
+    ) -> FitResumeSuggestions:
+        core_titles = self._dedupe_phrases(base.core_titles + ai_suggestions.core_titles, limit=5)
+        adjacent_titles = self._dedupe_phrases(base.adjacent_titles + ai_suggestions.adjacent_titles, limit=6)
+        domains = self._dedupe_phrases(base.domains + ai_suggestions.domains, limit=6)
+        skills_tools = self._dedupe_phrases(base.skills_tools + ai_suggestions.skills_tools, limit=8)
+        broadening_terms = self._dedupe_phrases(base.broadening_terms + ai_suggestions.broadening_terms, limit=6)
+        combined_query = " ".join(
+            self._dedupe_phrases(core_titles[:3] + adjacent_titles[:2] + domains[:2] + skills_tools[:2] + broadening_terms[:1], limit=8)
+        )
+        rationale_by_term = dict(base.rationale_by_term)
+        for group, terms in (
+            ("Adjacent title suggested by grouped search expansion.", adjacent_titles),
+            ("Domain suggested by grouped search expansion.", domains),
+            ("Skill/tool suggested by grouped search expansion.", skills_tools),
+            ("Broad recall term suggested by grouped search expansion.", broadening_terms),
+        ):
+            for term in terms:
+                rationale_by_term.setdefault(term, group)
+        return FitResumeSuggestions(
+            combined_query=combined_query,
+            core_titles=core_titles,
+            adjacent_titles=adjacent_titles,
+            domains=domains,
+            skills_tools=skills_tools,
+            broadening_terms=broadening_terms,
+            rationale_by_term=rationale_by_term,
+        )
+
+    def _extract_resume_titles(self, resume_data: ResumeData) -> list[str]:
+        titles: list[str] = []
+        for entry in resume_data.work_experience_entries:
+            normalized = self._normalize_resume_title(entry.role_line)
+            if normalized:
+                titles.append(normalized)
+        if not titles:
+            text_blocks = [resume_data.summary] + list(resume_data.experience_lines[:8])
+            for block in text_blocks:
+                if block:
+                    titles.extend(self._candidate_titles_from_text(block))
+        return self._dedupe_phrases(titles, limit=8)
+
+    def _normalize_resume_title(self, role_line: str) -> str:
+        text = re.sub(r"\s+", " ", role_line or "").strip().lower()
+        if not text:
+            return ""
+        text = re.split(r"\s+[—–-]\s+|\s+\|\s+|\s+at\s+", text, maxsplit=1)[0].strip()
+        text = re.sub(r",\s*[a-z .'-]+,\s*[a-z]{2}(?:\s+\d{5})?$", "", text).strip()
+        text = re.sub(r",\s*[a-z]{2}(?:\s+\d{5})?$", "", text).strip()
+        if "," in text:
+            first_segment = text.split(",", 1)[0].strip()
+            if self._looks_like_resume_title(first_segment):
+                text = first_segment
+        text = re.sub(r"\b(contract|consultant|freelance|freelancer)\b", "", text).strip()
+        if len(text.split()) > 6:
+            return ""
+        if text in {"present", "current"}:
+            return ""
+        if any(token in text for token in ("@", "http://", "https://")):
+            return ""
+        if not self._looks_like_resume_title(text):
+            return ""
+        return text
+
+    @staticmethod
+    def _looks_like_resume_title(text: str) -> bool:
+        title_tokens = {
+            "manager",
+            "director",
+            "analyst",
+            "coordinator",
+            "specialist",
+            "developer",
+            "engineer",
+            "organizer",
+            "organising",
+            "organizing",
+            "operations",
+            "marketing",
+            "communications",
+            "communication",
+            "policy",
+            "program",
+            "project",
+            "community",
+            "strategist",
+            "assistant",
+            "associate",
+            "lead",
+            "officer",
+            "designer",
+            "writer",
+            "research",
+            "researcher",
+            "recruiter",
+            "campaign",
+            "field",
+            "digital",
+            "growth",
+        }
+        strong_title_tokens = {
+            "manager",
+            "director",
+            "coordinator",
+            "specialist",
+            "developer",
+            "engineer",
+            "organizer",
+            "analyst",
+            "assistant",
+            "associate",
+            "lead",
+            "officer",
+            "designer",
+            "writer",
+            "researcher",
+            "recruiter",
+        }
+        company_tokens = {
+            "llc",
+            "inc",
+            "corp",
+            "corporation",
+            "company",
+            "partners",
+            "group",
+            "agency",
+            "associates",
+            "strategies",
+            "campaigns",
+            "studio",
+            "media",
+        }
+        tokens = set(re.findall(r"[a-z]+", text or ""))
+        if not tokens:
+            return False
+        if "work" in tokens:
+            return False
+        if any(char.isdigit() for char in text) and not (tokens & title_tokens):
+            return False
+        if any(char.isdigit() for char in text) and not (tokens & strong_title_tokens):
+            return False
+        if "campaign" in tokens and not (tokens & strong_title_tokens):
+            return False
+        if tokens & company_tokens and not (tokens & title_tokens):
+            return False
+        return bool(tokens & strong_title_tokens)
+
+    def _candidate_titles_from_text(self, text: str) -> list[str]:
+        phrases: list[str] = []
+        lower = (text or "").lower()
+        title_patterns = (
+            "software engineer",
+            "python developer",
+            "program manager",
+            "project manager",
+            "operations manager",
+            "marketing manager",
+            "digital marketing manager",
+            "marketing strategist",
+            "campaign manager",
+            "campaign coordinator",
+            "campaign director",
+            "organizer",
+            "field organizer",
+            "community organizer",
+            "policy analyst",
+            "communications manager",
+            "public affairs manager",
+            "business development",
+        )
+        for phrase in title_patterns:
+            if phrase in lower:
+                phrases.append(phrase)
+        token_set = set(re.findall(r"[a-z]+", lower))
+        heuristic_titles = (
+            ({"digital", "marketing"}, "digital marketing manager"),
+            ({"growth", "marketing"}, "growth marketing manager"),
+            ({"marketing", "operations"}, "marketing operations manager"),
+            ({"campaign", "manager"}, "campaign manager"),
+            ({"campaign", "coordinator"}, "campaign coordinator"),
+            ({"field", "organizer"}, "field organizer"),
+            ({"community", "organizer"}, "community organizer"),
+            ({"project", "management"}, "project manager"),
+            ({"program", "management"}, "program manager"),
+            ({"communications", "manager"}, "communications manager"),
+            ({"policy", "analyst"}, "policy analyst"),
+            ({"business", "development"}, "business development manager"),
+        )
+        for required_tokens, title in heuristic_titles:
+            if required_tokens <= token_set:
+                phrases.append(title)
+        return phrases
+
+    def _adjacent_titles_for_tokens(self, tokens: set[str]) -> list[str]:
+        suggestions: list[str] = []
+        mappings = {
+            "marketing": ["digital marketing", "growth marketing", "marketing operations"],
+            "campaign": ["campaign manager", "campaign operations", "field organizer"],
+            "operations": ["business operations", "program operations", "project manager"],
+            "organizing": ["community organizer", "field organizer", "organizing director"],
+            "organizer": ["community organizer", "field organizer", "campaign coordinator"],
+            "political": ["political coordinator", "campaign manager", "field organizer"],
+            "policy": ["policy analyst", "government affairs", "public affairs"],
+            "communications": ["communications manager", "public affairs", "external affairs"],
+            "sales": ["business development", "partnerships manager", "account management"],
+            "crm": ["crm manager", "lifecycle marketing", "marketing operations"],
+            "analytics": ["marketing analytics", "business intelligence", "revenue operations"],
+            "community": ["community manager", "community engagement", "organizing director"],
+        }
+        for token, variants in mappings.items():
+            if token in tokens:
+                suggestions.extend(variants)
+        return self._dedupe_phrases(suggestions, limit=6)
+
+    def _extract_resume_domains(self, resume_data: ResumeData) -> list[str]:
+        text = " ".join(
+            part
+            for part in [
+                resume_data.summary,
+                " ".join(resume_data.key_skills_lines),
+                " ".join(resume_data.experience_lines[:20]),
+            ]
+            if part
+        ).lower()
+        domain_patterns = (
+            "digital marketing",
+            "growth marketing",
+            "marketing operations",
+            "business operations",
+            "program operations",
+            "community organizing",
+            "field organizing",
+            "political campaigns",
+            "public affairs",
+            "government affairs",
+            "lead generation",
+            "stakeholder engagement",
+            "crm",
+            "analytics",
+            "fundraising",
+        )
+        matched = [phrase for phrase in domain_patterns if phrase in text]
+        if not matched:
+            matched = self._top_resume_ngrams(text, limit=4)
+        return self._dedupe_phrases(matched, limit=6)
+
+    def _extract_fit_resume_skills(self, resume_data: ResumeData) -> list[str]:
+        raw_terms = list(resume_data.skills) + list(resume_data.key_skills_lines)
+        cleaned: list[str] = []
+        for term in raw_terms:
+            normalized = re.sub(r"\s+", " ", str(term or "").strip().lower())
+            if not normalized or len(normalized.split()) > 4:
+                continue
+            if normalized in {"microsoft office", "office", "teamwork"}:
+                continue
+            cleaned.append(normalized)
+        return self._dedupe_phrases(cleaned, limit=8)
+
+    def _broadening_terms_for_tokens(self, tokens: set[str], domains: list[str], skills_tools: list[str]) -> list[str]:
+        suggestions: list[str] = []
+        if {"campaign", "political", "organizing"} & tokens:
+            suggestions.extend(["grassroots", "advocacy", "field operations"])
+        if {"marketing", "crm", "analytics"} & tokens:
+            suggestions.extend(["demand generation", "go to market", "customer lifecycle"])
+        if {"operations", "program", "project"} & tokens:
+            suggestions.extend(["cross-functional", "process improvement", "business systems"])
+        suggestions.extend(domains[:2])
+        suggestions.extend(skills_tools[:2])
+        return self._dedupe_phrases(suggestions, limit=6)
+
+    def _top_resume_ngrams(self, text: str, *, limit: int) -> list[str]:
+        tokens = [
+            token
+            for token in re.findall(r"[a-z0-9][a-z0-9+#./-]*", (text or "").lower())
+            if token not in _PRECHEAP_STOPWORDS and len(token) > 3
+        ]
+        ngrams: list[str] = []
+        for size in (2, 1):
+            for idx in range(0, max(len(tokens) - size + 1, 0)):
+                phrase = " ".join(tokens[idx:idx + size])
+                if phrase not in ngrams and not self._too_generic_fit_phrase(phrase):
+                    ngrams.append(phrase)
+                if len(ngrams) >= limit:
+                    return ngrams
+        return ngrams
+
+    @staticmethod
+    def _too_generic_fit_phrase(phrase: str) -> bool:
+        generic = {
+            "manager",
+            "operations",
+            "marketing",
+            "organizing",
+            "political",
+            "leadership",
+            "strategy",
+        }
+        tokens = phrase.split()
+        return len(tokens) == 1 and tokens[0] in generic
+
+    def _dedupe_phrases(self, phrases: list[str], *, limit: int) -> list[str]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for phrase in phrases:
+            normalized = re.sub(r"\s+", " ", str(phrase or "").strip().lower())
+            normalized = normalized.strip(",.;:")
+            if not normalized or normalized in seen or self._too_generic_fit_phrase(normalized):
+                continue
+            seen.add(normalized)
+            cleaned.append(normalized)
+            if len(cleaned) >= limit:
+                break
+        return cleaned
+
     @staticmethod
     def _build_resume_gate_text(resume_data: ResumeData) -> str:
         parts = [
@@ -1029,7 +1426,10 @@ class MatchScorer:
         return any(phrase.strip().lower() in lowered for phrase in phrases if phrase.strip())
 
     def _openai_chat_request_kwargs(self, model: str) -> tuple[dict[str, object], str]:
-        kwargs: dict[str, object] = {"max_completion_tokens": 700}
+        # gpt-5 reasoning models consume tokens on internal reasoning before emitting output;
+        # use a higher cap so the actual response isn't truncated.
+        token_cap = 4000 if model.startswith("gpt-5") else 700
+        kwargs: dict[str, object] = {"max_completion_tokens": token_cap}
         mode = "openai_chat_compact"
         if not model.startswith("gpt-5"):
             kwargs["temperature"] = 0
@@ -1416,7 +1816,7 @@ class MatchScorer:
                 {"role": "user", "content": json.dumps(prompt)},
             ],
             text={"format": {"type": "json_schema", "name": "job_match_scoring", "schema": self._scoring_json_schema(), "strict": True}},
-            max_output_tokens=1200,
+            max_output_tokens=4000,
         )
         text = self._extract_openai_response_text(response)
         if not text.strip():
@@ -1604,6 +2004,19 @@ class MatchScorer:
             if keyword:
                 cleaned.append(keyword)
         return cleaned[:16]
+
+    def _parse_fit_resume_payload(self, text: str) -> dict[str, list[str]]:
+        cleaned = self._extract_json_text(text)
+        if not cleaned.strip():
+            raise ValueError("fit-to-resume response was empty")
+        payload = json.loads(cleaned)
+        grouped: dict[str, list[str]] = {}
+        for key in ("core_titles", "adjacent_titles", "domains", "skills_tools", "broadening_terms"):
+            values = payload.get(key, [])
+            if not isinstance(values, list):
+                values = []
+            grouped[key] = self._dedupe_phrases([str(item) for item in values], limit=8)
+        return grouped
 
     @staticmethod
     def _validate_doc_provider_model(provider: str, model: str) -> str:
