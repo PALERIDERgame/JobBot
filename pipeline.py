@@ -222,6 +222,10 @@ class JobBotPipeline:
             LOGGER.info("AI shortlist sizes: fast_rank=%d cheap_top_n=%d", len(ranked), len(cheap_shortlist))
 
             cheap_results: list[tuple[Job, object, object, StageEvaluation]] = []
+            budget = self.config.max_run_cost_usd
+            if budget > 0 and run_cost >= budget:
+                LOGGER.warning("Spend cap reached ($%.4f >= $%.2f); skipping cheap AI stage.", run_cost, budget)
+                cheap_shortlist = []
             if cheap_shortlist:
                 self.database.update_run(
                     run_id,
@@ -297,6 +301,9 @@ class JobBotPipeline:
             )
 
             strong_results: list[tuple[Job, object, object, StageEvaluation, StageEvaluation]] = []
+            if budget > 0 and run_cost >= budget:
+                LOGGER.warning("Spend cap reached ($%.4f >= $%.2f); skipping strong AI stage.", run_cost, budget)
+                strong_shortlist = []
             if strong_shortlist:
                 self.database.update_run(
                     run_id,

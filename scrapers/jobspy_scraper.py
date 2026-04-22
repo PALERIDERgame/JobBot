@@ -6,6 +6,7 @@ from typing import Any
 from application_routing import infer_application_routing
 from config import JobBotConfig
 from database import Job
+from scrapers import scrape_with_retry
 
 
 class JobSpyScraper:
@@ -21,7 +22,7 @@ class JobSpyScraper:
             raise RuntimeError("JobSpy is not installed. Run 'python -m pip install python-jobspy'.") from exc
 
         kw = keyword or self.config.source.keyword
-        results = scrape_jobs(
+        results = scrape_with_retry(lambda: scrape_jobs(
             site_name=self.config.source.jobspy_sites,
             search_term=kw,
             google_search_term=f"{kw} jobs in {self.config.source.location}".strip(),
@@ -29,7 +30,7 @@ class JobSpyScraper:
             results_wanted=self.config.source.results_per_page,
             hours_old=max(min(self.config.source.days_back, 3) * 24, 24),
             country_indeed="USA",
-        )
+        ))
         rows = self._normalize_rows(results)
         jobs: list[tuple[Job, dict[str, Any]]] = []
         scraped_at = datetime.now(timezone.utc).isoformat()

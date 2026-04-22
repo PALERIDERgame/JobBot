@@ -71,12 +71,35 @@ Analysis based on: deep codebase audit, competitive research (LazyApply, Simplif
 
 ---
 
+## Remediation packages (planned — 2026-04-21)
+
+### Package F — Reliability & Cost Control
+- `max_run_cost_usd` config field: pipeline aborts (gracefully) before each AI call if `run_cost` exceeds budget. Prevents surprise bills on large batches.
+- Scraper retry + exponential backoff: all three scrapers (Adzuna, JobSpy, USAJobs) now wrap HTTP calls in a 3-attempt retry loop. Improves reliability on flaky networks and rate-limited APIs.
+- `ai_scoring_timeout_seconds` config field (default 60s): wraps each `_call_with_retry` call so a hung API call cannot freeze the pipeline indefinitely.
+
+### Package G — Search Quality
+- Enhanced pre-cheap gate: `_build_resume_gate_text` now includes work experience role titles (repeated for TF-IDF weight), giving the TF-IDF gate a better signal on semantically matching roles that use different keywords.
+- Title semantics bonus in `precheap_gate`: job title tokens checked against `target_titles` config; matching titles get a +10 gate score bonus, reducing false rejections on role-title variants.
+
+### Package H — Database & Search
+- Missing index on `match_results(score_source, verification_stage)`: speeds up review queue loading as job history grows.
+- SQLite FTS5 virtual table on job descriptions: enables fast keyword search across the corpus without slow `LIKE` queries.
+
+### Package I — Dashboard UX
+- Config presets: "Conservative", "Aggressive", "USAJobs Only", "Local Only" presets auto-populate key config fields from the Setup tab via a dropdown. Reduces friction when switching search strategies.
+
+---
+
 ## Explicitly deferred
 
 - **API key encryption** — plaintext on a personal local machine is acceptable risk; OS credential store adds complexity for negligible gain
 - **Pipeline checkpoint/resume** — significant architecture change; current model is fine for personal use
 - **Bulk approve/reject** — low usage frequency; not worth UI complexity now
 - **Full portal autofill expansion** — track which portals appear in outcomes data first, then prioritize
+- **CSV export from Approval tab** — useful but lower priority than search/filtering improvements
+- **Outcome time tracking** — `days_to_outcome` column deferred until enough outcome data exists to be useful
+- **Multi-source parallel scraping** — worthwhile but requires deduplication logic; revisit when single-source is stable
 
 ---
 

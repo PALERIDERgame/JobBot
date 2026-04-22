@@ -15,7 +15,7 @@ Complete field-by-field reference for `%APPDATA%\JobBot\config.yaml`. Edit via t
 |---|---|---|---|
 | `enabled` | bool | `true` | Enable/disable scraping |
 | `provider` | str | `jobspy` | `jobspy`, `usajobs`, `adzuna` |
-| `keyword` | str | `software engineer` | Free text search phrase |
+| `keyword` | str | `software engineer` | Main search phrase. Fit to Resume now fills this with the combined query preview |
 | `location` | str | *(empty)* | Optional city/state or blank |
 | `jobspy_sites` | list | `[indeed, google]` | `indeed`, `google`, `linkedin` |
 | `results_per_page` | int | `100` | Must be > 0 |
@@ -63,10 +63,10 @@ Complete field-by-field reference for `%APPDATA%\JobBot\config.yaml`. Edit via t
 | `scoring_threshold` | int | `30` | 0–100; display cutoff in dashboard |
 | `resume_source_path` | str | *(empty)* | Absolute path to resume file |
 | `output_dir` | str | `output` | Absolute or relative path |
-| `include_titles` | list | `[software engineer, python developer]` | Substring match, case-insensitive |
+| `include_titles` | list | `[software engineer, python developer]` | Adjacent-fit titles; substring match, case-insensitive |
 | `exclude_titles` | list | `[principal, sales, designer]` | Substring match, case-insensitive |
 | `force_escalate_keywords` | list | `[python, automation, llm, agent]` | Bypass AI, go straight to queue |
-| `target_titles` | list | `[software engineer, python developer]` | Scoring context |
+| `target_titles` | list | `[software engineer, python developer]` | Direct-fit titles used by fast-rank title scoring |
 | `salary_floor` | int | `0` | Min annual salary; 0 to disable |
 | `cheap_reject_threshold` | int | `25` | 0–100; must be <= cheap_escalate |
 | `cheap_escalate_threshold` | int | `35` | 0–100 |

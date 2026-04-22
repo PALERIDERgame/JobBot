@@ -240,6 +240,23 @@ class JobBotDashboard:
 
         frame = inner
         frame.columnconfigure(2, weight=1)
+
+        # Preset row
+        preset_label = ttk.Label(frame, text="Apply preset")
+        preset_label.grid(row=0, column=0, sticky="w", pady=6, padx=(0, 10))
+        self._add_tooltip(preset_label, "Load a predefined configuration profile. Overwrites AI stage and threshold settings but keeps your API keys and resume path.")
+        self._preset_var = tk.StringVar(value="")
+        preset_combo = ttk.Combobox(
+            frame,
+            textvariable=self._preset_var,
+            values=["— choose preset —", "Conservative", "Aggressive", "USAJobs Only", "Local Only"],
+            state="readonly",
+            width=30,
+        )
+        preset_combo.grid(row=0, column=1, columnspan=2, sticky="w", pady=6)
+        preset_combo.bind("<<ComboboxSelected>>", self._apply_preset)
+        self._add_tooltip(preset_combo, "Conservative: skip AI, tighter filters. Aggressive: full AI, looser filters. USAJobs Only: switch source. Local Only: Ollama cheap stage.")
+
         labels = [
             ("Resume source", self.resume_var),
             ("Job keyword", self.keyword_var),
@@ -289,11 +306,11 @@ class JobBotDashboard:
         }
         for idx, (label, var) in enumerate(labels):
             label_widget = ttk.Label(frame, text=label)
-            label_widget.grid(row=idx, column=0, sticky="w", pady=6, padx=(0, 10))
+            label_widget.grid(row=idx + 1, column=0, sticky="w", pady=6, padx=(0, 10))
             self._add_tooltip(label_widget, FIELD_TOOLTIPS.get(label, label))
             if label == "Resume source":
                 action_frame = ttk.Frame(frame)
-                action_frame.grid(row=idx, column=1, sticky="w", pady=6, padx=(0, 10))
+                action_frame.grid(row=idx + 1, column=1, sticky="w", pady=6, padx=(0, 10))
                 open_button = ttk.Button(action_frame, text="Open Resume", command=self._open_resume_source)
                 open_button.pack(side="left", padx=(0, 8))
                 browse_button = ttk.Button(action_frame, text="Browse Resume", command=self._browse_resume)
@@ -301,33 +318,33 @@ class JobBotDashboard:
                 self._add_tooltip(open_button, "Open the configured source resume file from disk.")
                 self._add_tooltip(browse_button, "Choose a resume file to use as the source document.")
                 entry = ttk.Entry(frame, textvariable=var, width=70)
-                entry.grid(row=idx, column=2, sticky="ew", pady=6)
+                entry.grid(row=idx + 1, column=2, sticky="ew", pady=6)
                 self._bind_entry_autosave(entry)
                 self._add_tooltip(entry, FIELD_TOOLTIPS[label])
             elif label == "Client secrets path":
                 action_frame = ttk.Frame(frame)
-                action_frame.grid(row=idx, column=1, sticky="w", pady=6, padx=(0, 10))
+                action_frame.grid(row=idx + 1, column=1, sticky="w", pady=6, padx=(0, 10))
                 browse_button = ttk.Button(action_frame, text="Browse", command=self._browse_client_secrets)
                 browse_button.pack(side="left")
                 self._add_tooltip(browse_button, "Choose your Google OAuth client secrets JSON file.")
                 entry = ttk.Entry(frame, textvariable=var, width=70)
-                entry.grid(row=idx, column=2, sticky="ew", pady=6)
+                entry.grid(row=idx + 1, column=2, sticky="ew", pady=6)
                 self._bind_entry_autosave(entry)
                 self._add_tooltip(entry, FIELD_TOOLTIPS[label])
             elif label == "Job keyword":
                 action_frame = ttk.Frame(frame)
-                action_frame.grid(row=idx, column=1, sticky="w", pady=6, padx=(0, 10))
+                action_frame.grid(row=idx + 1, column=1, sticky="w", pady=6, padx=(0, 10))
                 fit_button = ttk.Button(action_frame, text="Fit to Resume", command=self._fit_to_resume)
                 fit_button.pack(side="left")
                 self.fit_resume_button = fit_button
                 self._add_tooltip(fit_button, FIELD_TOOLTIPS["Fit to Resume"])
                 entry = ttk.Entry(frame, textvariable=var, width=70)
-                entry.grid(row=idx, column=2, sticky="ew", pady=6)
+                entry.grid(row=idx + 1, column=2, sticky="ew", pady=6)
                 self._bind_entry_autosave(entry)
                 self._add_tooltip(entry, FIELD_TOOLTIPS[label])
             elif label in {"Source provider", "Automation mode", "Cheap stage provider", "Strong stage provider", "Doc stage provider"}:
                 combo = ttk.Combobox(frame, textvariable=var, values=values_map[label], state="readonly", width=67)
-                combo.grid(row=idx, column=1, columnspan=2, sticky="ew", pady=6)
+                combo.grid(row=idx + 1, column=1, columnspan=2, sticky="ew", pady=6)
                 if label == "Source provider":
                     combo.bind("<<ComboboxSelected>>", self._on_source_provider_changed, add="+")
                 if label == "Cheap stage provider":
@@ -342,7 +359,7 @@ class JobBotDashboard:
                 self._add_tooltip(combo, FIELD_TOOLTIPS[label])
             elif label in {"Cheap stage model", "Strong stage model", "Doc stage model"}:
                 combo = ttk.Combobox(frame, textvariable=var, state="readonly", width=67)
-                combo.grid(row=idx, column=1, columnspan=2, sticky="ew", pady=6)
+                combo.grid(row=idx + 1, column=1, columnspan=2, sticky="ew", pady=6)
                 combo.bind("<<ComboboxSelected>>", self._autosave_setup, add="+")
                 if label == "Cheap stage model":
                     self.cheap_stage_model_combo = combo
@@ -354,7 +371,7 @@ class JobBotDashboard:
             else:
                 show = "*" if label in {"Anthropic API key", "OpenAI API key", "USAJobs authorization key", "Adzuna app key"} else ""
                 entry = ttk.Entry(frame, textvariable=var, width=70, show=show)
-                entry.grid(row=idx, column=1, columnspan=2, sticky="ew", pady=6)
+                entry.grid(row=idx + 1, column=1, columnspan=2, sticky="ew", pady=6)
                 self._bind_entry_autosave(entry)
                 self._add_tooltip(entry, FIELD_TOOLTIPS[label])
 
@@ -363,19 +380,19 @@ class JobBotDashboard:
         self._sync_doc_model_dropdown()
 
         check = ttk.Checkbutton(frame, text="Enable Gmail delivery", variable=self.gmail_enabled_var, command=self._autosave_setup)
-        check.grid(row=len(labels), column=1, columnspan=2, sticky="w", pady=6)
+        check.grid(row=len(labels) + 1, column=1, columnspan=2, sticky="w", pady=6)
         self._add_tooltip(check, FIELD_TOOLTIPS["Enable Gmail delivery"])
         skip_ai_check = ttk.Checkbutton(frame, text="Skip AI scoring in semi_auto", variable=self.skip_ai_scoring_var, command=self._autosave_setup)
-        skip_ai_check.grid(row=len(labels) + 1, column=1, columnspan=2, sticky="w", pady=6)
+        skip_ai_check.grid(row=len(labels) + 2, column=1, columnspan=2, sticky="w", pady=6)
         self._add_tooltip(skip_ai_check, FIELD_TOOLTIPS["Skip AI scoring in semi_auto"])
         progressive_check = ttk.Checkbutton(frame, text="Enable progressive queue", variable=self.progressive_queue_enabled_var, command=self._autosave_setup)
-        progressive_check.grid(row=len(labels) + 2, column=1, columnspan=2, sticky="w", pady=6)
+        progressive_check.grid(row=len(labels) + 3, column=1, columnspan=2, sticky="w", pady=6)
         self._add_tooltip(progressive_check, FIELD_TOOLTIPS["Enable progressive queue"])
         precheap_check = ttk.Checkbutton(frame, text="Enable pre-cheap gate", variable=self.precheap_gate_enabled_var, command=self._autosave_setup)
-        precheap_check.grid(row=len(labels) + 3, column=1, columnspan=2, sticky="w", pady=6)
+        precheap_check.grid(row=len(labels) + 4, column=1, columnspan=2, sticky="w", pady=6)
         self._add_tooltip(precheap_check, FIELD_TOOLTIPS["Enable pre-cheap gate"])
         portal_row = ttk.Frame(frame)
-        portal_row.grid(row=len(labels) + 4, column=1, columnspan=2, sticky="ew", pady=(6, 0))
+        portal_row.grid(row=len(labels) + 5, column=1, columnspan=2, sticky="ew", pady=(6, 0))
         portal_row.columnconfigure(0, weight=1)
         portal_status = ttk.Label(portal_row, textvariable=self.portal_readiness_var)
         portal_status.grid(row=0, column=0, sticky="w")
@@ -385,7 +402,7 @@ class JobBotDashboard:
         self.portal_test_buttons.append(portal_test_button)
         self._add_tooltip(portal_test_button, "Run an in-app headless Chromium launch check and report the exact portal runtime readiness.")
         gmail_status = ttk.Label(frame, textvariable=self.gmail_readiness_var)
-        gmail_status.grid(row=len(labels) + 5, column=1, columnspan=2, sticky="w", pady=(6, 0))
+        gmail_status.grid(row=len(labels) + 6, column=1, columnspan=2, sticky="w", pady=(6, 0))
         self._add_tooltip(gmail_status, "Shows whether Gmail email sending looks configured before you try Approve and Send on email jobs.")
 
     def _build_run_tab(self, frame: ttk.Frame) -> None:
@@ -712,6 +729,39 @@ class JobBotDashboard:
         current = self.doc_stage_model_var.get().strip()
         if current not in models and models:
             self.doc_stage_model_var.set(models[0])
+
+    def _apply_preset(self, _event: object | None = None) -> None:
+        preset = self._preset_var.get()
+        if preset == "Conservative":
+            self.automation_mode_var.set("semi_auto")
+            self.skip_ai_scoring_var.set(True)
+            self.precheap_gate_enabled_var.set(True)
+            self.fast_rank_min_score_var.set("30")
+            self.cheap_ai_top_n_var.set("5")
+            self.strong_ai_top_n_var.set("2")
+            self.cheap_reject_threshold_var.set("60")
+            self.cheap_escalate_threshold_var.set("78")
+            self.final_apply_threshold_var.set("85")
+        elif preset == "Aggressive":
+            self.automation_mode_var.set("semi_auto")
+            self.skip_ai_scoring_var.set(False)
+            self.precheap_gate_enabled_var.set(False)
+            self.fast_rank_min_score_var.set("10")
+            self.cheap_ai_top_n_var.set("15")
+            self.strong_ai_top_n_var.set("5")
+            self.cheap_reject_threshold_var.set("40")
+            self.cheap_escalate_threshold_var.set("65")
+            self.final_apply_threshold_var.set("70")
+        elif preset == "USAJobs Only":
+            self.source_provider_var.set("usajobs")
+            self._on_source_provider_changed()
+        elif preset == "Local Only":
+            self.cheap_stage_provider_var.set("ollama_local")
+            self._on_cheap_provider_changed()
+        else:
+            return
+        self._autosave_setup()
+        self._preset_var.set("— choose preset —")
 
     def _autosave_setup(self, _event: object | None = None) -> bool:
         return self._save_config(show_status_only=True)

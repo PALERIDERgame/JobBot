@@ -13,6 +13,7 @@ from urllib.request import ProxyHandler, Request, build_opener
 from application_routing import infer_application_routing
 from config import JobBotConfig
 from database import Job
+from scrapers import scrape_with_retry
 
 
 LOGGER = logging.getLogger(__name__)
@@ -51,10 +52,14 @@ class USAJobsScraper:
 
         delay = random.uniform(self.config.rate_limit_min_seconds, self.config.rate_limit_max_seconds)
         time.sleep(delay)
-        request = Request(url, headers=headers, method="GET")
+        req = Request(url, headers=headers, method="GET")
         LOGGER.info("Fetching jobs from %s", url)
-        with opener.open(request, timeout=30) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+
+        def _fetch() -> dict:
+            with opener.open(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+
+        payload = scrape_with_retry(_fetch)
 
         items = payload.get("SearchResult", {}).get("SearchResultItems", [])
         jobs: list[tuple[Job, dict[str, Any]]] = []

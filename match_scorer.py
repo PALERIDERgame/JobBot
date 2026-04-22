@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -275,20 +276,24 @@ class MatchScorer:
         keyword_overlap_score = min(overlap_count * 5, 100)
         tfidf_score = self._tfidf_similarity_score(resume_text, job_text)
         gate_score = int(round((0.7 * tfidf_score) + (0.3 * keyword_overlap_score)))
+        title_bonus = self._precheap_title_bonus(job)
+        gate_score = min(100, gate_score + title_bonus)
         threshold = self.config.precheap_gate_reject_threshold
         decision = "reject" if gate_score < threshold else "pass"
         top_terms = overlap_terms[:10]
         reason = (
             f"Pre-cheap gate {decision}: tfidf={tfidf_score}, "
             f"overlap={overlap_count} ({', '.join(top_terms)})"
+            + (f", title_bonus={title_bonus}" if title_bonus else "")
         )
 
         LOGGER.info(
-            "precheap_gate job_id=%s gate_score=%s tfidf_score=%s overlap=%s terms=%s decision=%s threshold=%s",
+            "precheap_gate job_id=%s gate_score=%s tfidf_score=%s overlap=%s title_bonus=%s terms=%s decision=%s threshold=%s",
             job.id,
             gate_score,
             tfidf_score,
             overlap_count,
+            title_bonus,
             ",".join(top_terms),
             decision,
             threshold,
@@ -609,9 +614,14 @@ class MatchScorer:
             )
 
         try:
-            text, input_tokens, output_tokens = _call_with_retry(
-                lambda: self._create_completion_with_usage(provider, model, prompt)
-            )
+            timeout_s = int(self.config.ai_scoring_timeout_seconds or 60)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _tex:
+                _future = _tex.submit(_call_with_retry, lambda: self._create_completion_with_usage(provider, model, prompt))
+                try:
+                    text, input_tokens, output_tokens = _future.result(timeout=timeout_s)
+                except concurrent.futures.TimeoutError:
+                    _future.cancel()
+                    raise TimeoutError(f"AI scoring timed out after {timeout_s}s")
             parsed = self._parse_scoring_payload(text)
             payload = parsed.payload
             # Validate and clamp score to [0, 100]
@@ -1342,10 +1352,16 @@ class MatchScorer:
 
     @staticmethod
     def _build_resume_gate_text(resume_data: ResumeData) -> str:
+        role_titles = " ".join(
+            entry.role_line for entry in (resume_data.work_experience_entries or []) if entry.role_line
+        )
         parts = [
             resume_data.summary or "",
             " ".join(resume_data.skills or []),
             " ".join(resume_data.experience_lines or []),
+            " ".join(resume_data.key_skills_lines or []),
+            role_titles,
+            role_titles,  # repeated to weight titles more in TF-IDF
         ]
         return " ".join(part for part in parts if part).strip()
 
@@ -1364,6 +1380,14 @@ class MatchScorer:
             return int(round(float(similarity) * 100))
         except ValueError:
             return 0
+
+    def _precheap_title_bonus(self, job: Job) -> int:
+        """Return a gate score bonus when job title tokens overlap with configured target/include titles."""
+        title_tokens = self._tokenize_terms(job.title)
+        target_tokens = self._tokenize_terms(" ".join(self.config.target_titles + self.config.include_titles))
+        if title_tokens & target_tokens:
+            return 10
+        return 0
 
     def _title_match_score(self, title: str) -> int:
         title_lower = (title or "").lower()

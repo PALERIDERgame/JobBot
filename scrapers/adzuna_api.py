@@ -8,6 +8,7 @@ import requests
 from application_routing import infer_application_routing
 from config import JobBotConfig
 from database import Job
+from scrapers import scrape_with_retry
 
 
 class AdzunaScraper:
@@ -38,7 +39,7 @@ class AdzunaScraper:
             params["category"] = self.config.source.adzuna_category
 
         url = f"https://api.adzuna.com/v1/api/jobs/{country}/search/1"
-        response = requests.get(url, params=params, timeout=30)
+        response = scrape_with_retry(lambda: requests.get(url, params=params, timeout=30))
         response.raise_for_status()
         payload = response.json()
 

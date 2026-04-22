@@ -13,6 +13,7 @@ from dashboard import JobBotDashboard
 from doc_generator import GeneratedDocs
 from database import Job
 from gmail_client import DeliveryResult
+from match_scorer import FitResumeSuggestions
 from portal_filler import PortalAutofillReadiness
 from test_support import workspace_temp_dir
 
@@ -149,7 +150,7 @@ class DashboardSmokeTests(unittest.TestCase):
                     root.destroy()
 
     @unittest.skipIf(os.environ.get("CI") == "true", "Skipping Tk smoke test in CI")
-    def test_fit_to_resume_applies_keywords_and_persists(self) -> None:
+    def test_fit_to_resume_applies_grouped_suggestions_and_persists(self) -> None:
         with workspace_temp_dir() as tmp:
             with patch.dict(os.environ, {"APPDATA": str(tmp)}):
                 paths = build_app_paths()
@@ -160,11 +161,25 @@ class DashboardSmokeTests(unittest.TestCase):
                 root.withdraw()
                 try:
                     dashboard = JobBotDashboard(root, config, paths, database)
-                    dashboard._apply_fit_to_resume_keywords("python developer automation llm")
+                    dashboard._apply_fit_to_resume_suggestions(
+                        FitResumeSuggestions(
+                            combined_query="python developer automation llm",
+                            core_titles=["python developer", "software engineer"],
+                            adjacent_titles=["automation engineer", "platform engineer"],
+                            domains=["developer tools"],
+                            skills_tools=["python", "apis"],
+                            broadening_terms=["workflow automation"],
+                            rationale_by_term={"python developer": "Direct title evidence."},
+                        )
+                    )
                     reloaded = load_or_create_config(paths)
                     self.assertEqual(dashboard.keyword_var.get(), "python developer automation llm")
+                    self.assertEqual(dashboard.target_titles_var.get(), "python developer, software engineer")
+                    self.assertEqual(dashboard.include_titles_var.get(), "automation engineer, platform engineer")
                     self.assertEqual(reloaded.source.keyword, "python developer automation llm")
-                    self.assertEqual(dashboard.status_var.get(), "Resume-fit keywords generated. Review and edit them before running.")
+                    self.assertEqual(reloaded.target_titles, ["python developer", "software engineer"])
+                    self.assertEqual(reloaded.include_titles, ["automation engineer", "platform engineer"])
+                    self.assertEqual(dashboard.status_var.get(), "Resume-fit suggestions applied. Review and edit them before running.")
                 finally:
                     root.destroy()
 
@@ -370,7 +385,7 @@ class DashboardSmokeTests(unittest.TestCase):
                     try:
                         dashboard = JobBotDashboard(root, config, paths, database)
                         values = dashboard.review_tree.item("email-present-row", "values")
-                        self.assertEqual(values[5], "present")
+                        self.assertEqual(values[6], "present")
                     finally:
                         root.destroy()
                 finally:

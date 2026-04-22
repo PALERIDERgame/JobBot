@@ -229,9 +229,17 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status);
                 CREATE INDEX IF NOT EXISTS idx_jobs_scraped_at ON jobs(scraped_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_match_results_status ON match_results(status);
+                CREATE INDEX IF NOT EXISTS idx_match_results_score_source ON match_results(score_source, verification_stage);
                 CREATE INDEX IF NOT EXISTS idx_ai_evaluations_job_stage ON ai_evaluations(job_id, stage_name);
                 CREATE INDEX IF NOT EXISTS idx_outcomes_job_id ON outcomes(job_id);
                 CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at DESC);
+
+                CREATE VIRTUAL TABLE IF NOT EXISTS jobs_fts USING fts5(
+                    job_id UNINDEXED,
+                    title,
+                    employer,
+                    description_full
+                );
             """
         )
         self._ensure_column("generated_documents", "resume_docx_path", "TEXT NOT NULL DEFAULT ''")
@@ -441,6 +449,11 @@ class Database:
                     job.scraped_at,
                     payload,
                 ),
+            )
+            connection.execute("DELETE FROM jobs_fts WHERE job_id = ?", (job.id,))
+            connection.execute(
+                "INSERT INTO jobs_fts(job_id, title, employer, description_full) VALUES (?, ?, ?, ?)",
+                (job.id, job.title, job.employer, job.description_full),
             )
             connection.commit()
 
@@ -914,6 +927,18 @@ class Database:
             (job_id,),
         ).fetchone()
         return dict(row) if row else None
+
+    def search_jobs_fts(self, query: str, *, limit: int = 100) -> list[str]:
+        """Return job IDs whose title, employer, or description match the FTS query."""
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                "SELECT job_id FROM jobs_fts WHERE jobs_fts MATCH ? ORDER BY rank LIMIT ?",
+                (query, limit),
+            ).fetchall()
+            return [str(row["job_id"]) for row in rows]
+        except Exception:
+            return []
 
     def recent_job_ids(self, *, hours: int = 24, before_scraped_at: str | None = None) -> set[str]:
         cutoff = (datetime.now(timezone.utc)).timestamp() - (hours * 3600)

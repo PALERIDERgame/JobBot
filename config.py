@@ -120,6 +120,8 @@ class JobBotConfig:
     work_authorization_required_terms: list[str] = field(
         default_factory=lambda: ["us citizen", "u.s. citizen", "citizenship required", "security clearance required", "no sponsorship"]
     )
+    ai_scoring_timeout_seconds: int = 60
+    max_run_cost_usd: float = 0.0
     anthropic_api_key: str = ""
     openai_api_key: str = ""
 
@@ -272,6 +274,8 @@ def load_or_create_config(paths: AppPaths) -> JobBotConfig:
                 ["us citizen", "u.s. citizen", "citizenship required", "security clearance required", "no sponsorship"],
             )
         ),
+        ai_scoring_timeout_seconds=int(raw.get("ai_scoring_timeout_seconds", 60)),
+        max_run_cost_usd=float(raw.get("max_run_cost_usd", 0.0)),
         anthropic_api_key=str(raw.get("anthropic_api_key", "")),
         openai_api_key=str(raw.get("openai_api_key", "")),
     )

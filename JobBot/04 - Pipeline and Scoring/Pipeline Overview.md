@@ -53,6 +53,20 @@ flowchart TD
 
 **Auto:** Jobs above `final_apply_threshold` with an email apply method are sent automatically. Semi-auto is strongly recommended until you trust the scoring.
 
+## Resume-fit search planning
+
+Before a run starts, the **Fit to Resume** button in the Config tab can now build grouped search suggestions from the configured resume.
+
+It produces:
+
+- a combined query for `source.keyword`
+- direct-fit titles for `target_titles`
+- adjacent titles for `include_titles`
+
+The goal is to keep search broad enough for recall while still giving fast-rank a cleaner set of direct titles to prefer.
+
+The title-cleanup logic also tries to keep employer names, locations, campaign names, and generic work-description phrases out of the direct-title bucket.
+
 ## Typical timing
 
 - 5–15 minutes for a 100-job batch

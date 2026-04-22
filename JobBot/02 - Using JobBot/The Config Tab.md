@@ -18,6 +18,27 @@ Every field in the JobBot configuration screen, organized by section. Changes ta
 |---|---|
 | Resume source | Path to your resume file. DOCX recommended for best tailoring; PDF and plain text also work. Click **Choose Resume** to browse. |
 
+### Fit to Resume
+
+The **Fit to Resume** button next to **Job keyword** analyzes the configured resume and opens a grouped suggestion dialog instead of silently overwriting one field.
+
+It proposes:
+
+- a **Combined query** for the main search phrase
+- **Core titles** for direct-fit roles
+- **Adjacent titles** for nearby/stretch roles
+- **Domains**
+- **Skills / tools**
+- **Broadening terms**
+
+When you click **Apply Suggestions**, JobBot writes the groups into the setup fields:
+
+- **Job keyword** gets the combined query
+- **Target titles** gets the core titles
+- **Include titles** gets the adjacent titles
+
+JobBot also tries to keep company names, locations, campaign names, and generic work-description phrases out of **Core titles** so the title-matching logic stays useful.
+
 ## Job Source
 
 | Field | What it does |
@@ -60,6 +81,7 @@ Every field in the JobBot configuration screen, organized by section. Changes ta
 
 | Field | What it does |
 |---|---|
+| Target titles | Comma-separated direct-fit titles that strongly influence fast-rank title matching |
 | Include titles | Comma-separated titles that are good fits (substring match, case-insensitive) |
 | Exclude titles | Comma-separated titles to always skip |
 | Force escalate keywords | Comma-separated keywords that push a job straight to the Review Queue, bypassing AI |
