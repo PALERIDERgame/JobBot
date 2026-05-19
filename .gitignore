@@ -1,8 +1,47 @@
-﻿__pycache__/
+__pycache__/
 .pycache_temp/
-.venv312/
+.tmp*/
+.venv*/
+.claude/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+*.py[cod]
+*.pyo
+*.pyd
+
+# Runtime data and local test artifacts
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+JobBot/.obsidian/
 tests/_tmp/
-*.pyc
+tmp_smoke/
+tmp_resume_cache.json
+output/
+logs/
+token.json
+config.yaml
+
+# Credentials and local secrets
+.env
+.env.*
+!.env.example
 gmail_client_secret.json
 client_secret_*.json
-.claude/worktrees/
+*client_secret*.json
+
+# Personal resumes and generated document previews
+Resume.pdf
+*Resume*.pdf
+*Resume*.docx
+_debug_*.png
+_generated_*.png
+_source_*.png
+
+# Local assistant/session notes
+CLAUDE.md
+CONTEXT_SUMMARY.md
+NextSteps.txt

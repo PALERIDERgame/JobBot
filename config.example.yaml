@@ -1,0 +1,114 @@
+source:
+  enabled: true
+  provider: jobspy
+  keyword: software engineer
+  location: ''
+  jobspy_sites:
+  - indeed
+  - google
+  results_per_page: 100
+  days_back: 3
+  remote_only: false
+  api_url: https://data.usajobs.gov/api/search
+  user_agent: jobbot-demo@example.com
+  authorization_key: ''
+  adzuna_app_id: ''
+  adzuna_app_key: ''
+  adzuna_country: us
+  adzuna_category: ''
+  adzuna_sort: date
+  additional_keywords: []
+gmail:
+  enabled: false
+  sender_email: ''
+  recipient_email: ''
+  client_secrets_file: ''
+schedule:
+  enabled: false
+  weekdays:
+  - mon
+  - tue
+  - wed
+  - thu
+  - fri
+  start_hour_est: 7
+  end_hour_est: 17
+  interval_minutes: 120
+automation_mode: semi_auto
+llm_provider: anthropic
+cheap_stage_provider: openai
+cheap_stage_model: gpt-5-nano
+strong_stage_provider: anthropic
+strong_stage_model: claude-sonnet-4-20250514
+doc_stage_provider: openai
+doc_stage_model: gpt-5-mini
+ollama_base_url: http://localhost:11434
+proxy_list: []
+scoring_threshold: 70
+rate_limit_min_seconds: 3
+rate_limit_max_seconds: 5
+resume_source_path: ''
+output_dir: output
+target_titles:
+- software engineer
+- python developer
+include_titles:
+- software engineer
+- python developer
+exclude_titles:
+- principal
+- sales
+- designer
+force_escalate_keywords:
+- python
+- automation
+- llm
+- agent
+salary_floor: 0
+cheap_reject_threshold: 55
+cheap_escalate_threshold: 75
+final_apply_threshold: 80
+precheap_gate_enabled: true
+precheap_gate_reject_threshold: 30
+skip_ai_scoring_in_semi_auto: true
+fast_rank_min_score: 20
+cheap_ai_top_n: 8
+strong_ai_top_n: 3
+progressive_queue_enabled: false
+enable_cost_tracking: true
+scoring_max_workers: 4
+auto_apply_requires_high_confidence: true
+auto_apply_block_on_missing_required_items: true
+auto_apply_block_on_red_flags: true
+auto_apply_requires_strong_stage: true
+review_on_vague_job_description: true
+restricted_states:
+- ca
+- california
+- co
+- colorado
+- il
+- illinois
+sensitive_assessment_keywords:
+- video interview
+- emotion recognition
+- facial analysis
+- personality assessment
+- game-based assessment
+manual_review_keywords:
+- accommodation
+- reasonable accommodation
+- disability
+- background check
+- security clearance
+- work authorization
+work_authorization_required_terms:
+- us citizen
+- u.s. citizen
+- citizenship required
+- security clearance required
+- no sponsorship
+ai_scoring_timeout_seconds: 60
+max_run_cost_usd: 0.0
+anthropic_api_key: ''
+openai_api_key: ''
