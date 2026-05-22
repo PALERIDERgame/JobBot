@@ -17,8 +17,8 @@ def _build_source_resume_docx(path: Path) -> None:
     from docx import Document
 
     doc = Document()
-    doc.add_paragraph("ROBERT THOM")
-    doc.add_paragraph("robert@example.com | linkedin.com/in/example | (530) 220-4847")
+    doc.add_paragraph("ALEX RIVERS")
+    doc.add_paragraph("alex@example.com | linkedin.com/in/example | (555) 000-1234")
     doc.add_paragraph("WORK EXPERIENCE", style="Heading 1")
     doc.add_paragraph("Underdog Strategies, New York, NY — Digital Advertising and Field Manager", style="Heading 2")
     doc.add_paragraph("JULY 2024 - Present")
@@ -242,7 +242,7 @@ class DocumentGeneratorTests(unittest.TestCase):
             self.assertIn("MILK BAR", text)
             self.assertIn("analytics and reporting", text.lower())
             self.assertIn("digital growth", text.lower())
-            self.assertIn("Sincerely,\nRobert Thom", text)
+            self.assertIn("Sincerely,\nAlex Rivers", text)
             self.assertNotIn("Selected experience highlights:", text)
             self.assertNotIn("I believe my background is relevant", text)
             self.assertNotIn("â€”", text)
@@ -316,12 +316,12 @@ class DocumentGeneratorTests(unittest.TestCase):
             "resume.docx",
             "",
             "WORK EXPERIENCE",
-            "robert@example.com",
-            "(530) 220-4847",
+            "alex@example.com",
+            "(555) 000-1234",
             "",
             ["Operations"],
             ["Led digital ad strategy and reporting"],
-            header_lines=["ROBERT THOM", "robert@example.com | linkedin.com/in/example | (530) 220-4847"],
+            header_lines=["ALEX RIVERS", "alex@example.com | linkedin.com/in/example | (555) 000-1234"],
             work_experience_entries=[
                 ResumeWorkEntry(
                     role_line="Underdog Strategies, New York, NY — Digital Advertising and Field Manager",
@@ -343,7 +343,7 @@ class DocumentGeneratorTests(unittest.TestCase):
                 ai_notes="",
             )
             text = docs.cover_letter_txt_path.read_text(encoding="utf-8")
-            self.assertIn("Sincerely,\nRobert Thom", text)
+            self.assertIn("Sincerely,\nAlex Rivers", text)
             self.assertNotIn("Sincerely,\nWORK EXPERIENCE", text)
 
     def test_generate_cover_letter_outputs_docx_and_pdf(self) -> None:
@@ -373,9 +373,9 @@ class DocumentGeneratorTests(unittest.TestCase):
         resume = ResumeData(
             "resume.docx",
             "Mailchimp Salesforce Marketing Cloud streamlined campaign reporting dashboards",
-            "ROBERT THOM",
-            "robert@example.com",
-            "(530) 220-4847",
+            "ALEX RIVERS",
+            "alex@example.com",
+            "(555) 000-1234",
             "Marketing leader",
             ["Operations"],
             ["Streamlined campaign reporting dashboards for executive leadership"],
@@ -393,9 +393,9 @@ class DocumentGeneratorTests(unittest.TestCase):
         resume = ResumeData(
             "resume.docx",
             "Planned and ran programming and managed campaigns and analytics dashboards",
-            "ROBERT THOM",
-            "robert@example.com",
-            "(530) 220-4847",
+            "ALEX RIVERS",
+            "alex@example.com",
+            "(555) 000-1234",
             "Marketing leader",
             ["Operations"],
             ["Planned and ran programming and managed campaigns and analytics dashboards"],
@@ -527,7 +527,7 @@ class DocumentGeneratorTests(unittest.TestCase):
 
             bad_source = Path(tmp) / "bad_resume.docx"
             doc = Document()
-            doc.add_paragraph("ROBERT THOM")
+            doc.add_paragraph("ALEX RIVERS")
             doc.add_paragraph("KEY SKILLS", style="Heading 1")
             doc.add_paragraph("Operations, Project Management")
             doc.save(str(bad_source))
@@ -542,3 +542,4 @@ class DocumentGeneratorTests(unittest.TestCase):
                     MatchScore(0, "", [], [], False, "review", "", ""),
                     ai_notes="",
                 )
+          

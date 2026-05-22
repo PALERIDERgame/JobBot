@@ -500,7 +500,7 @@ class PipelineTests(unittest.TestCase):
                 config.automation_mode = "semi_auto"
                 config.skip_ai_scoring_in_semi_auto = True
                 config.gmail.enabled = True
-                config.gmail.sender_email = "robert@example.com"
+                config.gmail.sender_email = "alex@example.com"
                 config.gmail.client_secrets_file = str(Path(tmp) / "client_secret.json")
                 Path(config.gmail.client_secrets_file).write_text("{}", encoding="utf-8")
                 resume_path = Path(tmp) / "resume.txt"
@@ -649,7 +649,7 @@ class PipelineTests(unittest.TestCase):
                 config.automation_mode = "semi_auto"
                 config.skip_ai_scoring_in_semi_auto = True
                 config.gmail.enabled = True
-                config.gmail.sender_email = "robert@example.com"
+                config.gmail.sender_email = "alex@example.com"
                 config.gmail.client_secrets_file = str(Path(tmp) / "client_secret.json")
                 Path(config.gmail.client_secrets_file).write_text("{}", encoding="utf-8")
                 resume_path = Path(tmp) / "resume.txt"
@@ -1490,7 +1490,7 @@ class PipelineTests(unittest.TestCase):
                 config = load_or_create_config(paths)
                 resume_path = Path(tmp) / "resume.txt"
                 resume_path.write_text(
-                    "ROBERT THOM\nrobert@example.com | linkedin.com/in/example | (530) 220-4847\n"
+                    "ALEX RIVERS\nalex@example.com | linkedin.com/in/example | (555) 000-1234\n"
                     "WORK EXPERIENCE\n"
                     "Underdog Strategies, New York, NY — Digital Advertising and Field Manager\n"
                     "JULY 2024 - Present\n"
@@ -1504,7 +1504,7 @@ class PipelineTests(unittest.TestCase):
                 )
                 config.resume_source_path = str(resume_path)
                 paths.resume_json.write_text(
-                    '{"source_path": "' + str(resume_path).replace("\\", "\\\\") + '", "raw_text": "legacy", "name": "ROBERT THOM", "email": "old@example.com", "phone": "555", "summary": "legacy", "skills": ["legacy"], "experience_lines": ["legacy"]}',
+                    '{"source_path": "' + str(resume_path).replace("\\", "\\\\") + '", "raw_text": "legacy", "name": "ALEX RIVERS", "email": "old@example.com", "phone": "555", "summary": "legacy", "skills": ["legacy"], "experience_lines": ["legacy"]}',
                     encoding="utf-8",
                 )
                 database = Database(paths.database_file)
@@ -1522,10 +1522,10 @@ class PipelineTests(unittest.TestCase):
 
                 paths = build_app_paths()
                 config = load_or_create_config(paths)
-                resume_path = Path(tmp) / "Robert Thom Resume 2026.docx"
+                resume_path = Path(tmp) / "Alex Rivers Resume 2026.docx"
                 doc = Document()
-                doc.add_paragraph("ROBERT THOM")
-                doc.add_paragraph("robert@example.com | linkedin.com/in/example | (530) 220-4847")
+                doc.add_paragraph("ALEX RIVERS")
+                doc.add_paragraph("alex@example.com | linkedin.com/in/example | (555) 000-1234")
                 doc.add_paragraph("WORK EXPERIENCE", style="Heading 1")
                 doc.add_paragraph("Underdog Strategies, New York, NY — Digital Advertising and Field Manager", style="Heading 2")
                 doc.add_paragraph("JULY 2024 - Present")
@@ -1549,7 +1549,7 @@ class PipelineTests(unittest.TestCase):
                         '"summary": "legacy", '
                         '"skills": ["legacy"], '
                         '"experience_lines": ["legacy"], '
-                        '"header_lines": ["robert@example.com | linkedin.com/in/example | (530) 220-4847"], '
+                        '"header_lines": ["alex@example.com | linkedin.com/in/example | (555) 000-1234"], '
                         '"education_lines": ["University of California, Davis"], '
                         '"key_skills_lines": ["Operations, Project Management, CRM, Data Analysis"], '
                         '"work_experience_entries": [{"role_line": "Underdog Strategies, New York, NY — Digital Advertising and Field Manager", "date_line": "JULY 2024 - Present", "bullets": ["Led digital ad strategy and reporting"]}]'
@@ -1561,7 +1561,7 @@ class PipelineTests(unittest.TestCase):
                 database.initialize()
                 pipeline = JobBotPipeline(config, paths, database)
                 resume = pipeline._load_resume()
-                self.assertEqual(resume.name, "ROBERT THOM")
+                self.assertEqual(resume.name, "ALEX RIVERS")
                 self.assertTrue(resume.key_skills_templates)
                 self.assertTrue(resume.work_experience_entries[0].role_template is not None)
                 self.assertTrue(resume.work_experience_entries[0].bullet_templates)
@@ -1615,3 +1615,4 @@ class PipelineTests(unittest.TestCase):
                 result = pipeline.run()
                 self.assertEqual(result.status, "completed")
                 self.assertEqual(result.jobs_matched, 0)
+          

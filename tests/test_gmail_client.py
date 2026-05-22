@@ -45,7 +45,7 @@ class GmailClientTests(unittest.TestCase):
                 Job("1", "Engineer", "Acme", "Remote", "", "Email your resume to hiring@example.com", "email", "https://example.com", "hiring@example.com", "usajobs", "", ""),
                 MatchScore(90, "Strong Python fit.", [], [], True, "scored", "", ""),
                 GeneratedDocs(Path(tmp), resume_path, cover_letter_path),
-                sender_name="Robert Thom",
+                sender_name="Alex Rivers",
             )
 
             self.assertEqual(result.status, "sent")
@@ -57,7 +57,7 @@ class GmailClientTests(unittest.TestCase):
             self.assertIn("Subject: Application: Engineer at Acme", decoded)
             self.assertIn("I have attached my resume and cover letter for review.", decoded)
             self.assertNotIn("AI scoring skipped in semi_auto", decoded)
-            self.assertIn("\n\nRobert Thom\n", decoded)
+            self.assertIn("\n\nAlex Rivers\n", decoded)
             self.assertIn("resume.pdf", decoded)
             self.assertIn("cover_letter.pdf", decoded)
 

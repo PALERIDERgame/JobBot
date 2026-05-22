@@ -1367,7 +1367,7 @@ class DocumentGenerator:
                     continue
                 if len(candidate.split()) >= 2:
                     return candidate.title() if candidate.isupper() else candidate
-            return "Robert Thom"
+            return "Alex Rivers"
         return cleaned.title() if cleaned.isupper() else cleaned
 
     @staticmethod
